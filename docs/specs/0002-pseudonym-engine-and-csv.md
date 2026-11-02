@@ -1,7 +1,7 @@
 # Feature Delta Spec: Pseudonym engine and CSV files
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0001-rust-cli-scaffold-and-devcontainer.md` · `docs/adr/0003-derive-pseudonyms-with-a-keyed-hash.md` · `docs/adr/0004-initial-crate-set.md`
 
