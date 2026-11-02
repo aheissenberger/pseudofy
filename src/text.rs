@@ -30,7 +30,7 @@ struct Token {
 }
 
 fn is_token_char(c: char) -> bool {
-    c.is_alphabetic() || c == '\'' || is_combining_mark(c)
+    c.is_alphabetic() || matches!(c, '\'' | '\u{2019}' | '\u{2bc}') || is_combining_mark(c)
 }
 
 /// Replace each name token in `value`.

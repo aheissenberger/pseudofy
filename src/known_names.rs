@@ -9,7 +9,8 @@
 //! - Token: a maximal run of letters, combining marks and `'`. Leading and
 //!   trailing `'` and a trailing possessive `'s` are not part of the token, so
 //!   `'Anna Muster'` and `Anna's` match, and `O'Brien` is one token. A curly
-//!   apostrophe and a hyphen separate tokens, as in `text.rs`.
+//!   apostrophe (U+2019, U+02BC) is an apostrophe like `'`; a hyphen separates
+//!   tokens, as in `text.rs`.
 //! - Whole word: only complete tokens match. "Annabelle" does not match "Anna".
 //! - Folding: stored and text tokens are compared after NFC, lowercase,
 //!   `ß` to `ss`, and removal of U+0307 after `i`. The replacement keeps the
@@ -25,13 +26,13 @@
 //!   over single tokens. A full name counts as one replacement.
 //! - Single tokens (mode `tokens`): a token known as first and as last name
 //!   gets the role that it has more often in the columns; a tie gives First.
-//!   A last-name token that is all lowercase in every last-name cell (a
-//!   particle like `de`, `von`) does not match alone.
+//!   A last-name token that is all lowercase and not the final token
+//!   in every last-name cell (a particle like `de`, `von`) does not match alone.
 //! - One-letter tokens never match alone.
 
 use std::borrow::Cow;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::{UnicodeNormalization, is_nfc};
@@ -55,14 +56,19 @@ pub struct KnownNames {
     /// Last-name tokens that were not all lowercase in some cell.
     cased_last: HashSet<String>,
     persons: HashSet<(Vec<String>, Vec<String>)>,
-    /// Folded token → the first spelling seen in a name column. The
-    /// pseudonym comes from this spelling, so `STRAUSS` in free text gets the
-    /// pseudonym of `Strauß` in the column.
-    canon: HashMap<String, String>,
+    /// Folded token → the spellings seen in name columns (NFC, lowercase).
+    /// A free-text token with a column spelling gets that spelling; any other
+    /// token gets the smallest one. Independent of the file order.
+    canon: HashMap<String, BTreeSet<String>>,
+}
+
+/// `'`, the curly apostrophe U+2019 and the modifier letter U+02BC.
+fn is_apos(c: char) -> bool {
+    matches!(c, '\'' | '\u{2019}' | '\u{2bc}')
 }
 
 fn is_token_char(c: char) -> bool {
-    c.is_alphabetic() || c == '\'' || is_combining_mark(c)
+    c.is_alphabetic() || is_apos(c) || is_combining_mark(c)
 }
 
 /// A name token: byte range in the (NFC) text.
@@ -77,15 +83,17 @@ fn push_run(text: &str, from: usize, to: usize, out: &mut Vec<Tok>) {
     let Some(run) = text.get(from..to) else {
         return;
     };
-    let start = from + (run.len() - run.trim_start_matches('\'').len());
-    let trim = |s: usize, e: usize| s + text.get(s..e).unwrap_or("").trim_end_matches('\'').len();
+    let start = from + (run.len() - run.trim_start_matches(is_apos).len());
+    let trim =
+        |s: usize, e: usize| s + text.get(s..e).unwrap_or("").trim_end_matches(is_apos).len();
     let mut end = trim(start, to);
-    let b = text.as_bytes();
-    let possessive = end >= start + 3
-        && b.get(end - 2) == Some(&b'\'')
-        && matches!(b.get(end - 1), Some(b's' | b'S'));
-    if possessive {
-        end = trim(start, end - 2);
+    let mut rev = text.get(start..end).unwrap_or("").char_indices().rev();
+    if let (Some((_, last)), Some((at, apos))) = (rev.next(), rev.next())
+        && matches!(last, 's' | 'S')
+        && is_apos(apos)
+        && at > 0
+    {
+        end = trim(start, start + at);
     }
     let Some(token) = text.get(start..end) else {
         return;
@@ -125,6 +133,7 @@ fn fold(token: &str) -> String {
         for l in c.to_lowercase() {
             match l {
                 'ß' => out.push_str("ss"),
+                '\u{2019}' | '\u{2bc}' => out.push('\''),
                 '\u{307}' if out.ends_with('i') => {}
                 _ => out.push(l),
             }
@@ -134,7 +143,7 @@ fn fold(token: &str) -> String {
 }
 
 fn is_sep_char(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '-' | '\u{2010}' | '\u{2011}')
+    c.is_whitespace() || matches!(c, '-' | '\u{2010}' | '\u{2011}' | '\u{2013}' | '\u{2014}')
 }
 
 enum Gap {
@@ -200,12 +209,19 @@ fn strip_angle(value: &str) -> String {
 }
 
 impl KnownNames {
+    fn add_spelling(&mut self, folded: &str, raw: &str) {
+        self.canon
+            .entry(folded.to_string())
+            .or_default()
+            .insert(raw.to_lowercase());
+    }
+
     /// Add the tokens of a first-name cell value. Returns the folded tokens.
     pub fn add_first(&mut self, value: &str) -> Vec<String> {
         let tokens = name_tokens(value);
         for (t, _, raw) in &tokens {
             *self.first_count.entry(t.clone()).or_insert(0) += 1;
-            self.canon.entry(t.clone()).or_insert_with(|| raw.clone());
+            self.add_spelling(t, raw);
         }
         tokens.into_iter().map(|(t, _, _)| t).collect()
     }
@@ -213,10 +229,12 @@ impl KnownNames {
     /// Add the tokens of a last-name cell value. Returns the folded tokens.
     pub fn add_last(&mut self, value: &str) -> Vec<String> {
         let tokens = name_tokens(value);
-        for (t, lower, raw) in &tokens {
+        let n = tokens.len();
+        for (i, (t, lower, raw)) in tokens.iter().enumerate() {
             *self.last_count.entry(t.clone()).or_insert(0) += 1;
-            self.canon.entry(t.clone()).or_insert_with(|| raw.clone());
-            let set = if *lower {
+            self.add_spelling(t, raw);
+            // A particle is lowercase and not the final token of its cell.
+            let set = if *lower && i + 1 != n {
                 &mut self.lower_last
             } else {
                 &mut self.cased_last
@@ -245,26 +263,29 @@ impl KnownNames {
             self.add_person(after, before);
             return;
         }
-        let toks: Vec<Tok> = lex(&nfc).into_iter().filter(|t| !t.initial).collect();
-        if let Some((last, rest)) = toks.split_last() {
-            let first = match rest.first() {
-                Some(a) => nfc.get(a.start..last.start).unwrap_or(""),
-                None => "",
-            };
-            let last = nfc.get(last.start..last.end).unwrap_or("");
-            self.add_person(first, last);
+        // Same assignment as `NameRole::Full`: the final token is Last, an
+        // initial included. A final initial leaves no last name.
+        let toks = lex(&nfc);
+        let Some((last, rest)) = toks.split_last() else {
+            return;
+        };
+        if last.initial {
+            self.add_first(nfc.get(..last.start).unwrap_or(""));
+            return;
         }
+        let first = match rest.first() {
+            Some(a) => nfc.get(a.start..last.start).unwrap_or(""),
+            None => "",
+        };
+        let last = nfc.get(last.start..last.end).unwrap_or("");
+        self.add_person(first, last);
     }
 
     /// Build the whole-word matcher for `mode`.
-    #[expect(
-        clippy::unnecessary_wraps,
-        reason = "the signature is part of the interface of spec 0004"
-    )]
-    pub fn matcher(&self, mode: FreeText) -> anyhow::Result<Matcher> {
+    pub fn matcher(&self, mode: FreeText) -> Matcher {
         let mut m = Matcher::default();
         if mode == FreeText::Off {
-            return Ok(m);
+            return m;
         }
         m.canon.clone_from(&self.canon);
         for (f, l) in &self.persons {
@@ -304,7 +325,7 @@ impl KnownNames {
                 m.singles.insert(t.clone(), part);
             }
         }
-        Ok(m)
+        m
     }
 }
 
@@ -352,7 +373,7 @@ pub struct Matcher {
     heads: HashSet<String>,
     singles: HashMap<String, Part>,
     max_words: usize,
-    canon: HashMap<String, String>,
+    canon: HashMap<String, BTreeSet<String>>,
 }
 
 fn role(part: Part) -> NameRole {
@@ -384,14 +405,28 @@ impl Matcher {
         let mut init: Option<(usize, usize)> = None; // (words before, token)
         let mut comma: Option<usize> = None; // words before the comma
         let (mut prev, mut prev_init) = (from, false);
-        let mut best = None;
+        let mut best: Option<Found> = None;
         let mut next = from + 1;
-        while next < toks.len() && words.len() < self.max_words {
+        while next < toks.len()
+            && (words.len() < self.max_words || toks.get(next).is_some_and(|t| t.initial))
+        {
             let (before, after) = (toks.get(prev)?, toks.get(next)?);
             let Some(gap) = text.get(before.end..after.start) else {
                 break;
             };
             if after.initial {
+                if comma.is_some() {
+                    // `Last, First M.`: the initial follows the first-name part.
+                    if !prev_init
+                        && matches!(classify(gap), Gap::Sep)
+                        && let Some(b) = best.as_mut()
+                        && b.comma.is_some()
+                        && b.words.len() == words.len()
+                    {
+                        b.init = Some(next);
+                    }
+                    break;
+                }
                 let ok = !prev_init
                     && init.is_none()
                     && comma.is_none()
@@ -521,11 +556,15 @@ impl Matcher {
             let Some(t) = toks.get(idx) else { continue };
             out.push_str(text.get(pos..t.start).unwrap_or(""));
             let token = text.get(t.start..t.end).unwrap_or("");
-            // The pseudonym comes from the column spelling; the case style
+            // A token with a column spelling is passed as it is; any other
+            // spelling gets the smallest column spelling. The case style
             // comes from the text.
+            let lower = token.to_lowercase();
             let real = folded
                 .get(idx)
                 .and_then(|f| self.canon.get(f))
+                .filter(|set| !set.contains(&lower))
+                .and_then(|set| set.first())
                 .map_or(token, String::as_str);
             out.push_str(&replace_name(token, role(part), &mut |p, _| {
                 replace(p, real)
@@ -550,7 +589,7 @@ mod tests {
     }
 
     fn run(names: &KnownNames, mode: FreeText, text: &str) -> (String, usize) {
-        let m = names.matcher(mode).unwrap();
+        let m = names.matcher(mode);
         m.replace(text, &mut fake)
     }
 
@@ -594,7 +633,7 @@ mod tests {
     fn case_style_kept() {
         let k = sample();
         let mut seen = Vec::new();
-        let m = k.matcher(FreeText::Tokens).unwrap();
+        let m = k.matcher(FreeText::Tokens);
         let (out, n) = m.replace("ANNA MUSTER and anna", &mut |p, t| {
             seen.push((p, t.to_string()));
             match p {
@@ -604,29 +643,29 @@ mod tests {
         });
         assert_eq!(out, "BERTA KUNZ and berta");
         assert_eq!(n, 2);
-        // The callback gets the column spelling; the case comes from the text.
-        assert_eq!(seen[0], (Part::First, "Anna".to_string()));
+        // The callback gets the token itself (a column spelling).
+        assert_eq!(seen[0], (Part::First, "ANNA".to_string()));
     }
 
     #[test]
     fn folded_match_uses_the_column_spelling() {
         let mut k = KnownNames::default();
         k.add_person("Ilse", "Strauß");
-        let m = k.matcher(FreeText::Tokens).unwrap();
+        let m = k.matcher(FreeText::Tokens);
         let mut seen = Vec::new();
         let (out, n) = m.replace("STRAUSS", &mut |p, t| {
             seen.push((p, t.to_string()));
             "Kunz".to_string()
         });
         assert_eq!((out.as_str(), n), ("KUNZ", 1));
-        assert_eq!(seen, [(Part::Last, "Strauß".to_string())]);
+        assert_eq!(seen, [(Part::Last, "strauß".to_string())]);
     }
 
     #[test]
     fn longest_match_wins() {
         let k = sample();
         let mut seen = Vec::new();
-        let m = k.matcher(FreeText::Tokens).unwrap();
+        let m = k.matcher(FreeText::Tokens);
         let (out, n) = m.replace("Call Anna Muster now", &mut |p, t| {
             seen.push((p, t.to_string()));
             "X".to_string()
@@ -646,7 +685,7 @@ mod tests {
     fn comma_form() {
         let k = sample();
         let mut seen = Vec::new();
-        let m = k.matcher(FreeText::Full).unwrap();
+        let m = k.matcher(FreeText::Full);
         let (out, n) = m.replace("See Muster, Anna.", &mut |p, t| {
             seen.push((p, t.to_string()));
             "Zed".to_string()
@@ -829,7 +868,7 @@ mod tests {
             })
             .collect();
         let start = std::time::Instant::now();
-        let m = k.matcher(FreeText::Tokens).unwrap();
+        let m = k.matcher(FreeText::Tokens);
         let mut total = 0;
         for text in &texts {
             total += m.replace(text, &mut fake).1;
@@ -840,5 +879,100 @@ mod tests {
             run(&k, FreeText::Off, "Call Anna Muster"),
             ("Call Anna Muster".to_string(), 0)
         );
+    }
+
+    fn seen(k: &KnownNames, mode: FreeText, text: &str) -> Vec<String> {
+        let mut seen = Vec::new();
+        k.matcher(mode).replace(text, &mut |_, t| {
+            seen.push(t.to_string());
+            "X".to_string()
+        });
+        seen
+    }
+
+    #[test]
+    fn lowercase_last_name_column() {
+        let mut k = KnownNames::default();
+        k.add_person("zorbina", "quenzel");
+        k.add_person("Jorvik", "de Velgrad");
+        for t in ["quenzel", "Quenzel", "QUENZEL"] {
+            assert_eq!(run(&k, FreeText::Tokens, t).1, 1, "{t}");
+        }
+        assert_eq!(run(&k, FreeText::Tokens, "de said").1, 0);
+        assert_eq!(run(&k, FreeText::Tokens, "Velgrad").1, 1);
+    }
+
+    #[test]
+    fn curly_apostrophe_is_one_key() {
+        let mut k = KnownNames::default();
+        k.add_person("Tamsorin", "O\u{2019}Brien");
+        for t in [
+            "O'Brien",
+            "O\u{2019}Brien",
+            "O\u{2bc}Brien",
+            "o\u{2019}brien\u{2019}s",
+        ] {
+            assert_eq!(run(&k, FreeText::Tokens, t).1, 1, "{t}");
+        }
+        assert_eq!(run(&k, FreeText::Tokens, "O\u{2019}Brienx").1, 0);
+        // The column spelling is passed as it is.
+        assert_eq!(
+            seen(&k, FreeText::Tokens, "O\u{2019}Brien"),
+            ["O\u{2019}Brien"]
+        );
+        // An unseen spelling gets the column spelling.
+        assert_eq!(seen(&k, FreeText::Tokens, "O'Brien"), ["o\u{2019}brien"]);
+        let mut k2 = KnownNames::default();
+        k2.add_person("A", "O'Brien");
+        k2.add_person("B", "O\u{2019}Brien");
+        assert_eq!(seen(&k2, FreeText::Tokens, "O'Brien"), ["O'Brien"]);
+        assert_eq!(seen(&k2, FreeText::Tokens, "O\u{2bc}BRIEN"), ["o'brien"]);
+    }
+
+    #[test]
+    fn several_spellings_do_not_depend_on_order() {
+        let mut a = KnownNames::default();
+        a.add_person("Ilse", "Strauss");
+        a.add_person("Karl", "Strauß");
+        let mut b = KnownNames::default();
+        b.add_person("Karl", "Strauß");
+        b.add_person("Ilse", "Strauss");
+        for k in [&a, &b] {
+            let got = seen(k, FreeText::Tokens, "Strauss STRAUSS Strauß STRAUß");
+            assert_eq!(got, ["Strauss", "STRAUSS", "Strauß", "STRAUß"]);
+        }
+    }
+
+    #[test]
+    fn full_name_with_trailing_initial() {
+        let mut k = KnownNames::default();
+        k.add_full("Kesta Wolmar J.");
+        assert_eq!(run(&k, FreeText::Full, "Kesta Wolmar").1, 0);
+        assert_eq!(run(&k, FreeText::Tokens, "Kesta").1, 1);
+        // The tokens before the final initial are first names.
+        assert_eq!(run(&k, FreeText::Tokens, "Wolmar").1, 1);
+        assert_eq!(run(&k, FreeText::Tokens, "J. said").1, 0);
+    }
+
+    #[test]
+    fn comma_form_with_trailing_initial() {
+        let mut k = KnownNames::default();
+        k.add_full("Draven, Ilsa M.");
+        assert_eq!(
+            run(&k, FreeText::Full, "Draven, Ilsa M. said"),
+            ("L6, F4 F. said".to_string(), 1)
+        );
+        assert_eq!(
+            run(&k, FreeText::Full, "Draven, Ilsa said").0,
+            "L6, F4 said"
+        );
+    }
+
+    #[test]
+    fn dashes_separate_inside_a_name() {
+        let mut k = KnownNames::default();
+        k.add_person("Lisandra\u{2013}Mae", "Kroft");
+        assert_eq!(run(&k, FreeText::Full, "Lisandra\u{2013}Mae Kroft").1, 1);
+        assert_eq!(run(&k, FreeText::Full, "Lisandra\u{2014}Mae Kroft").1, 1);
     }
 }

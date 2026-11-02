@@ -122,7 +122,7 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
     if free_text {
         collect_known(&items, &pass1, &mut known);
     }
-    let matcher = known.matcher(config.free_text)?;
+    let matcher = known.matcher(config.free_text);
     let pass2 = CellFns {
         matcher: free_text.then_some(&matcher),
         ..pass1
