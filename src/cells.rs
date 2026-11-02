@@ -1,7 +1,6 @@
 //! Column roles, header matching, cell replacement, and the safe output
 //! write. `csv_file` and `xlsx_file` use the same functions.
 
-use std::cell::RefCell;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -79,24 +78,16 @@ pub(crate) fn is_not_found(error: &std::io::Error) -> bool {
 /// Name of the temp file in the output directory.
 const TEMP_NAME: &str = ".pseudofy-out.tmp";
 
-thread_local! {
-    /// Permission bits of the input file that the current thread processes.
-    /// `write_output` sets them on the copy (a private input gives a private copy).
-    static INPUT_PERMISSIONS: RefCell<Option<fs::Permissions>> = const { RefCell::new(None) };
-}
-
-/// Set the permissions that `write_output` gives the next copies, or clear them.
-pub(crate) fn set_input_permissions(permissions: Option<fs::Permissions>) {
-    INPUT_PERMISSIONS.with(|cell| *cell.borrow_mut() = permissions);
-}
-
 /// Write `bytes` to `output` without following a symlink: check each directory
 /// below `out_root`, refuse a symlink target, write a temp file, rename it.
+/// The copy gets the permission bits of `input` (a private input gives a
+/// private copy).
 pub(crate) fn write_output(
     out_root: &Path,
     output: &Path,
     bytes: &[u8],
     rel: &str,
+    input: &Path,
 ) -> anyhow::Result<()> {
     let parent = output.parent().unwrap_or(out_root);
     let below = parent
@@ -129,7 +120,7 @@ pub(crate) fn write_output(
     }
     // A short fixed name: a long but legal file name still fits.
     let temp = parent.join(TEMP_NAME);
-    let permissions = INPUT_PERMISSIONS.with(|cell| cell.borrow().clone());
+    let permissions = fs::metadata(input).ok().map(|meta| meta.permissions());
     match fs::remove_file(&temp) {
         Ok(()) => {}
         Err(error) if is_not_found(&error) => {}
@@ -477,9 +468,13 @@ mod tests {
     fn write_output_uses_a_short_temp_name_for_a_long_file_name() {
         let dir = tempfile::tempdir().unwrap();
         let name = format!("{}.csv", "n".repeat(245));
-        write_output(dir.path(), &dir.path().join(&name), b"x", &name).unwrap();
-        assert_eq!(fs::read(dir.path().join(&name)).unwrap(), b"x");
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        let input = dir.path().join("in.csv");
+        fs::write(&input, "x").unwrap();
+        let out = dir.path().join("out");
+        fs::create_dir(&out).unwrap();
+        write_output(&out, &out.join(&name), b"x", &name, &input).unwrap();
+        assert_eq!(fs::read(out.join(&name)).unwrap(), b"x");
+        assert_eq!(fs::read_dir(&out).unwrap().count(), 1);
     }
 
     #[cfg(unix)]
@@ -487,11 +482,13 @@ mod tests {
     fn write_output_gives_the_copy_the_input_permissions() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
-        set_input_permissions(Some(fs::Permissions::from_mode(0o600)));
-        let result = write_output(dir.path(), &dir.path().join("a.csv"), b"x", "a.csv");
-        set_input_permissions(None);
-        result.unwrap();
-        let mode = fs::metadata(dir.path().join("a.csv"))
+        let input = dir.path().join("in.csv");
+        fs::write(&input, "x").unwrap();
+        fs::set_permissions(&input, fs::Permissions::from_mode(0o600)).unwrap();
+        let out = dir.path().join("out");
+        fs::create_dir(&out).unwrap();
+        write_output(&out, &out.join("a.csv"), b"x", "a.csv", &input).unwrap();
+        let mode = fs::metadata(out.join("a.csv"))
             .unwrap()
             .permissions()
             .mode();

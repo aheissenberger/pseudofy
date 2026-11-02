@@ -112,7 +112,7 @@ pub fn process(
     let out = xlsx_scrub::scrub(&original, &out).map_err(|_| unwritable())?;
     // The warnings come from the written package, where part names are canonical.
     let written = xlsx_scrub::inspect(&out).map_err(|_| unwritable())?;
-    write_output(out_root, output, &out, rel)?;
+    write_output(out_root, output, &out, rel, input)?;
     if !written.kinds.is_empty() {
         eprintln!(
             "warning: {rel}: not pseudonymized: {}",

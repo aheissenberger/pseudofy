@@ -104,7 +104,7 @@ pub fn process(
         Kind::Email => pseudonymizer.email(value),
     };
     let result = transform_encoded(&bytes, &columns, rules, cells, &mut replace, rel, None)?;
-    write_output(out_root, output, &result.bytes, rel)?;
+    write_output(out_root, output, &result.bytes, rel, input)?;
     Ok(CsvStats {
         replaced: result.replaced,
         free_text: result.free_text,
@@ -1008,8 +1008,8 @@ mod tests {
         let root = dir.path().join("out");
         fs::create_dir(&root).unwrap();
         let file = root.join("sub").join("a.csv");
-        write_output(&root, &file, b"one", "sub/a.csv").unwrap();
-        write_output(&root, &file, b"two", "sub/a.csv").unwrap();
+        write_output(&root, &file, b"one", "sub/a.csv", &file).unwrap();
+        write_output(&root, &file, b"two", "sub/a.csv", &file).unwrap();
         assert_eq!(fs::read(&file).unwrap(), b"two");
         assert!(!root.join("sub").join(".a.csv.pseudofy-tmp").exists());
 
@@ -1019,7 +1019,7 @@ mod tests {
             fs::write(&victim, b"keep").unwrap();
             let link = root.join("b.csv");
             std::os::unix::fs::symlink(&victim, &link).unwrap();
-            let error = write_output(&root, &link, b"x", "b.csv").unwrap_err();
+            let error = write_output(&root, &link, b"x", "b.csv", &link).unwrap_err();
             assert!(error.to_string().contains("b.csv"));
             assert_eq!(fs::read(&victim).unwrap(), b"keep");
 
@@ -1027,7 +1027,7 @@ mod tests {
             fs::create_dir(&target_dir).unwrap();
             std::os::unix::fs::symlink(&target_dir, root.join("linked")).unwrap();
             let inner = root.join("linked").join("c.csv");
-            assert!(write_output(&root, &inner, b"x", "linked/c.csv").is_err());
+            assert!(write_output(&root, &inner, b"x", "linked/c.csv", &inner).is_err());
             assert!(!target_dir.join("c.csv").exists());
         }
     }
