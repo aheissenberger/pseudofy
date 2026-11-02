@@ -1,6 +1,10 @@
 //! Project config in `config/pseudofy.toml`.
 
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::Path;
+
+use anyhow::Context;
 
 use serde::Deserialize;
 
@@ -39,12 +43,58 @@ fn default_email_subdomains() -> bool {
 }
 
 /// Load `config/pseudofy.toml`.
-pub fn load(_project: &Path) -> anyhow::Result<Config> {
-    todo!("task io")
+pub fn load(project: &Path) -> anyhow::Result<Config> {
+    let text = fs::read_to_string(project.join(CONFIG_FILE))
+        .with_context(|| format!("cannot read {CONFIG_FILE}"))?;
+    toml::from_str(&text).with_context(|| format!("invalid {CONFIG_FILE}"))
 }
 
 /// Write `config/pseudofy.toml` with the language, `email_subdomains = true`,
 /// and one example rule. Fail if the file exists.
-pub fn create(_project: &Path, _language: Language) -> anyhow::Result<()> {
-    todo!("task io")
+pub fn create(project: &Path, language: Language) -> anyhow::Result<()> {
+    let path = project.join(CONFIG_FILE);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("cannot create the config directory")?;
+    }
+    let text = format!(
+        r#"# pseudofy config
+language = "{}"
+# false: each fake email uses example.com. true: each real domain gets one fake subdomain.
+email_subdomains = true
+
+# Each rule selects files with a glob (relative to the project) and names the
+# header texts of the name and email columns.
+[[rule]]
+files = "**/*.csv"
+first_name = ["first_name"]
+last_name = ["last_name"]
+full_name = ["name"]
+email = ["email"]
+"#,
+        language.code()
+    );
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .with_context(|| format!("cannot create {CONFIG_FILE}"))?;
+    file.write_all(text.as_bytes())
+        .with_context(|| format!("cannot write {CONFIG_FILE}"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn created_config_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        create(dir.path(), Language::De).unwrap();
+        let config = load(dir.path()).unwrap();
+        assert_eq!(config.language, Language::De);
+        assert!(config.email_subdomains);
+        assert_eq!(config.rules.len(), 1);
+        assert!(create(dir.path(), Language::En).is_err());
+    }
 }
