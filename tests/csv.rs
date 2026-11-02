@@ -516,3 +516,243 @@ fn run_does_not_print_real_values_on_stderr() {
         .success()
         .stderr(contains("Zorbina").not().and(contains("acme").not()));
 }
+
+// --- Regression tests for review findings ------------------------------------
+
+const LEAK_WORDS: [&str; 8] = [
+    "zorbel",
+    "bäckerei",
+    "müller",
+    "anna",
+    "jürgen",
+    "localhost",
+    "quenzel",
+    "acme",
+];
+
+fn stderr_text(assert: &assert_cmd::assert::Assert) -> String {
+    String::from_utf8_lossy(&assert.get_output().stderr).to_lowercase()
+}
+
+fn assert_no_leak(text: &str, what: &str) {
+    let lower = text.to_lowercase();
+    for word in LEAK_WORDS {
+        assert!(!lower.contains(word), "{what} leaks {word}");
+    }
+}
+
+/// Runs successfully, checks stderr for leaks, returns the output directory.
+fn run_clean(project: &Path) -> TempDir {
+    let out = TempDir::new().unwrap();
+    let assert = run(project, out.path()).success();
+    assert_no_leak(&stderr_text(&assert), "stderr");
+    out
+}
+
+fn strip_angle(word: &str) -> &str {
+    word.trim_matches(|c| c == '<' || c == '>')
+}
+
+#[test]
+fn email_column_values_the_pattern_may_not_match_are_replaced() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "name,email\nPerson One,info@bäckerei-zorbel.test\nPerson Two,zorbel@localhost\n",
+    );
+    let out = run_clean(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_leak(&text, "output");
+    let table = rows(&text, ',');
+    for (real, fake) in ["info@bäckerei-zorbel.test", "zorbel@localhost"]
+        .iter()
+        .zip(column(&table, "email"))
+    {
+        assert_ne!(*real, fake);
+        assert!(fake.ends_with("example.com"), "{fake}");
+        assert!(fake.is_ascii(), "{fake}");
+    }
+}
+
+#[test]
+fn unicode_email_in_free_text_is_replaced_without_leaking_the_name() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "id,note\n1,please write to anna.müller@acme.test soon\n",
+    );
+    let out = run_clean(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_leak(&text, "output");
+    let found = emails_in(&text);
+    assert_eq!(found.len(), 1, "{text}");
+    assert!(found[0].ends_with("example.com"), "{}", found[0]);
+}
+
+#[test]
+fn email_inside_a_full_name_cell_matches_the_email_column() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "name,email\nZorbel Quenzel <zorbel@acme.test>,other@other.test\nPerson Two,zorbel@acme.test\n",
+    );
+    let out = run_clean(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_leak(&text, "output");
+    let table = rows(&text, ',');
+    let in_name = emails_in(&column(&table, "name")[0]);
+    assert_eq!(in_name.len(), 1, "{text}");
+    assert_eq!(strip_angle(&in_name[0]), column(&table, "email")[1]);
+}
+
+#[test]
+fn nfd_and_nfc_forms_of_a_name_give_the_same_pseudonym() {
+    let dir = project(KEY_A, None, &[]);
+    let nfd = "Ju\u{308}rgen";
+    let nfc = "J\u{fc}rgen";
+    assert_ne!(nfd, nfc);
+    write_file(
+        dir.path(),
+        "data.csv",
+        &format!("first_name,last_name\n{nfd},Quenzel\n{nfc},Quenzel\n"),
+    );
+    let out = run_clean(dir.path());
+    let table = rows(&read(out.path(), "data.csv"), ',');
+    let first = column(&table, "first_name");
+    assert_eq!(first[0], first[1]);
+    assert_ne!(first[0].to_lowercase(), nfc.to_lowercase());
+}
+
+#[test]
+fn one_letter_initials_never_stay_equal_to_themselves() {
+    for key in [KEY_A, KEY_B] {
+        let dir = project(key, None, &[]);
+        let mut input = String::from("first_name,last_name\n");
+        for initial in ["A", "Z", "Q", "J", "M", "T"] {
+            input.push_str(initial);
+            input.push(',');
+            input.push_str(initial);
+            input.push('\n');
+        }
+        write_file(dir.path(), "data.csv", &input);
+        let out = run_clean(dir.path());
+        let before = rows(&input, ',');
+        let after = rows(&read(out.path(), "data.csv"), ',');
+        for header in ["first_name", "last_name"] {
+            for (real, fake) in column(&before, header).iter().zip(column(&after, header)) {
+                assert_ne!(real.to_lowercase(), fake.to_lowercase(), "{header}");
+            }
+        }
+    }
+}
+
+#[test]
+fn uppercase_csv_extension_matches_the_default_rule() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "PEOPLE.CSV",
+        "first_name,last_name\nZorbina,Quenzel\n",
+    );
+    let out = run_clean(dir.path());
+    let files = snapshot_relative(out.path());
+    assert_eq!(files.len(), 1, "{:?}", files.keys());
+    let text = String::from_utf8(files.into_values().next().unwrap()).unwrap();
+    assert_no_leak(&text, "output");
+    assert_ne!(text, "first_name,last_name\nZorbina,Quenzel\n");
+}
+
+#[test]
+fn blank_lines_are_kept_at_their_position() {
+    let dir = project(KEY_A, None, &[]);
+    let input = "first_name,last_name\nZorbina,Quenzel\n\nTamsorin,Velgrad\n";
+    write_file(dir.path(), "data.csv", input);
+    let out = run_clean(dir.path());
+    let output = read(out.path(), "data.csv");
+    let lines: Vec<&str> = output.lines().collect();
+    assert_eq!(lines.len(), input.lines().count(), "{output:?}");
+    assert_eq!(lines[2], "");
+    assert!(!lines[1].is_empty() && !lines[3].is_empty());
+}
+
+#[test]
+fn header_bytes_and_missing_final_newline_are_kept() {
+    let dir = project(KEY_A, None, &[]);
+    let input = "\"first_name\",\"last_name\"\nZorbina,Quenzel";
+    write_file(dir.path(), "data.csv", input);
+    let out = run_clean(dir.path());
+    let output = read(out.path(), "data.csv");
+    assert_eq!(
+        output.lines().next(),
+        Some("\"first_name\",\"last_name\""),
+        "{output:?}"
+    );
+    assert!(!output.ends_with('\n'), "{output:?}");
+    assert!(!output.to_lowercase().contains("zorbina"), "{output:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn output_symlink_to_an_input_file_never_changes_the_input() {
+    let dir = project(KEY_A, None, &[]);
+    let input = "first_name,last_name\nZorbina,Quenzel\n";
+    write_file(dir.path(), "data.csv", input);
+    let out = TempDir::new().unwrap();
+    std::os::unix::fs::symlink(dir.path().join("data.csv"), out.path().join("data.csv")).unwrap();
+    let assert = run(dir.path(), out.path());
+    assert_no_leak(&stderr_text(&assert), "stderr");
+    assert_eq!(read(dir.path(), "data.csv"), input);
+}
+
+#[test]
+fn out_inside_secrets_fails() {
+    let dir = project(KEY_A, None, &["people_a.csv"]);
+    let out = dir.path().join("secrets/out");
+    let assert = run(dir.path(), &out).failure();
+    assert_no_leak(&stderr_text(&assert), "stderr");
+    assert!(!out.join("people_a.csv").exists());
+}
+
+#[test]
+fn file_without_a_matching_rule_warns_and_still_replaces_emails() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "config/pseudofy.toml",
+        "language = \"de\"\n\n[[rule]]\nfiles = \"only/*.csv\"\nfirst_name = [\"first_name\"]\n",
+    );
+    write_file(
+        dir.path(),
+        "other/data.csv",
+        "first_name,email\nZorbina,zorbel@acme.test\n",
+    );
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).success();
+    let stderr = stderr_text(&assert);
+    assert!(stderr.contains("warning"), "{stderr}");
+    assert_no_leak(&stderr, "stderr");
+    let text = read(out.path(), "other/data.csv");
+    assert!(!text.to_lowercase().contains("acme"), "{text}");
+    assert!(!text.to_lowercase().contains("zorbel"), "{text}");
+    assert!(text.contains("example.com"), "{text}");
+}
+
+#[test]
+fn stderr_never_contains_real_values_from_the_fixtures() {
+    let dir = project(KEY_A, None, &["people_a.csv", "people_b.csv", "upper.csv"]);
+    write_file(
+        dir.path(),
+        "extra.csv",
+        "name,email\nZorbel Quenzel <zorbel@acme.test>,info@bäckerei-zorbel.test\n",
+    );
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path());
+    let stderr = stderr_text(&assert);
+    assert_no_leak(&stderr, "stderr");
+    for part in REAL_TOKENS.iter().chain(REAL_EMAIL_PARTS.iter()) {
+        assert!(!stderr.contains(part), "stderr leaks {part}");
+    }
+}
