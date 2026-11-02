@@ -1,7 +1,7 @@
 # Feature Delta Spec: CSV files in Windows-1252
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0002-pseudonym-engine-and-csv.md` · `docs/adr/0009-decode-csv-with-encoding-rs.md`
 
