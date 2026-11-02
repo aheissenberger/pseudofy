@@ -896,7 +896,8 @@ fn copy_parts(bytes: &[u8]) -> Vec<(String, String)> {
         dir.path(),
         "config/pseudofy.toml",
         "language = \"de\"\n\n[[rule]]\nfiles = \"*.xlsx\"\n\
-         first_name = [\"First Name\"]\nlast_name = [\"Last Name\"]\nemail = [\"Email\"]\n",
+         first_name = [\"First Name\"]\nlast_name = [\"Last Name\"]\n\
+         full_name = [\"name\"]\nemail = [\"Email\", \"email\"]\n",
     );
     fs::write(dir.path().join("mappe.xlsx"), bytes).unwrap();
     let (out, _, _) = run_ok(dir.path());
@@ -1264,4 +1265,185 @@ fn workbook_without_sparklines_gets_no_sparkline_extension() {
         assert!(!xml.contains("x14:sparkline"), "sheet {name}");
         assert!(!xml.contains(SPARKLINE_URI), "sheet {name}");
     }
+}
+
+// ---- Header search and fail closed (spec 0015) ----
+
+/// Runs a project that must fail. Returns a fresh output directory and stderr.
+fn run_failing(project: &Path) -> (TempDir, String) {
+    let out = TempDir::new().unwrap();
+    let assert = run(project, out.path()).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    (out, stderr)
+}
+
+/// Checks the line `error: <message>` and that stderr has no value or header text.
+fn assert_error_line(stderr: &str, message: &str) {
+    let expected = format!("error: {message}");
+    assert!(
+        stderr.lines().any(|line| line.trim_end() == expected),
+        "no line {expected:?} in stderr: {stderr}"
+    );
+    assert_no_leak(stderr, "stderr");
+    for header in ["first_name", "last_name", "email"] {
+        assert!(!stderr.contains(header), "stderr names a header: {stderr}");
+    }
+}
+
+const NO_HEADER_RULE: &str = "no header of rule \"**/*.xlsx\" in the first 20 rows";
+
+#[test]
+fn workbook_fails_when_sheet_2_has_no_header_and_names_the_sheet_position() {
+    let dir = project(None);
+    let mut book = umya_spreadsheet::new_file_empty_worksheet();
+    let first = book.new_sheet("Daten").unwrap();
+    set(first, "A1", "name");
+    set(first, "B1", "email");
+    set(first, "A2", "Zorbina Quenzel");
+    set(first, "B2", "zorbina@acme.test");
+    let second = book.new_sheet("Info").unwrap();
+    set(second, "A1", "Tamsorin Velgrad");
+    set(second, "B1", "tamsorin@acme.test");
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, stderr) = run_failing(dir.path());
+    assert_error_line(&stderr, &format!("mappe.xlsx: sheet 2: {NO_HEADER_RULE}"));
+    assert!(!stderr.contains("Info"), "stderr names the sheet: {stderr}");
+    assert!(!out.path().join("mappe.xlsx").exists());
+}
+
+#[test]
+fn workbook_without_any_header_fails_with_sheet_1() {
+    let dir = project(None);
+    let mut book = umya_spreadsheet::new_file_empty_worksheet();
+    let sheet = book.new_sheet("Daten").unwrap();
+    set(sheet, "A1", "Zorbina Quenzel");
+    set(sheet, "B1", "zorbina@acme.test");
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, stderr) = run_failing(dir.path());
+    assert_error_line(&stderr, &format!("mappe.xlsx: sheet 1: {NO_HEADER_RULE}"));
+    assert!(!out.path().join("mappe.xlsx").exists());
+}
+
+#[test]
+fn sheets_glob_lets_an_info_sheet_without_headers_pass() {
+    let dir = project(Some("[\"Daten\"]"));
+    let mut book = simple_book("Zorbina Quenzel", "zorbina@acme.test");
+    let info = book.new_sheet("Info").unwrap();
+    set(info, "A1", "Nur fuer den internen Gebrauch");
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    let copy = open(out.path(), "mappe.xlsx");
+    assert_ne!(value(&copy, "Daten", "A2"), "Zorbina Quenzel");
+    assert_ne!(value(&copy, "Daten", "B2"), "zorbina@acme.test");
+    assert_eq!(value(&copy, "Info", "A1"), "Nur fuer den internen Gebrauch");
+}
+
+#[test]
+fn title_in_row_1_and_header_in_row_2_get_names_replaced_and_the_title_cleaned() {
+    let dir = project(None);
+    let mut book = umya_spreadsheet::new_file_empty_worksheet();
+    let sheet = book.new_sheet("Daten").unwrap();
+    set(sheet, "A1", "Kontakte von zorbina@acme.test fuer Zorbina");
+    set(sheet, "A2", "name");
+    set(sheet, "B2", "email");
+    set(sheet, "A3", "Zorbina Quenzel");
+    set(sheet, "B3", "zorbina@acme.test");
+    set(sheet, "A4", "Tamsorin Velgrad");
+    set(sheet, "B4", "tamsorin@acme.test");
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    let copy = open(out.path(), "mappe.xlsx");
+    let title = value(&copy, "Daten", "A1");
+    assert_no_leak(&title, "title");
+    assert!(title.starts_with("Kontakte von "), "title: {title}");
+    assert!(
+        title.contains('@') && title.contains("example.com"),
+        "{title}"
+    );
+    assert!(title.contains(" fuer "), "title: {title}");
+    assert_eq!(value(&copy, "Daten", "A2"), "name");
+    assert_eq!(value(&copy, "Daten", "B2"), "email");
+    assert_ne!(value(&copy, "Daten", "A3"), "Zorbina Quenzel");
+    assert_ne!(value(&copy, "Daten", "A4"), "Tamsorin Velgrad");
+    assert_ne!(value(&copy, "Daten", "A4"), "");
+    assert!(value(&copy, "Daten", "B3").contains("example.com"));
+    assert_package_clean(&out.path().join("mappe.xlsx"));
+}
+
+#[test]
+fn email_in_the_header_row_is_replaced_and_configured_headers_stay() {
+    let dir = project(None);
+    let mut book = umya_spreadsheet::new_file_empty_worksheet();
+    let sheet = book.new_sheet("Daten").unwrap();
+    set(sheet, "A1", "name");
+    set(sheet, "B1", "email");
+    set(sheet, "C1", "Kontakt zorbina@acme.test");
+    set(sheet, "A2", "Zorbina Quenzel");
+    set(sheet, "B2", "zorbina@acme.test");
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    let copy = open(out.path(), "mappe.xlsx");
+    assert_eq!(value(&copy, "Daten", "A1"), "name");
+    assert_eq!(value(&copy, "Daten", "B1"), "email");
+    let cell = value(&copy, "Daten", "C1");
+    assert_no_leak(&cell, "header cell");
+    assert!(cell.starts_with("Kontakt "), "{cell}");
+    assert!(cell.contains("example.com"), "{cell}");
+    assert_package_clean(&out.path().join("mappe.xlsx"));
+}
+
+/// A workbook whose header row is row `header_row`. Each row above has a title.
+fn book_with_header_in_row(header_row: u32) -> Workbook {
+    let mut book = umya_spreadsheet::new_file_empty_worksheet();
+    let sheet = book.new_sheet("Daten").unwrap();
+    for row in 1..header_row {
+        set(sheet, &format!("A{row}"), &format!("Zeile {row}"));
+    }
+    set(sheet, &format!("A{header_row}"), "name");
+    set(sheet, &format!("A{}", header_row + 1), "Zorbina Quenzel");
+    book
+}
+
+#[test]
+fn header_in_row_20_is_found() {
+    let dir = project(None);
+    save(&book_with_header_in_row(20), dir.path(), "mappe.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    let copy = open(out.path(), "mappe.xlsx");
+    assert_ne!(value(&copy, "Daten", "A21"), "Zorbina Quenzel");
+    assert_ne!(value(&copy, "Daten", "A21"), "");
+}
+
+#[test]
+fn header_in_row_21_is_not_found_and_the_file_fails() {
+    let dir = project(None);
+    save(&book_with_header_in_row(21), dir.path(), "mappe.xlsx");
+    let (out, stderr) = run_failing(dir.path());
+    assert_error_line(&stderr, &format!("mappe.xlsx: sheet 1: {NO_HEADER_RULE}"));
+    assert!(!out.path().join("mappe.xlsx").exists());
+}
+
+#[test]
+fn failed_workbook_keeps_a_stale_copy_and_the_other_files_are_written() {
+    let dir = project(None);
+    let mut book = umya_spreadsheet::new_file_empty_worksheet();
+    set(book.new_sheet("Daten").unwrap(), "A1", "Zorbina Quenzel");
+    save(&book, dir.path(), "a_bad.xlsx");
+    save(
+        &simple_book("Tamsorin Velgrad", "tamsorin@acme.test"),
+        dir.path(),
+        "b_good.xlsx",
+    );
+    let out = TempDir::new().unwrap();
+    write_file(out.path(), "a_bad.xlsx", "stale copy");
+    let assert = run(dir.path(), out.path()).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert_error_line(&stderr, &format!("a_bad.xlsx: sheet 1: {NO_HEADER_RULE}"));
+    assert!(stderr.contains("1 file(s) failed"), "stderr: {stderr}");
+    assert_eq!(
+        fs::read(out.path().join("a_bad.xlsx")).unwrap(),
+        b"stale copy"
+    );
+    let copy = open(out.path(), "b_good.xlsx");
+    assert_ne!(value(&copy, "Daten", "A2"), "Tamsorin Velgrad");
 }
