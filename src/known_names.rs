@@ -10,10 +10,6 @@
 //!   of a full-name form.
 //! - A full-name match gets its parts from the split rule of
 //!   `text::replace_name` with `NameRole::Full`.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "wired in by the pipeline task of spec 0004")
-)]
 
 use std::collections::BTreeSet;
 

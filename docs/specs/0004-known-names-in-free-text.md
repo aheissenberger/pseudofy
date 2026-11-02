@@ -27,6 +27,7 @@
 - `src/csv_file.rs`, `src/xlsx_file.rs` — pass 1 reads the name columns of each file. Pass 2 gives the matcher to the cell replacement.
 - `src/cells.rs` — replace known names in each text cell outside the name and email columns, after the emails.
 - `src/config.rs` template from `pseudofy init` — a commented `free_text` line.
+- `tests/xlsx.rs` — the `sheets` glob test uses a name that occurs in no name column. Known names now change the other sheets too.
 
 ### Removed
 
