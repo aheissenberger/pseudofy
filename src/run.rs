@@ -1,13 +1,14 @@
 //! `pseudofy run`: find the CSV and XLSX files, apply the rules, write the copies.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
 use globset::{GlobBuilder, GlobMatcher};
 use walkdir::WalkDir;
 
-use crate::cells::CellFns;
+use crate::cells::{CellFns, is_not_found};
 use crate::config::{self, FreeText, Rule};
 use crate::csv_file;
 use crate::key;
@@ -53,6 +54,8 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
     let mut pseudonymizer = Pseudonymizer::new(&key, config.language, config.email_subdomains);
     let mut summary = Summary::default();
     let mut items: Vec<Item> = Vec::new();
+    let mut others: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+    summary.copied = config.copy_other_files.then_some(0);
 
     let secrets = project.join("secrets");
     let config_dir = project.join("config");
@@ -91,6 +94,9 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
         }
         let csv = is_csv(entry.path());
         if !csv && !is_workbook(entry.path()) {
+            if config.copy_other_files && is_copyable_other(entry.path(), relative) {
+                others.push((entry.path().to_path_buf(), relative.to_path_buf(), rel));
+            }
             continue;
         }
         let rules: Vec<&Rule> = matchers
@@ -131,8 +137,23 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
     };
 
     // Pass 2: write the copies.
-    for item in &items {
-        let result = write_item(item, &out, &mut pseudonymizer, &pass2);
+    write_items(&items, &out, &mut pseudonymizer, &pass2, &mut summary);
+    summary.collisions = pseudonymizer.collisions();
+
+    copy_others(&others, &out, &mut summary);
+    Ok(summary)
+}
+
+/// Pass 2 over all files. A failed file is reported and counted.
+fn write_items(
+    items: &[Item],
+    out: &Path,
+    pseudonymizer: &mut Pseudonymizer,
+    cells: &CellFns,
+    summary: &mut Summary,
+) {
+    for item in items {
+        let result = write_item(item, out, pseudonymizer, cells);
         match result {
             Ok((replaced, free_text)) => {
                 if free_text > 0 {
@@ -147,8 +168,6 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
             }
         }
     }
-    summary.collisions = pseudonymizer.collisions();
-    Ok(summary)
 }
 
 /// The compiled file glob of each rule.
@@ -269,6 +288,80 @@ fn resolve_future(path: &Path) -> anyhow::Result<PathBuf> {
     Ok(resolved)
 }
 
+/// Copy each other file unchanged and count it. A failure is reported and
+/// counted in `failed`.
+fn copy_others(others: &[(PathBuf, PathBuf, String)], out: &Path, summary: &mut Summary) {
+    for (path, relative, rel) in others {
+        if copy_file(path, out, &out.join(relative)).is_ok() {
+            println!("{rel}: copied unchanged");
+            summary.copied = summary.copied.map(|n| n + 1);
+        } else {
+            eprintln!("error: cannot copy {rel}");
+            summary.failed += 1;
+        }
+    }
+}
+
+/// A file that `copy_other_files` copies: not CSV, not XLSX, not an Excel lock
+/// file (`~$*`), and no path component starts with `.`.
+fn is_copyable_other(path: &Path, relative: &Path) -> bool {
+    !is_csv(path)
+        && !is_xlsx(path)
+        && !is_lock_file(path)
+        && !relative
+            .components()
+            .any(|part| part.as_os_str().to_string_lossy().starts_with('.'))
+}
+
+/// Stream `input` to `output` without following a symlink in the output
+/// directory: check each directory below `out_root`, refuse a symlink target,
+/// write a temp file, rename it. The error carries no detail.
+fn copy_file(input: &Path, out_root: &Path, output: &Path) -> Result<(), ()> {
+    let parent = output.parent().unwrap_or(out_root);
+    let below = parent
+        .strip_prefix(out_root)
+        .unwrap_or_else(|_| Path::new(""));
+    let mut current = out_root.to_path_buf();
+    for part in below.components() {
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+            Err(error) if is_not_found(&error) => fs::create_dir(&current).map_err(drop)?,
+            Ok(_) | Err(_) => return Err(()),
+        }
+    }
+    match fs::symlink_metadata(output) {
+        Ok(meta) if meta.file_type().is_symlink() || meta.is_dir() => return Err(()),
+        Ok(_) => {}
+        Err(error) if is_not_found(&error) => {}
+        Err(_) => return Err(()),
+    }
+    let name = output
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = parent.join(format!(".{name}.pseudofy-tmp"));
+    match fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(error) if is_not_found(&error) => {}
+        Err(_) => return Err(()),
+    }
+    let mut source = fs::File::open(input).map_err(drop)?;
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .and_then(|mut file| {
+            io::copy(&mut source, &mut file)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temp, output));
+    if written.is_err() {
+        drop(fs::remove_file(&temp));
+    }
+    written.map_err(drop)
+}
+
 fn is_csv(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -367,6 +460,39 @@ mod tests {
         assert!(is_csv(Path::new("a/b.CSV")));
         assert!(!is_csv(Path::new("a/b.xlsx")));
         assert_eq!(relative_text(Path::new("a/b.csv")), "a/b.csv");
+    }
+
+    #[test]
+    fn other_files_skip_hidden_lock_and_tabular() {
+        let ok = |p: &str| is_copyable_other(Path::new(p), Path::new(p));
+        assert!(ok("a/notes.txt"));
+        assert!(ok("a/noext"));
+        assert!(!ok("a/b.CSV"));
+        assert!(!ok("~$b.xlsx"));
+        assert!(!ok("~$b.docx"));
+        assert!(!ok(".private_x"));
+        assert!(!ok(".git/config"));
+        assert!(!ok("sub/.hidden/x.txt"));
+        assert!(!ok("sub/.DS_Store"));
+    }
+
+    #[test]
+    fn copy_streams_and_refuses_a_symlinked_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.txt");
+        fs::write(&input, "abc").unwrap();
+        let out = dir.path().join("out");
+        fs::create_dir(&out).unwrap();
+        copy_file(&input, &out, &out.join("sub").join("in.txt")).unwrap();
+        assert_eq!(fs::read_to_string(out.join("sub/in.txt")).unwrap(), "abc");
+        #[cfg(unix)]
+        {
+            let elsewhere = dir.path().join("elsewhere.txt");
+            fs::write(&elsewhere, "keep").unwrap();
+            std::os::unix::fs::symlink(&elsewhere, out.join("link.txt")).unwrap();
+            assert!(copy_file(&input, &out, &out.join("link.txt")).is_err());
+            assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "keep");
+        }
     }
 
     #[test]
