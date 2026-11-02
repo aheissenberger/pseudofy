@@ -1,7 +1,7 @@
 # Feature Delta Spec: Claude Code project setup
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/adr/0007-split-agent-work-by-file-ownership.md` · `docs/adr/0006-strict-lint-policy-in-cargo-toml.md` · `docs/adr/0002-develop-in-a-devcontainer.md`
 
@@ -61,9 +61,9 @@
 - [x] `.claude/hooks/stop-check` exits 0 on a clean working tree.
 - [x] `.claude/hooks/stop-check` exits 2 if `src/main.rs` contains `unwrap()`.
 - [x] Each file in `.claude/agents/` has frontmatter with a `name` equal to the file name, a `description`, and a valid `model` and `effort`.
-- [ ] A `Read` of `secrets/x` is denied.
+- [x] A `Read` of `secrets/x` is denied.
 - [x] `rg`, `fd`, `shellcheck`, and `gh` exist in the devcontainer.
-- [ ] A `gh` login stays after a container rebuild.
+- [x] A `gh` login stays after a container rebuild.
 - [x] `shellcheck` gives no finding for `.claude/hooks/stop-check` and `.devcontainer/post-create.sh`.
 
 **Tests to add/update:**
