@@ -1,4 +1,5 @@
-# Build the macOS binary for Apple Silicon on a tag v* (ADR-0005, spec 0005).
+# On a tag v*: run all checks in the devcontainer, then build the macOS binary
+# for Apple Silicon (ADR-0005, specs 0005 and 0011). No other workflow exists.
 name: Release
 
 on:
@@ -9,7 +10,21 @@ on:
 permissions: {}
 
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: devcontainers/ci@513af61f4de4f75d37e4438f184ba4358f0fc1ca # v0.3.1900000450
+        with:
+          runCmd: ./scripts/check
+          push: never
+
   release:
+    needs: check
     runs-on: macos-15
     permissions:
       contents: write

@@ -3,7 +3,7 @@
 **Date:** 2026-11-02
 **Status:** done
 **Author:** Claude (agent)
-**Related:** `docs/plan/pseudonymization.md` §2 (14, 15) · `docs/adr/0002-develop-in-a-devcontainer.md` · `docs/adr/0005-build-releases-in-github-actions.md`
+**Related:** `docs/plan/pseudonymization.md` §2 (14, 15) · `docs/adr/0002-develop-in-a-devcontainer.md` · `docs/adr/0005-build-releases-in-github-actions.md` · `docs/specs/0011-checks-only-on-release-tags.md`
 
 ---
 
@@ -70,6 +70,8 @@ gh run list --workflow ci.yml --limit 1
 - Run `xattr -d com.apple.quarantine pseudofy`, then `./pseudofy --version` — the output is `pseudofy 0.1.0`.
 
 ## 5. Rollback / Notes (optional)
+
+Spec 0011 replaces the CI trigger: the checks run only on a tag `v*`, before the release build. `ci.yml` no longer exists.
 
 The binary has only the ad-hoc signature of the Rust linker. Gatekeeper blocks a downloaded binary until the user removes the quarantine attribute.
 A later spec can add Developer ID signing and notarization.
