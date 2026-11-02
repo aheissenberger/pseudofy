@@ -11,20 +11,22 @@ use regex::Regex;
 use umya_spreadsheet::{CellRawValue, Workbook, reader, writer};
 
 use crate::cells::{
-    ColRole, EmailFn, Kind, NameFn, collect_columns, missing_headers, role_of,
+    CellFns, ColRole, Collector, EmailFn, Kind, collect_columns, missing_headers, role_of,
     rules_without_headers, transform_cell, write_output,
 };
 use crate::config::Rule;
+use crate::known_names::KnownNames;
 use crate::panic_guard;
 use crate::pseudonym::Pseudonymizer;
-use crate::text;
 use crate::xlsx_scrub;
 
 /// Counts for one processed workbook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct XlsxStats {
-    /// Replaced values.
+    /// Replaced values (including the free-text replacements).
     pub replaced: usize,
+    /// Known names replaced in text cells.
+    pub free_text: usize,
     /// Formula cells (left unchanged).
     pub formulas: usize,
     /// Rich-text cells that were written as plain text.
@@ -33,6 +35,51 @@ pub struct XlsxStats {
 
 /// A rule with the sheet-name globs of its `sheets` field (`None`: each sheet).
 type SheetRule<'a> = (Option<GlobSet>, &'a Rule);
+
+/// Read the workbook at `input`. With `quiet`, nothing is printed.
+fn open_book(input: &Path, rel: &str, quiet: bool) -> anyhow::Result<Workbook> {
+    let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
+    let unreadable = || anyhow!("{rel}: cannot read the workbook");
+    if has_pivot_parts(&bytes) {
+        return Err(anyhow!("{rel}: workbook has pivot tables; not supported"));
+    }
+    let found = xlsx_scrub::inspect(&bytes).map_err(|_| unreadable())?;
+    if found.unsupported {
+        return Err(anyhow!("{rel}: unsupported workbook layout"));
+    }
+    if !quiet && !found.kinds.is_empty() {
+        eprintln!(
+            "warning: {rel}: not pseudonymized: {}",
+            found.kinds.join(", ")
+        );
+    }
+    // The crate can panic on a damaged workbook; its error texts are not used.
+    panic_guard::catch(|| reader::xlsx::read_reader(Cursor::new(bytes), true))
+        .ok_or_else(unreadable)?
+        .map_err(|_| unreadable())
+}
+
+/// Pass 1: read the name columns of `input` and add the known names to
+/// `known`. Nothing is written or printed. On an error `known` stays unchanged.
+pub fn collect(
+    input: &Path,
+    rel: &str,
+    rules: &[&Rule],
+    cells: &CellFns,
+    known: &mut KnownNames,
+) -> anyhow::Result<()> {
+    let mut book = open_book(input, rel, true)?;
+    let mut collector = Collector::default();
+    transform(
+        &mut book,
+        rules,
+        cells,
+        &mut |_, _| String::new(),
+        Some(&mut collector),
+    )?;
+    collector.apply(known);
+    Ok(())
+}
 
 /// Read `input`, replace names and emails in each sheet, write the copy to
 /// `output`. `out_root` is the output directory, `rel` the relative path for
@@ -44,41 +91,16 @@ pub fn process(
     rel: &str,
     rules: &[&Rule],
     pseudonymizer: &mut Pseudonymizer,
-    email_regex: &Regex,
+    cells: &CellFns,
 ) -> anyhow::Result<XlsxStats> {
-    let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
-    let unreadable = || anyhow!("{rel}: cannot read the workbook");
-    if has_pivot_parts(&bytes) {
-        return Err(anyhow!("{rel}: workbook has pivot tables; not supported"));
-    }
-    let found = xlsx_scrub::inspect(&bytes).map_err(|_| unreadable())?;
-    if found.unsupported {
-        return Err(anyhow!("{rel}: unsupported workbook layout"));
-    }
-    if !found.kinds.is_empty() {
-        eprintln!(
-            "warning: {rel}: not pseudonymized: {}",
-            found.kinds.join(", ")
-        );
-    }
-    // The crate can panic on a damaged workbook; its error texts are not used.
-    let mut book = panic_guard::catch(|| reader::xlsx::read_reader(Cursor::new(bytes), true))
-        .ok_or_else(unreadable)?
-        .map_err(|_| unreadable())?;
+    let mut book = open_book(input, rel, false)?;
 
     let mut replace = |kind: Kind, value: &str| match kind {
         Kind::First => pseudonymizer.first_name(value),
         Kind::Last => pseudonymizer.last_name(value),
         Kind::Email => pseudonymizer.email(value),
     };
-    let result = transform(
-        &mut book,
-        rules,
-        email_regex,
-        text::replace_name,
-        text::replace_emails,
-        &mut replace,
-    )?;
+    let result = transform(&mut book, rules, cells, &mut replace, None)?;
     for glob in &result.no_sheet {
         eprintln!("warning: rule \"{glob}\" matches {rel}, but no sheet matches its sheets globs");
     }
@@ -233,14 +255,25 @@ fn sheet_rules<'a>(rules: &[&'a Rule]) -> anyhow::Result<Vec<SheetRule<'a>>> {
         .collect()
 }
 
+/// Give the text of a cell to the collector.
+fn collect_cell(collector: &mut Collector, cell: &umya_spreadsheet::Cell, role: Option<ColRole>) {
+    match cell.raw_value() {
+        CellRawValue::String(text) | CellRawValue::Lazy(text) => collector.cell(role, text),
+        CellRawValue::RichText(rich) => collector.cell(role, rich.text().as_ref()),
+        _ => {}
+    }
+}
+
+/// Transform each sheet. With `collect`, the workbook stays unchanged: the
+/// name cells of each row go to the collector instead.
 fn transform(
     book: &mut Workbook,
     rules: &[&Rule],
-    email_regex: &Regex,
-    names: NameFn,
-    emails: EmailFn,
+    fns: &CellFns,
     replace: &mut dyn FnMut(Kind, &str) -> String,
+    mut collect: Option<&mut Collector>,
 ) -> anyhow::Result<Transformed> {
+    let (email_regex, emails) = (fns.email_regex, fns.emails);
     let matchers = sheet_rules(rules)?;
     let all_pairs = missing_headers(&[], &collect_columns(rules));
     let mut found: Vec<(String, String)> = Vec::new();
@@ -269,13 +302,7 @@ fn transform(
         else {
             continue;
         };
-        let mut header_texts: HashMap<u32, String> = HashMap::new();
-        for cell in &cells {
-            let at = cell.coordinate();
-            if at.row_num() == header_row {
-                header_texts.insert(at.col_num(), cell.value().trim().to_lowercase());
-            }
-        }
+        let header_texts = header_texts(&cells, header_row);
         let texts: Vec<String> = header_texts.values().cloned().collect();
         let sheet_missing = missing_headers(&texts, &columns);
         for pair in missing_headers(&[], &columns) {
@@ -288,9 +315,20 @@ fn transform(
             .filter_map(|(col, text)| role_of(text, &columns).map(|role| (*col, role)))
             .collect();
 
+        let mut current_row = header_row;
         for cell in &mut cells {
             let at = cell.coordinate();
             let (row, col) = (at.row_num(), at.col_num());
+            if let Some(collector) = collect.as_deref_mut() {
+                if row != current_row {
+                    collector.end_row();
+                    current_row = row;
+                }
+                if row > header_row && !cell.is_formula() {
+                    collect_cell(collector, cell, by_col.get(&col).copied());
+                }
+                continue;
+            }
             scrub_hyperlink(cell, email_regex, emails, replace);
             if cell.is_formula() {
                 if row > header_row {
@@ -302,21 +340,18 @@ fn transform(
             if row <= header_row {
                 continue;
             }
-            let (old, rich) = match cell.raw_value() {
-                CellRawValue::String(text) | CellRawValue::Lazy(text) => (text.to_string(), false),
-                CellRawValue::RichText(rich) => (rich.text().to_string(), true),
-                _ => continue,
+            let Some((old, rich)) = string_value(cell) else {
+                continue;
             };
             let new = transform_cell(
                 &old,
                 by_col.get(&col).copied(),
-                email_regex,
-                names,
-                emails,
+                fns,
                 &mut |kind, value| {
                     stats.replaced += 1;
                     replace(kind, value)
                 },
+                &mut stats.free_text,
             );
             if new != old {
                 cell.set_value_string(new);
@@ -326,16 +361,14 @@ fn transform(
             }
         }
     }
+    if let Some(collector) = collect {
+        collector.end_row();
+    }
     let missing = all_pairs
         .into_iter()
         .filter(|pair| !found.contains(pair))
         .collect();
-    let no_sheet = matchers
-        .iter()
-        .zip(&sheet_matched)
-        .filter(|((set, _), matched)| set.is_some() && !**matched)
-        .map(|((_, rule), _)| rule.files.clone())
-        .collect();
+    let no_sheet = unmatched_sheet_rules(&matchers, &sheet_matched);
     Ok(Transformed {
         stats,
         missing,
@@ -343,9 +376,43 @@ fn transform(
     })
 }
 
+/// Header texts (trimmed, lowercase) of the header row by column number.
+fn header_texts(cells: &[&mut umya_spreadsheet::Cell], header_row: u32) -> HashMap<u32, String> {
+    cells
+        .iter()
+        .filter(|cell| cell.coordinate().row_num() == header_row)
+        .map(|cell| {
+            (
+                cell.coordinate().col_num(),
+                cell.value().trim().to_lowercase(),
+            )
+        })
+        .collect()
+}
+
+/// The text of a string cell and whether it is rich text.
+fn string_value(cell: &umya_spreadsheet::Cell) -> Option<(String, bool)> {
+    match cell.raw_value() {
+        CellRawValue::String(text) | CellRawValue::Lazy(text) => Some((text.to_string(), false)),
+        CellRawValue::RichText(rich) => Some((rich.text().to_string(), true)),
+        _ => None,
+    }
+}
+
+/// Globs of the rules with `sheets` that matched no sheet.
+fn unmatched_sheet_rules(matchers: &[SheetRule], sheet_matched: &[bool]) -> Vec<String> {
+    matchers
+        .iter()
+        .zip(sheet_matched)
+        .filter(|((set, _), matched)| set.is_some() && !**matched)
+        .map(|((_, rule), _)| rule.files.clone())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text;
 
     fn rule(sheets: &[&str]) -> Rule {
         Rule {
@@ -369,15 +436,13 @@ mod tests {
 
     fn run(book: &mut Workbook, rules: &[&Rule]) -> Transformed {
         let regex = text::email_regex().unwrap();
-        transform(
-            book,
-            rules,
-            &regex,
-            text::replace_name,
-            text::replace_emails,
-            &mut fake,
-        )
-        .unwrap()
+        let fns = CellFns {
+            email_regex: &regex,
+            names: text::replace_name,
+            emails: text::replace_emails,
+            matcher: None,
+        };
+        transform(book, rules, &fns, &mut fake, None).unwrap()
     }
 
     fn book() -> Workbook {

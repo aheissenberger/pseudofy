@@ -4,12 +4,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use globset::GlobBuilder;
+use globset::{GlobBuilder, GlobMatcher};
 use walkdir::WalkDir;
 
+use crate::cells::CellFns;
 use crate::config::{self, Rule};
 use crate::csv_file;
 use crate::key;
+use crate::known_names::KnownNames;
 use crate::pseudonym::Pseudonymizer;
 use crate::text;
 use crate::xlsx_file;
@@ -25,6 +27,15 @@ pub struct Summary {
     pub failed: usize,
 }
 
+/// A CSV or XLSX file of the project that both passes handle.
+struct Item<'a> {
+    path: PathBuf,
+    relative: PathBuf,
+    rel: String,
+    csv: bool,
+    rules: Vec<&'a Rule>,
+}
+
 /// Write a pseudonymized copy of each CSV and XLSX file under `project` to
 /// `out`. A failed file is reported and counted in `failed`; the run goes on.
 /// Excel lock files (`~$*`) are skipped.
@@ -34,22 +45,12 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
 
     let (project, out) = resolve_dirs(project, out)?;
 
-    let matchers = config
-        .rules
-        .iter()
-        .map(|rule| {
-            let glob = GlobBuilder::new(&rule.files)
-                .case_insensitive(true)
-                .literal_separator(true)
-                .build()
-                .with_context(|| format!("invalid glob \"{}\" in the config", rule.files))?;
-            Ok((glob.compile_matcher(), rule))
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let matchers = rule_matchers(&config.rules)?;
 
     let email_regex = text::email_regex()?;
     let mut pseudonymizer = Pseudonymizer::new(&key, config.language, config.email_subdomains);
     let mut summary = Summary::default();
+    let mut items: Vec<Item> = Vec::new();
 
     let secrets = project.join("secrets");
     let config_dir = project.join("config");
@@ -98,30 +99,39 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
         if rules.is_empty() {
             eprintln!("warning: {rel}: no rule matches; only emails are replaced");
         }
-        let target = out.join(relative);
-        let result = if csv {
-            csv_file::process(
-                entry.path(),
-                &out,
-                &target,
-                &rel,
-                &rules,
-                &mut pseudonymizer,
-                &email_regex,
-            )
-        } else {
-            process_xlsx(
-                entry.path(),
-                &out,
-                &target,
-                &rel,
-                &rules,
-                &mut pseudonymizer,
-                &email_regex,
-            )
-        };
+        items.push(Item {
+            path: entry.path().to_path_buf(),
+            relative: relative.to_path_buf(),
+            rel,
+            csv,
+            rules,
+        });
+    }
+
+    // Pass 1: collect the known names. A file that fails here is skipped; pass 2
+    // reports it.
+    let mut known = KnownNames::default();
+    let pass1 = CellFns {
+        email_regex: &email_regex,
+        names: text::replace_name,
+        emails: text::replace_emails,
+        matcher: None,
+    };
+    collect_known(&items, &pass1, &mut known);
+    let matcher = known.matcher(config.free_text)?;
+    let pass2 = CellFns {
+        matcher: Some(&matcher),
+        ..pass1
+    };
+
+    // Pass 2: write the copies.
+    for item in &items {
+        let result = write_item(item, &out, &mut pseudonymizer, &pass2);
         match result {
-            Ok(replaced) => {
+            Ok((replaced, free_text)) => {
+                if free_text > 0 {
+                    println!("{}: {free_text} free-text replacements", item.rel);
+                }
                 summary.replaced += replaced;
                 summary.files += 1;
             }
@@ -135,8 +145,52 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
     Ok(summary)
 }
 
+/// The compiled file glob of each rule.
+fn rule_matchers(rules: &[Rule]) -> anyhow::Result<Vec<(GlobMatcher, &Rule)>> {
+    rules
+        .iter()
+        .map(|rule| {
+            let glob = GlobBuilder::new(&rule.files)
+                .case_insensitive(true)
+                .literal_separator(true)
+                .build()
+                .with_context(|| format!("invalid glob \"{}\" in the config", rule.files))?;
+            Ok((glob.compile_matcher(), rule))
+        })
+        .collect()
+}
+
+/// Pass 2 for one file. Returns the replaced values and the free-text replacements.
+fn write_item(
+    item: &Item,
+    out: &Path,
+    pseudonymizer: &mut Pseudonymizer,
+    cells: &CellFns,
+) -> anyhow::Result<(usize, usize)> {
+    let target = out.join(&item.relative);
+    let (path, rel, rules) = (&item.path, &item.rel, &item.rules);
+    if item.csv {
+        let stats = csv_file::process(path, out, &target, rel, rules, pseudonymizer, cells)?;
+        Ok((stats.replaced, stats.free_text))
+    } else {
+        process_xlsx(path, out, &target, rel, rules, pseudonymizer, cells)
+    }
+}
+
+/// Pass 1 over all files. A file that fails adds no names and is skipped.
+fn collect_known(items: &[Item], cells: &CellFns, known: &mut KnownNames) {
+    for item in items.iter().filter(|item| !item.rules.is_empty()) {
+        let collected = if item.csv {
+            csv_file::collect(&item.path, &item.rel, &item.rules, cells, known)
+        } else {
+            xlsx_file::collect(&item.path, &item.rel, &item.rules, cells, known)
+        };
+        drop(collected);
+    }
+}
+
 /// Process one XLSX file and report its formula and rich-text counts.
-/// Returns the number of replaced values.
+/// Returns the number of replaced values and of free-text replacements.
 fn process_xlsx(
     input: &Path,
     out: &Path,
@@ -144,9 +198,9 @@ fn process_xlsx(
     rel: &str,
     rules: &[&Rule],
     pseudonymizer: &mut Pseudonymizer,
-    email_regex: &regex::Regex,
-) -> anyhow::Result<usize> {
-    let stats = xlsx_file::process(input, out, target, rel, rules, pseudonymizer, email_regex)?;
+    cells: &CellFns,
+) -> anyhow::Result<(usize, usize)> {
+    let stats = xlsx_file::process(input, out, target, rel, rules, pseudonymizer, cells)?;
     if stats.formulas > 0 {
         println!("{rel}: {} formula cells unchanged", stats.formulas);
     }
@@ -156,7 +210,7 @@ fn process_xlsx(
             stats.rich_text
         );
     }
-    Ok(stats.replaced)
+    Ok((stats.replaced, stats.free_text))
 }
 
 /// Canonical project and output directories. Fail if the output could
