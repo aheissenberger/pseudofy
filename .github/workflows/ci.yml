@@ -2,7 +2,9 @@
 name: CI
 
 on:
+  # Branches only: a tag push starts the release workflow, not CI.
   push:
+    branches: ["**"]
   pull_request:
 
 permissions:
