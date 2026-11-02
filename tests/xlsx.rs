@@ -138,6 +138,75 @@ fn assert_no_leak(text: &str, what: &str) {
     }
 }
 
+/// Copies the entries of an XLSX package into a new one. `edit` gets the
+/// name and text of each part and returns new text to replace it. `extra`
+/// parts are appended.
+fn rewrite_package(
+    bytes: &[u8],
+    edit: impl Fn(&str, &str) -> Option<String>,
+    extra: &[(&str, &str)],
+) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, text) in package_parts(bytes) {
+        let text = edit(&name, &text).unwrap_or(text);
+        writer.start_file(name, options).unwrap();
+        writer.write_all(text.as_bytes()).unwrap();
+    }
+    for (name, text) in extra {
+        writer.start_file(*name, options).unwrap();
+        writer.write_all(text.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+/// Fails if an XML part of the package at `path` is not well-formed.
+fn assert_well_formed(path: &Path) {
+    let parts = package_parts(&fs::read(path).unwrap());
+    assert!(!parts.is_empty(), "package has no parts");
+    for (name, text) in parts {
+        let extension = Path::new(&name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        if !["xml", "rels", "vml"].contains(&extension.as_str()) {
+            continue;
+        }
+        let mut reader = quick_xml::Reader::from_str(&text);
+        let mut depth: i64 = 0;
+        loop {
+            let event = reader
+                .read_event()
+                .unwrap_or_else(|_| panic!("package part {name} is not well-formed"));
+            match event {
+                quick_xml::events::Event::Eof => break,
+                quick_xml::events::Event::Start(_) => depth += 1,
+                quick_xml::events::Event::End(_) => depth -= 1,
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "package part {name} has unbalanced elements");
+    }
+}
+
+const MAIN_NS: &str = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+
+/// Runs on a project whose only failing file is `file`. Checks the
+/// "unsupported workbook layout" error and that no copy exists.
+fn run_refused(dir: &TempDir, file: &str) -> String {
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(stderr.contains(file), "stderr: {stderr}");
+    assert!(
+        stderr.contains("unsupported workbook layout"),
+        "stderr: {stderr}"
+    );
+    assert_no_leak(&stderr, "stderr");
+    assert!(!out.path().join(file).exists(), "a copy was written");
+    stderr
+}
+
 #[test]
 fn name_in_csv_and_xlsx_gets_the_same_pseudonym() {
     let dir = project(None);
@@ -376,6 +445,7 @@ fn output_workbooks_and_streams_contain_no_real_value() {
     }
     assert!(seen >= 8, "expected cells in the output, found {seen}");
     assert_package_clean(&out.path().join("mappe.xlsx"));
+    assert_well_formed(&out.path().join("mappe.xlsx"));
 }
 
 /// The input must really keep the names in the shared-string table,
@@ -413,6 +483,7 @@ fn mailto_hyperlink_gets_the_fake_address() {
     save(&book, dir.path(), "mappe.xlsx");
     let (out, _, _) = run_ok(dir.path());
     assert_package_clean(&out.path().join("mappe.xlsx"));
+    assert_well_formed(&out.path().join("mappe.xlsx"));
     let copy = open(out.path(), "mappe.xlsx");
     let sheet = copy.sheet_by_name("Daten").unwrap();
     let cell = sheet.cell("B2").unwrap();
@@ -434,6 +505,7 @@ fn cached_formula_result_does_not_leak_a_real_name() {
     save(&book, dir.path(), "mappe.xlsx");
     let (out, _, _) = run_ok(dir.path());
     assert_package_clean(&out.path().join("mappe.xlsx"));
+    assert_well_formed(&out.path().join("mappe.xlsx"));
     let copy = open(out.path(), "mappe.xlsx");
     let sheet = copy.sheet_by_name("Daten").unwrap();
     assert_eq!(sheet.cell("A3").unwrap().formula(), "A2");
@@ -566,8 +638,14 @@ fn rich_text_cell_in_a_name_column_is_replaced_and_reported() {
         .set_rich_text(rich);
     save(&book, dir.path(), "mappe.xlsx");
     let (out, _, stderr) = run_ok(dir.path());
-    assert!(stderr.contains("rich-text"), "stderr: {stderr}");
+    assert!(stderr.contains("1 rich-text cells"), "stderr: {stderr}");
     assert_package_clean(&out.path().join("mappe.xlsx"));
+    assert_well_formed(&out.path().join("mappe.xlsx"));
+    let copy = open(out.path(), "mappe.xlsx");
+    let replaced = value(&copy, "Daten", "A3");
+    assert!(!replaced.is_empty(), "rich-text cell is empty");
+    assert_ne!(replaced, "Zorbina Quenzel");
+    assert_no_leak(&replaced, "rich-text cell");
 }
 
 #[test]
@@ -604,4 +682,191 @@ fn input_files_stay_unchanged() {
         before_xlsx
     );
     assert_eq!(fs::read(dir.path().join("kunden.csv")).unwrap(), before_csv);
+}
+
+fn sheet_with(cells: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><worksheet xmlns=\"{MAIN_NS}\"><sheetData>{cells}</sheetData></worksheet>"
+    )
+}
+
+#[test]
+fn unprocessed_parts_give_one_warning_without_content() {
+    let dir = project(None);
+    let bytes = book_bytes(&simple_book("Tamsorin Velgrad", "tamsorin@acme.test"));
+    let edited = rewrite_package(
+        &bytes,
+        |name, text| {
+            if name != "xl/worksheets/sheet1.xml" {
+                return None;
+            }
+            let validations = "</sheetData><dataValidations count=\"1\"><dataValidation type=\"list\" sqref=\"A2\"><formula1>\"x,y\"</formula1></dataValidation></dataValidations>";
+            let header = "<headerFooter><oddHeader>&amp;LZorbina Quenzel</oddHeader></headerFooter></worksheet>";
+            Some(
+                text.replacen("</sheetData>", validations, 1)
+                    .replacen("</worksheet>", header, 1),
+            )
+        },
+        &[],
+    );
+    fs::write(dir.path().join("mappe.xlsx"), edited).unwrap();
+    let (out, _, stderr) = run_ok(dir.path());
+    assert!(out.path().join("mappe.xlsx").exists());
+    let warnings: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("not pseudonymized"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "stderr: {stderr}");
+    let line = warnings[0];
+    assert!(line.contains("warning:"), "line: {line}");
+    assert!(line.contains("mappe.xlsx"), "line: {line}");
+    assert!(line.contains("data validations"), "line: {line}");
+    assert!(line.contains("headers/footers"), "line: {line}");
+    assert_no_leak(&stderr, "stderr");
+    assert_well_formed(&out.path().join("mappe.xlsx"));
+}
+
+#[test]
+fn comments_part_gives_a_comments_warning() {
+    let dir = project(None);
+    let bytes = book_bytes(&simple_book("Tamsorin Velgrad", "tamsorin@acme.test"));
+    let comments = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><comments xmlns=\"{MAIN_NS}\"><authors><author>Autor</author></authors><commentList/></comments>"
+    );
+    let edited = rewrite_package(&bytes, |_, _| None, &[("xl/comments1.xml", &comments)]);
+    fs::write(dir.path().join("mappe.xlsx"), edited).unwrap();
+    let (_out, _, stderr) = run_ok(dir.path());
+    let line = stderr
+        .lines()
+        .find(|line| line.contains("not pseudonymized"))
+        .unwrap_or_default();
+    assert!(line.contains("mappe.xlsx"), "stderr: {stderr}");
+    assert!(line.contains("comments"), "stderr: {stderr}");
+    assert_no_leak(&stderr, "stderr");
+}
+
+#[test]
+fn plain_workbook_gives_no_unprocessed_warning() {
+    let dir = project(None);
+    save(
+        &simple_book("Tamsorin Velgrad", "tamsorin@acme.test"),
+        dir.path(),
+        "mappe.xlsx",
+    );
+    let (_out, _, stderr) = run_ok(dir.path());
+    assert!(!stderr.contains("not pseudonymized"), "stderr: {stderr}");
+}
+
+#[test]
+fn hyperlink_tooltip_is_cleared() {
+    let dir = project(None);
+    let mut book = simple_book("Zorbina Quenzel", "zorbina@acme.test");
+    let mut link = umya_spreadsheet::Hyperlink::default();
+    link.set_url("https://example.com/seite");
+    link.set_tooltip("Mail Zorbina Quenzel");
+    book.sheet_by_name_mut("Daten")
+        .unwrap()
+        .cell_mut("A2")
+        .set_hyperlink(link);
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    assert_package_clean(&out.path().join("mappe.xlsx"));
+    assert_well_formed(&out.path().join("mappe.xlsx"));
+    let copy = open(out.path(), "mappe.xlsx");
+    let sheet = copy.sheet_by_name("Daten").unwrap();
+    let link = sheet.cell("A2").unwrap().hyperlink().cloned();
+    let tooltip = link.map(|h| h.tooltip().to_string()).unwrap_or_default();
+    assert_eq!(tooltip, "");
+}
+
+#[test]
+fn percent_encoded_mailto_gets_the_fake_address() {
+    let dir = project(None);
+    let mut book = simple_book("Zorbina Quenzel", "tamsorin@acme.test");
+    let mut link = umya_spreadsheet::Hyperlink::default();
+    link.set_url("mailto:tamsorin%40acme.test");
+    book.sheet_by_name_mut("Daten")
+        .unwrap()
+        .cell_mut("B2")
+        .set_hyperlink(link);
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    assert_package_clean(&out.path().join("mappe.xlsx"));
+    assert_well_formed(&out.path().join("mappe.xlsx"));
+    let copy = open(out.path(), "mappe.xlsx");
+    let sheet = copy.sheet_by_name("Daten").unwrap();
+    let cell = sheet.cell("B2").unwrap();
+    let fake = cell.value().to_string();
+    assert!(fake.contains('@'), "cell: {fake}");
+    let url = cell.hyperlink().map(|h| h.url().to_string());
+    assert_eq!(url, Some(format!("mailto:{fake}")));
+}
+
+#[test]
+fn mailto_with_query_part_is_reduced_to_the_fake_address() {
+    let dir = project(None);
+    let mut book = simple_book("Zorbina Quenzel", "Pirmox.Hulbert@acme.test");
+    let mut link = umya_spreadsheet::Hyperlink::default();
+    link.set_url("mailto:Pirmox.Hulbert@acme.test?subject=Hallo%20Pirmox");
+    book.sheet_by_name_mut("Daten")
+        .unwrap()
+        .cell_mut("B2")
+        .set_hyperlink(link);
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    assert_package_clean(&out.path().join("mappe.xlsx"));
+    assert_well_formed(&out.path().join("mappe.xlsx"));
+    for (name, text) in package_parts(&fs::read(out.path().join("mappe.xlsx")).unwrap()) {
+        assert!(
+            !text.to_lowercase().contains("pirmox"),
+            "part {name} leaks pirmox"
+        );
+    }
+    let copy = open(out.path(), "mappe.xlsx");
+    let sheet = copy.sheet_by_name("Daten").unwrap();
+    let cell = sheet.cell("B2").unwrap();
+    let fake = cell.value().to_string();
+    assert!(fake.contains('@'), "cell: {fake}");
+    let url = cell.hyperlink().map(|h| h.url().to_string());
+    assert_eq!(url, Some(format!("mailto:{fake}")));
+}
+
+#[test]
+fn prefixed_shared_string_table_is_refused() {
+    let dir = project(None);
+    let bytes = book_bytes(&simple_book("Tamsorin Velgrad", "tamsorin@acme.test"));
+    let strings = ["name", "email", "Tamsorin Velgrad", "tamsorin@acme.test"];
+    let mut items = String::new();
+    for text in strings.iter().chain(strings.iter()) {
+        items += "<x:si><x:t>";
+        items += text;
+        items += "</x:t></x:si>";
+    }
+    let sst = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><x:sst xmlns:x=\"{MAIN_NS}\">{items}</x:sst>"
+    );
+    let edited = rewrite_package(
+        &bytes,
+        |name, _| (name == "xl/sharedStrings.xml").then(|| sst.clone()),
+        &[],
+    );
+    fs::write(dir.path().join("mappe.xlsx"), edited).unwrap();
+    run_refused(&dir, "mappe.xlsx");
+}
+
+#[test]
+fn inline_string_with_two_runs_is_refused() {
+    let dir = project(None);
+    let bytes = book_bytes(&simple_book("Tamsorin Velgrad", "tamsorin@acme.test"));
+    let sheet = sheet_with(concat!(
+        "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>name</t></is></c></row>",
+        "<row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><r><t>Tamsorin</t></r><r><t> Velgrad</t></r></is></c></row>"
+    ));
+    let edited = rewrite_package(
+        &bytes,
+        |name, _| (name == "xl/worksheets/sheet1.xml").then(|| sheet.clone()),
+        &[],
+    );
+    fs::write(dir.path().join("mappe.xlsx"), edited).unwrap();
+    run_refused(&dir, "mappe.xlsx");
 }
