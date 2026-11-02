@@ -868,3 +868,65 @@ fn quoted_newline_header_and_semicolon_delimiter_are_kept() {
     assert!(!data_line.contains(','), "{output:?}");
     assert!(data_line.starts_with("1;"), "{output:?}");
 }
+
+#[test]
+fn partial_headers_give_no_warning() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "first_name,last_name\nZorbina,Quenzel\n",
+    );
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).success();
+    let stderr = stderr_text(&assert);
+    assert!(!stderr.contains("warning"), "{stderr}");
+}
+
+#[test]
+fn rule_without_any_header_warns_once() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(dir.path(), "data.csv", "id,note\n1,x\n");
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).success();
+    let stderr = stderr_text(&assert);
+    assert_eq!(stderr.matches("warning").count(), 1, "{stderr}");
+    assert!(stderr.contains("data.csv"), "{stderr}");
+}
+
+#[test]
+fn a_bad_file_is_reported_and_the_other_files_are_written() {
+    let dir = project(KEY_A, None, &[]);
+    let bad = dir.path().join("a_bad.csv");
+    fs::write(&bad, b"first_name\nZorbina\xff\n").unwrap();
+    write_file(dir.path(), "b_good.csv", "first_name\nTamsorin\n");
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).failure();
+    let stderr = stderr_text(&assert);
+    assert!(stderr.contains("a_bad.csv"), "{stderr}");
+    assert!(stderr.contains("1 file(s) failed"), "{stderr}");
+    assert_no_leak(&stderr, "stderr");
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(stdout.contains("files: 1,"), "{stdout}");
+    assert!(!out.path().join("a_bad.csv").exists());
+    let good = read(out.path(), "b_good.csv");
+    assert!(!good.to_lowercase().contains("tamsorin"), "{good}");
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinked_input_is_skipped_with_a_warning() {
+    let dir = project(KEY_A, None, &[]);
+    let target = TempDir::new().unwrap();
+    write_file(target.path(), "linked.csv", "first_name\nZorbina\n");
+    std::os::unix::fs::symlink(
+        target.path().join("linked.csv"),
+        dir.path().join("linked.csv"),
+    )
+    .unwrap();
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).success();
+    let stderr = stderr_text(&assert);
+    assert!(stderr.contains("linked.csv: symlink skipped"), "{stderr}");
+    assert!(!out.path().join("linked.csv").exists());
+}

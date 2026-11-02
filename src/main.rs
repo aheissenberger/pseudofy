@@ -96,5 +96,8 @@ fn run(project: &Path, out: &Path) -> anyhow::Result<()> {
     if summary.collisions > 0 {
         eprintln!("warning: two or more real values share one pseudonym");
     }
+    if summary.failed > 0 {
+        bail!("{} file(s) failed; see the messages above", summary.failed);
+    }
     Ok(())
 }
