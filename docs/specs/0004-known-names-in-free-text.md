@@ -1,7 +1,7 @@
 # Feature Delta Spec: Known names in free text
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** active
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 (11) · `docs/specs/0002-pseudonym-engine-and-csv.md` · `docs/specs/0003-xlsx-support.md` · `docs/adr/0003-derive-pseudonyms-with-a-keyed-hash.md`
 
@@ -24,6 +24,9 @@
 
 - `src/run.rs` — two passes. Pass 1 collects the known names from all files. Pass 2 writes the copies.
 - `src/config.rs` — the optional key `free_text` with the values `full` and `tokens`. The default is `tokens`.
+- `src/csv_file.rs`, `src/xlsx_file.rs` — pass 1 reads the name columns of each file. Pass 2 gives the matcher to the cell replacement.
+- `src/cells.rs` — replace known names in each text cell outside the name and email columns, after the emails.
+- `src/config.rs` template from `pseudofy init` — a commented `free_text` line.
 
 ### Removed
 
@@ -44,6 +47,8 @@
 - [ ] `tokens` also replaces each single first-name and last-name token.
 - [ ] A longer match has priority over a shorter match.
 - [ ] Known names stay in memory only. pseudofy never writes them to a file or a log.
+- [ ] Header rows are not changed.
+- [ ] A file that fails in pass 1 adds no known names. Pass 2 reports it.
 
 ## 4. Acceptance Criteria & Verification
 
@@ -53,7 +58,7 @@
 - [ ] A known name from a CSV file is replaced in a text cell of an XLSX file in the same project.
 - [ ] With `free_text = "full"`, "Anna said" stays unchanged. With `tokens`, "Anna" is replaced.
 - [ ] "Annabelle" stays unchanged if only "Anna" is known.
-- [ ] `run` prints the number of free-text replacements for each file.
+- [ ] `run` prints `<rel>: <N> free-text replacements` to stdout for each file with N > 0.
 
 **Tests to add/update:**
 
