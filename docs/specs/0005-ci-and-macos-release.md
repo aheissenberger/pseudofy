@@ -1,7 +1,7 @@
 # Feature Delta Spec: CI and macOS release
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** active
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 (14, 15) · `docs/adr/0002-develop-in-a-devcontainer.md` · `docs/adr/0005-build-releases-in-github-actions.md`
 

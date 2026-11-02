@@ -1,0 +1,54 @@
+# Build the macOS binary for Apple Silicon on a tag v* (ADR-0005, spec 0005).
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions: {}
+
+jobs:
+  release:
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check that the tag equals the Cargo.toml version
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+          if [ "v${version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} is not equal to the Cargo.toml version ${version}"
+            exit 1
+          fi
+          echo "VERSION=${version}" >> "${GITHUB_ENV}"
+
+      - name: Install the Rust version from rust-toolchain.toml
+        run: |
+          channel="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "${channel}" --profile minimal --target aarch64-apple-darwin
+
+      - name: Build
+        run: cargo build --release --locked --target aarch64-apple-darwin
+
+      - name: Package
+        run: |
+          name="pseudofy-${VERSION}-aarch64-apple-darwin"
+          file target/aarch64-apple-darwin/release/pseudofy
+          tar -czf "${name}.tar.gz" -C target/aarch64-apple-darwin/release pseudofy
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          echo "ASSET=${name}" >> "${GITHUB_ENV}"
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            "${ASSET}.tar.gz" "${ASSET}.tar.gz.sha256" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "pseudofy ${VERSION}" \
+            --notes "macOS binary for Apple Silicon (aarch64-apple-darwin). See README.md, section \"Install on macOS\"."
