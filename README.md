@@ -13,7 +13,19 @@ pseudofy refuses workbooks with pivot tables.
 
 ## Install on macOS
 
-pseudofy has a binary for Macs with Apple Silicon. Download it from the GitHub release:
+pseudofy has a binary for Macs with Apple Silicon.
+
+### Homebrew
+
+```sh
+brew install aheissenberger/tools/pseudofy
+```
+
+Homebrew checks the SHA256 of the download and adds no quarantine attribute.
+
+### Manual download
+
+Download the binary from the GitHub release:
 
 ```sh
 version=0.1.0
