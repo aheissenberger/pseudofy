@@ -1,7 +1,7 @@
 # Feature Delta Spec: Homebrew formula
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 (17) · `docs/adr/0008-distribute-on-macos-with-the-homebrew-tools-tap.md` · `docs/specs/0005-ci-and-macos-release.md`
 
@@ -50,14 +50,14 @@ This spec starts only after spec 0005 is done and the release `v0.1.0` exists.
 
 **Behavior:**
 
-- [ ] `brew install aheissenberger/tools/pseudofy` installs `pseudofy` without a quarantine attribute.
-- [ ] `pseudofy --version` prints `pseudofy 0.1.0`.
-- [ ] `brew test aheissenberger/tools/pseudofy` passes.
-- [ ] On an Intel Mac, `brew install` stops with an architecture error.
+- [x] `brew install aheissenberger/tools/pseudofy` installs `pseudofy` without a quarantine attribute.
+- [x] `pseudofy --version` prints `pseudofy 0.1.0`.
+- [x] `brew test aheissenberger/tools/pseudofy` passes.
+- [x] On an Intel Mac, `brew install` stops with an architecture error.
 
 **Tests to add/update:**
 
-- [ ] `Formula/pseudofy.rb` — `test do` block asserts the version output.
+- [x] `Formula/pseudofy.rb` — `test do` block asserts the version output.
 
 **Commands that must pass:**
 
@@ -76,6 +76,8 @@ xattr "$(brew --prefix)/bin/pseudofy"
 - Run `xattr` on the installed binary — the output does not contain `com.apple.quarantine`.
 
 ## 5. Rollback / Notes (optional)
+
+Verified on 2026-11-02 with Homebrew 57cac9d: `brew style` and `brew audit --strict --online` pass, `brew install` and `brew test` pass on an Apple Silicon Mac, `pseudofy --version` prints `pseudofy 0.1.0`, and the binary has no quarantine attribute. The Intel case is covered by `depends_on arch: :arm64`; no Intel Mac was tested. Current Homebrew trusts the formula on `brew install aheissenberger/tools/pseudofy`.
 
 To roll back, delete `Formula/pseudofy.rb` from the tap. The GitHub release stays.
 The formula depends on the tarball layout of spec 0005: the binary `pseudofy` is at the root of the tarball.
