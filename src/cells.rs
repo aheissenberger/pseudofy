@@ -9,6 +9,7 @@ use anyhow::{Context, bail};
 use regex::Regex;
 
 use crate::config::Rule;
+use crate::known_names::{KnownNames, Matcher};
 use crate::text::{self, NameRole, Part};
 
 /// Name replacement function (the signature of `text::replace_name`).
@@ -184,15 +185,113 @@ pub(crate) fn replace_spans(
     out
 }
 
-/// Replace names and emails in one cell, depending on the column role.
+/// What `transform_cell` needs besides the cell.
+pub(crate) struct CellFns<'a> {
+    pub(crate) email_regex: &'a Regex,
+    pub(crate) names: NameFn,
+    pub(crate) emails: EmailFn,
+    /// Known names for text cells (pass 2 of spec 0004); `None`: no free-text pass.
+    pub(crate) matcher: Option<&'a Matcher>,
+}
+
+/// Known names found in the name columns of one file (pass 1). They reach
+/// `KnownNames` only through `apply`, after the whole file was read.
+#[derive(Default)]
+pub(crate) struct Collector {
+    persons: Vec<(String, String)>,
+    fulls: Vec<String>,
+    first: String,
+    last: String,
+}
+
+impl Collector {
+    /// One data cell. Call `end_row` after the last cell of each row.
+    pub(crate) fn cell(&mut self, role: Option<ColRole>, value: &str) {
+        let value = value.trim();
+        if value.is_empty() {
+            return;
+        }
+        match role {
+            Some(ColRole::Name(NameRole::First)) if self.first.is_empty() => {
+                value.clone_into(&mut self.first);
+            }
+            Some(ColRole::Name(NameRole::Last)) if self.last.is_empty() => {
+                value.clone_into(&mut self.last);
+            }
+            Some(ColRole::Name(NameRole::Full)) => self.fulls.push(value.to_owned()),
+            _ => {}
+        }
+    }
+
+    /// End of a data row: the first-name and last-name cells form one person.
+    pub(crate) fn end_row(&mut self) {
+        if !self.first.is_empty() || !self.last.is_empty() {
+            self.persons.push((
+                std::mem::take(&mut self.first),
+                std::mem::take(&mut self.last),
+            ));
+        }
+    }
+
+    pub(crate) fn apply(mut self, known: &mut KnownNames) {
+        self.end_row();
+        for (first, last) in &self.persons {
+            known.add_person(first, last);
+        }
+        for value in &self.fulls {
+            known.add_full(value);
+        }
+    }
+}
+
+/// Replace the known names in `text` (which holds no address).
+fn free_segment(
+    matcher: &Matcher,
+    text: &str,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+    free: &mut usize,
+) -> String {
+    let (out, count) = matcher.replace(text, &mut |part, token| replace(name_kind(part), token));
+    *free += count;
+    out
+}
+
+/// Replace the addresses of a text cell; replace the known names in the text
+/// outside the addresses.
+fn replace_free_text(
+    cell: &str,
+    fns: &CellFns,
+    matcher: &Matcher,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+    free: &mut usize,
+) -> String {
+    let mut out = String::with_capacity(cell.len());
+    let mut pos = 0;
+    for span in text::email_spans(cell, fns.email_regex) {
+        let before = cell.get(pos..span.start).unwrap_or("");
+        out.push_str(&free_segment(matcher, before, replace, free));
+        out.push_str(&replace(Kind::Email, cell.get(span.clone()).unwrap_or("")));
+        pos = span.end;
+    }
+    out.push_str(&free_segment(
+        matcher,
+        cell.get(pos..).unwrap_or(""),
+        replace,
+        free,
+    ));
+    out
+}
+
+/// Replace names and emails in one cell, depending on the column role. In a
+/// cell without role, the known names count in `free`.
 pub(crate) fn transform_cell(
     cell: &str,
     role: Option<ColRole>,
-    email_regex: &Regex,
-    names: NameFn,
-    emails: EmailFn,
+    fns: &CellFns,
     replace: &mut dyn FnMut(Kind, &str) -> String,
+    free: &mut usize,
 ) -> String {
+    let (email_regex, names, emails) = (fns.email_regex, fns.names, fns.emails);
     let trimmed = cell.trim();
     if trimmed.is_empty() {
         return cell.to_owned();
@@ -222,9 +321,12 @@ pub(crate) fn transform_cell(
             out.push_str(cell.get(cell.len() - tail..).unwrap_or(""));
             out
         }
-        None => emails(cell, email_regex, &mut |address| {
-            replace(Kind::Email, address)
-        }),
+        None => match fns.matcher {
+            Some(matcher) => replace_free_text(cell, fns, matcher, replace, free),
+            None => emails(cell, email_regex, &mut |address| {
+                replace(Kind::Email, address)
+            }),
+        },
     }
 }
 

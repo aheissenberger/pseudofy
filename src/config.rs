@@ -21,10 +21,6 @@ pub struct Config {
     pub email_subdomains: bool,
     /// How known names are replaced in text cells outside the name columns.
     #[serde(default)]
-    #[expect(
-        dead_code,
-        reason = "spec 0004 skeleton; run reads it, the orchestrator removes this after the merge"
-    )]
     pub free_text: FreeText,
     #[serde(default, rename = "rule")]
     pub rules: Vec<Rule>,
