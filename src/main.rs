@@ -75,7 +75,11 @@ fn init(project: &Path, language: Option<Language>) -> anyhow::Result<()> {
         detected.language
     });
     key::create(project)?;
-    config::create(project, language)?;
+    if let Err(error) = config::create(project, language) {
+        // Remove the new key so that a later `init` can start again.
+        let _ = std::fs::remove_file(project.join(KEY_FILE));
+        return Err(error);
+    }
     println!(
         "created {KEY_FILE} and {CONFIG_FILE} (language = \"{}\")",
         language.code()
