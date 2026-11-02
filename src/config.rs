@@ -66,9 +66,11 @@ language = "{}"
 email_subdomains = true
 
 # Each rule selects files with a glob (relative to the project) and names the
-# header texts of the name and email columns.
+# header texts of the name and email columns. In XLSX files, each sheet uses
+# its first non-empty row as the header. `sheets = ["Kunden*"]` limits a rule
+# to the sheets with matching names.
 [[rule]]
-files = "**/*.csv"
+files = "**/*.{{csv,xlsx}}"
 first_name = ["first_name"]
 last_name = ["last_name"]
 full_name = ["name"]
@@ -98,6 +100,7 @@ mod tests {
         assert_eq!(config.language, Language::De);
         assert!(config.email_subdomains);
         assert_eq!(config.rules.len(), 1);
+        assert_eq!(config.rules[0].files, "**/*.{csv,xlsx}");
         assert!(create(dir.path(), Language::En).is_err());
     }
 }

@@ -91,3 +91,36 @@ fn init_twice_fails_and_keeps_the_key() {
         .failure();
     assert_eq!(key, std::fs::read_to_string(&key_path).unwrap());
 }
+
+#[test]
+fn default_config_covers_csv_and_xlsx() {
+    let dir = tempfile::TempDir::new().unwrap();
+    pseudofy()
+        .args(["init", "--language", "en", "--project"])
+        .arg(dir.path())
+        .assert()
+        .success();
+    let workbook_dir = dir.path().join("sub");
+    std::fs::create_dir_all(&workbook_dir).unwrap();
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.sheet_mut(0).unwrap();
+    sheet.cell_mut("A1").set_value_string("name");
+    sheet.cell_mut("A2").set_value_string("Zorbina Quenzel");
+    umya_spreadsheet::writer::xlsx::write(&book, workbook_dir.join("people.xlsx")).unwrap();
+    std::fs::write(dir.path().join("people.csv"), "name\nZorbina Quenzel\n").unwrap();
+    let out = tempfile::TempDir::new().unwrap();
+    let assert = pseudofy()
+        .args(["run", "--project"])
+        .arg(dir.path())
+        .arg("--out")
+        .arg(out.path())
+        .assert()
+        .success();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(!stderr.contains("no rule matches"), "{stderr}");
+    let csv = std::fs::read_to_string(out.path().join("people.csv")).unwrap();
+    assert!(!csv.contains("Zorbina"), "{csv}");
+    let copy = umya_spreadsheet::reader::xlsx::read(out.path().join("sub/people.xlsx")).unwrap();
+    let value = copy.sheet(0).unwrap().value("A2");
+    assert!(!value.is_empty() && !value.contains("Zorbina"), "{value}");
+}
