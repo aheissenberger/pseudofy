@@ -1,4 +1,4 @@
-# ADR-0009: Scrub the written XLSX package
+# ADR-0010: Scrub the written XLSX package
 
 **Date:** 2026-11-02
 **Status:** proposed

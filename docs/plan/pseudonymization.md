@@ -74,3 +74,4 @@ The README must state this limit.
 - `docs/adr/0005-build-releases-in-github-actions.md`
 - `docs/adr/0008-distribute-on-macos-with-the-homebrew-tools-tap.md`
 - `docs/adr/0009-decode-csv-with-encoding-rs.md`
+- `docs/adr/0010-scrub-the-written-xlsx-package.md`

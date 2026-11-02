@@ -3,7 +3,7 @@
 **Date:** 2026-11-02
 **Status:** done
 **Author:** Claude (agent)
-**Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0002-pseudonym-engine-and-csv.md` · `docs/adr/0004-initial-crate-set.md` · `docs/adr/0009-scrub-the-written-xlsx-package.md`
+**Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0002-pseudonym-engine-and-csv.md` · `docs/adr/0004-initial-crate-set.md` · `docs/adr/0010-scrub-the-written-xlsx-package.md`
 
 ---
 
@@ -18,7 +18,7 @@
 ### Added
 
 - `src/xlsx_file.rs` — open a workbook with `umya-spreadsheet`, replace cell values, save the copy.
-- `src/xlsx_scrub.rs` — blank each unused entry of `xl/sharedStrings.xml` in the written package (ADR-0009).
+- `src/xlsx_scrub.rs` — blank each unused entry of `xl/sharedStrings.xml` in the written package (ADR-0010).
 - `src/panic_guard.rs` — the panic hook, and a guard that keeps the hook silent for a panic that pseudofy catches.
 - `src/cells.rs` — column roles, header matching, cell replacement, and the safe output write. `src/csv_file.rs` and `src/xlsx_file.rs` use it.
 - `tests/xlsx.rs` — XLSX tests. The tests create the input workbooks in a temporary directory.
@@ -29,7 +29,7 @@
 - `src/csv_file.rs` — move the shared code to `src/cells.rs`.
 - `src/main.rs` — install the panic hook from `src/panic_guard.rs`. The hook prints only the code location, never the panic message. A crate can panic on a damaged workbook.
 - `src/config.rs` — a rule gets the optional field `sheets` (list of sheet-name globs, for example `"Kunden*"`). Without `sheets`, the rule applies to each sheet.
-- `Cargo.toml` — add `umya-spreadsheet`, `zip`, and `quick-xml` (ADR-0009).
+- `Cargo.toml` — add `umya-spreadsheet`, `zip`, and `quick-xml` (ADR-0010).
 - `README.md` — state which XLSX parts pseudofy does not pseudonymize.
 
 ### Removed

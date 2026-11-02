@@ -1,4 +1,4 @@
-//! Scrub the written XLSX package (ADR-0009).
+//! Scrub the written XLSX package (ADR-0010).
 //!
 //! `umya-spreadsheet` keeps the old shared strings of a changed cell. The
 //! scrub blanks each entry of `xl/sharedStrings.xml` that no worksheet uses.

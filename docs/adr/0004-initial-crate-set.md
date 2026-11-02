@@ -3,7 +3,7 @@
 **Date:** 2026-11-02
 **Status:** proposed
 **Deciders:** Andreas Heissenberger
-**Related:** `docs/specs/0001-rust-cli-scaffold-and-devcontainer.md` · `docs/specs/0002-pseudonym-engine-and-csv.md` · `docs/specs/0003-xlsx-support.md` · `docs/specs/0004-known-names-in-free-text.md` · `docs/specs/0010-xlsx-round-trip-fidelity.md`
+**Related:** `docs/specs/0001-rust-cli-scaffold-and-devcontainer.md` · `docs/specs/0002-pseudonym-engine-and-csv.md` · `docs/specs/0003-xlsx-support.md` · `docs/specs/0004-known-names-in-free-text.md` · `docs/specs/0010-xlsx-round-trip-fidelity.md` · `docs/adr/0010-scrub-the-written-xlsx-package.md`
 
 ## Context
 
@@ -29,7 +29,8 @@ We will use these crates and no other runtime crates without a new ADR:
 | `globset`, `walkdir` | File selection in the project |
 | `anyhow`, `thiserror` | Error handling |
 
-Test-only crates: `assert_cmd`, `predicates`, `tempfile`, `zip` (spec 0010).
+Test-only crates: `assert_cmd`, `predicates`, `tempfile`.
+ADR-0010 adds `zip` and `quick-xml` as runtime crates. Spec 0010 also uses `zip` in a test.
 `Cargo.lock` is committed. Each version is pinned in `Cargo.toml`.
 
 ## Consequences
