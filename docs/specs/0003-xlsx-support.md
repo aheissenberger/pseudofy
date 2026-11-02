@@ -1,7 +1,7 @@
 # Feature Delta Spec: XLSX support
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** active
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0002-pseudonym-engine-and-csv.md` · `docs/adr/0004-initial-crate-set.md`
 
@@ -18,11 +18,13 @@
 ### Added
 
 - `src/xlsx_file.rs` — open a workbook with `umya-spreadsheet`, replace cell values, save the copy.
+- `src/cells.rs` — column roles, header matching, cell replacement, and the safe output write. `src/csv_file.rs` and `src/xlsx_file.rs` use it.
 - `tests/xlsx.rs` — XLSX tests. The tests create the input workbooks in a temporary directory.
 
 ### Modified
 
 - `src/run.rs` — select `.xlsx` files and call `src/xlsx_file.rs`.
+- `src/csv_file.rs` — move the shared code to `src/cells.rs`.
 - `src/config.rs` — a rule gets the optional field `sheets` (list of sheet-name globs, for example `"Kunden*"`). Without `sheets`, the rule applies to each sheet.
 - `Cargo.toml` — add `umya-spreadsheet`.
 
@@ -45,7 +47,7 @@
 - [ ] One real value gets one pseudonym in all sheets and all files.
 - [ ] pseudofy changes only string cells. Number, date, boolean, and formula cells stay unchanged.
 - [ ] The copy keeps sheet names, sheet order, cell styles, column widths, and merged cells.
-- [ ] `src/xlsx_file.rs` and `src/csv_file.rs` use the same replacement function from `src/run.rs`.
+- [ ] `src/xlsx_file.rs` and `src/csv_file.rs` use the same replacement function from `src/cells.rs`.
 
 ## 4. Acceptance Criteria & Verification
 

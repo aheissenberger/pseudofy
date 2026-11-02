@@ -1,3 +1,4 @@
+mod cells;
 mod config;
 mod csv_file;
 mod key;
@@ -6,6 +7,7 @@ mod names;
 mod pseudonym;
 mod run;
 mod text;
+mod xlsx_file;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
