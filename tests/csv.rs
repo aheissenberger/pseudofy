@@ -884,17 +884,6 @@ fn partial_headers_give_no_warning() {
 }
 
 #[test]
-fn rule_without_any_header_warns_once() {
-    let dir = project(KEY_A, None, &[]);
-    write_file(dir.path(), "data.csv", "id,note\n1,x\n");
-    let out = TempDir::new().unwrap();
-    let assert = run(dir.path(), out.path()).success();
-    let stderr = stderr_text(&assert);
-    assert_eq!(stderr.matches("warning").count(), 1, "{stderr}");
-    assert!(stderr.contains("data.csv"), "{stderr}");
-}
-
-#[test]
 fn a_bad_file_is_reported_and_the_other_files_are_written() {
     let dir = project(KEY_A, None, &[]);
     write_file(dir.path(), "a_bad.csv", "first_name\nZorbina\n");
@@ -1111,4 +1100,214 @@ fn utf16_file_is_rejected() {
         bytes.extend_from_slice(&unit.to_le_bytes());
     }
     assert_rejected("unicode.csv", &bytes);
+}
+
+// --- Header search and fail closed (spec 0015) -------------------------------
+
+const NO_HEADER_DATA: &str = "data.csv: no header of rule \"**/*.csv\" in the first 20 rows";
+
+/// Runs a project that must fail. Returns a fresh output directory and stderr.
+fn run_failing(project: &Path) -> (TempDir, String) {
+    let out = TempDir::new().unwrap();
+    let assert = run(project, out.path()).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    (out, stderr)
+}
+
+/// Checks that stderr has the line `error: <message>` and no value or header text.
+fn assert_error_line(stderr: &str, message: &str) {
+    let expected = format!("error: {message}");
+    assert!(
+        stderr.lines().any(|line| line.trim_end() == expected),
+        "no line {expected:?} in stderr: {stderr}"
+    );
+    assert_no_leak(stderr, "stderr");
+    for header in ["first_name", "last_name", "email", "note"] {
+        assert!(!stderr.contains(header), "stderr names a header: {stderr}");
+    }
+}
+
+fn assert_no_real_value(text: &str, what: &str) {
+    let lower = text.to_lowercase();
+    for word in ["zorbina", "quenzel", "tamsorin", "velgrad", "acme"] {
+        assert!(!lower.contains(word), "{what} leaks {word}: {text}");
+    }
+}
+
+#[test]
+fn rule_without_any_header_fails_the_file_and_writes_no_copy() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(dir.path(), "data.csv", "id,note\n1,x\n");
+    let (out, stderr) = run_failing(dir.path());
+    assert_error_line(&stderr, NO_HEADER_DATA);
+    assert!(!stderr.contains("warning"), "{stderr}");
+    assert!(!stderr.contains("none of its headers"), "{stderr}");
+    assert!(!out.path().join("data.csv").exists());
+}
+
+#[test]
+fn csv_without_a_header_fails_and_writes_no_copy() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "Zorbina Quenzel,zorbina.quenzel@acme.test\n",
+    );
+    let (out, stderr) = run_failing(dir.path());
+    assert_error_line(&stderr, NO_HEADER_DATA);
+    assert!(!out.path().join("data.csv").exists());
+}
+
+#[test]
+fn failed_csv_does_not_stop_the_other_files_and_keeps_a_stale_copy() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "a_bad.csv",
+        "Zorbina Quenzel,zorbina@acme.test\n",
+    );
+    write_file(
+        dir.path(),
+        "b_good.csv",
+        "name,email\nTamsorin Velgrad,tamsorin@acme.test\n",
+    );
+    let out = TempDir::new().unwrap();
+    write_file(out.path(), "a_bad.csv", "stale copy\n");
+    let assert = run(dir.path(), out.path()).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert_error_line(
+        &stderr,
+        "a_bad.csv: no header of rule \"**/*.csv\" in the first 20 rows",
+    );
+    assert!(stderr.contains("1 file(s) failed"), "{stderr}");
+    assert_eq!(read(out.path(), "a_bad.csv"), "stale copy\n");
+    assert_no_real_value(&read(out.path(), "b_good.csv"), "good copy");
+}
+
+#[test]
+fn title_line_above_the_header_gets_a_fake_email_and_the_names_below_are_replaced() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "Kontakte von zorbina.quenzel@acme.test\nname,email\n\
+         Zorbina Quenzel,zorbina.quenzel@acme.test\nTamsorin Velgrad,tamsorin@acme.test\n",
+    );
+    let (out, _) = run_ok(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_real_value(&text, "copy");
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 4, "{text}");
+    assert!(lines[0].starts_with("Kontakte von "), "{text}");
+    let emails = emails_in(lines[0]);
+    assert_eq!(emails.len(), 1, "{text}");
+    check_fake_email(&emails[0], true);
+    assert_eq!(lines[1], "name,email");
+    let table = rows(&text, ',');
+    for (row, real) in table[2..]
+        .iter()
+        .zip(["Zorbina Quenzel", "Tamsorin Velgrad"])
+    {
+        assert_ne!(row[0], real);
+        assert_ne!(row[0], "");
+        check_fake_email(&row[1], true);
+    }
+    // The title email and the email in the data row are one address.
+    assert!(lines[0].ends_with(&table[2][1]), "{text}");
+}
+
+#[test]
+fn email_in_the_header_line_is_replaced_and_configured_headers_stay() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "name,email,zorbina@acme.test\nZorbina Quenzel,zorbina@acme.test,x\n",
+    );
+    let (out, _) = run_ok(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_real_value(&text, "copy");
+    let header = text.lines().next().unwrap();
+    assert!(header.starts_with("name,email,"), "{header}");
+    let emails = emails_in(header);
+    assert_eq!(emails.len(), 1, "{header}");
+    check_fake_email(&emails[0], true);
+}
+
+#[test]
+fn known_name_in_the_header_line_is_replaced() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "name,email,Notiz zu Zorbina\nZorbina Quenzel,zorbina@acme.test,x\n",
+    );
+    let (out, _) = run_ok(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_real_value(&text, "copy");
+    let header = text.lines().next().unwrap();
+    assert!(header.starts_with("name,email,Notiz zu "), "{header}");
+    assert_ne!(header, "name,email,Notiz zu Zorbina");
+}
+
+#[test]
+fn csv_with_an_unclosed_quote_fails_and_writes_no_copy() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "name,email\n\"Zorbina Quenzel,zorbina@acme.test\nTamsorin Velgrad,tamsorin@acme.test\n",
+    );
+    let (out, stderr) = run_failing(dir.path());
+    assert_error_line(&stderr, "data.csv: unclosed quote");
+    assert!(!out.path().join("data.csv").exists());
+}
+
+/// A CSV with `title_rows` title lines and then a header line and one data row.
+fn csv_with_title_rows(title_rows: usize) -> String {
+    let mut text = "Titel\n".repeat(title_rows);
+    text.push_str("name,email\nZorbina Quenzel,zorbina@acme.test\n");
+    text
+}
+
+#[test]
+fn header_in_row_20_is_found() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(dir.path(), "data.csv", &csv_with_title_rows(19));
+    let (out, _) = run_ok(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_real_value(&text, "copy");
+}
+
+#[test]
+fn header_in_row_21_is_not_found_and_the_file_fails() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(dir.path(), "data.csv", &csv_with_title_rows(20));
+    let (out, stderr) = run_failing(dir.path());
+    assert_error_line(&stderr, NO_HEADER_DATA);
+    assert!(!out.path().join("data.csv").exists());
+}
+
+#[test]
+fn file_without_a_matching_rule_gets_emails_replaced_in_its_first_line() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "config/pseudofy.toml",
+        "language = \"de\"\n\n[[rule]]\nfiles = \"only/*.csv\"\nfirst_name = [\"first_name\"]\n",
+    );
+    write_file(
+        dir.path(),
+        "other/data.csv",
+        "zorbina@acme.test,Notiz\ntamsorin@acme.test,x\n",
+    );
+    let (out, _) = run_ok(dir.path());
+    let text = read(out.path(), "other/data.csv");
+    assert_no_real_value(&text, "copy");
+    let first = text.lines().next().unwrap();
+    assert!(
+        first.contains('@') && first.contains("example.com"),
+        "{text}"
+    );
+    assert!(first.ends_with(",Notiz"), "{text}");
 }
