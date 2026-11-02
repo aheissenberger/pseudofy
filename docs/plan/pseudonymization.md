@@ -33,6 +33,7 @@ The README must state this limit.
 14. GitHub Actions builds the macOS binary for Apple Silicon (`aarch64-apple-darwin`).
 15. The source is in a public GitHub repository.
 17. Homebrew installs pseudofy on an Apple Silicon Mac from the tap `aheissenberger/tools`.
+18. pseudofy reads CSV files in UTF-8 and in Windows-1252. The copy keeps the encoding of the input file.
 
 ## 3. Terms
 
@@ -55,6 +56,8 @@ The README must state this limit.
 | `docs/specs/0004-known-names-in-free-text.md` | Known names in text cells outside the name columns |
 | `docs/specs/0005-ci-and-macos-release.md` | GitHub Actions checks and macOS release binary |
 | `docs/specs/0008-homebrew-formula.md` | Homebrew formula in the tap `aheissenberger/homebrew-tools` |
+| `docs/specs/0009-csv-windows-1252-input.md` | CSV files in Windows-1252 |
+| `docs/specs/0010-xlsx-round-trip-fidelity.md` | Parts that the XLSX copy keeps and loses |
 
 ## 5. Later work (no spec yet)
 
@@ -70,3 +73,4 @@ The README must state this limit.
 - `docs/adr/0004-initial-crate-set.md`
 - `docs/adr/0005-build-releases-in-github-actions.md`
 - `docs/adr/0008-distribute-on-macos-with-the-homebrew-tools-tap.md`
+- `docs/adr/0009-decode-csv-with-encoding-rs.md`
