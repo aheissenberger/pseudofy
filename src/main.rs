@@ -2,13 +2,6 @@ mod cells;
 mod config;
 mod csv_file;
 mod key;
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "spec 0004 skeleton; the pipeline task wires it in and removes this"
-    )
-)]
 mod known_names;
 mod locale;
 mod names;

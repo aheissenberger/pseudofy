@@ -1,5 +1,9 @@
 //! Known names: the real names from the name columns of all project files
 //! (spec 0004). They stay in memory only and are never printed.
+#![expect(
+    dead_code,
+    reason = "spec 0004 skeleton; removed when the module is implemented and wired in"
+)]
 
 use crate::config::FreeText;
 use crate::text::Part;
