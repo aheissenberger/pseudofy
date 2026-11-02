@@ -1,7 +1,7 @@
 # Feature Delta Spec: Pseudonym engine and CSV files
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** active
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0001-rust-cli-scaffold-and-devcontainer.md` · `docs/adr/0003-derive-pseudonyms-with-a-keyed-hash.md` · `docs/adr/0004-initial-crate-set.md`
 
@@ -32,6 +32,7 @@
 - `src/main.rs` — `init --project <DIR> [--language de|en]` and `run --project <DIR> --out <DIR>` call the new modules.
 - `init` writes `config/pseudofy.toml` with the language, `email_subdomains = true`, and one example rule. `init` fails if the file exists.
 - `Cargo.toml` — add the crates from ADR-0004 except `umya-spreadsheet`.
+- `tests/cli.rs` — remove the test for the "not implemented" output.
 
 ### Removed
 
