@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use globset::Glob;
+use globset::GlobBuilder;
 use walkdir::WalkDir;
 
 use crate::config::{self, Rule};
@@ -32,7 +32,10 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
         .rules
         .iter()
         .map(|rule| {
-            let glob = Glob::new(&rule.files)
+            let glob = GlobBuilder::new(&rule.files)
+                .case_insensitive(true)
+                .literal_separator(true)
+                .build()
                 .with_context(|| format!("invalid glob \"{}\" in the config", rule.files))?;
             Ok((glob.compile_matcher(), rule))
         })
@@ -67,9 +70,13 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
             .filter(|(matcher, _)| matcher.is_match(&rel))
             .map(|(_, rule)| *rule)
             .collect();
+        if rules.is_empty() {
+            eprintln!("warning: {rel}: no rule matches; only emails are replaced");
+        }
         let target = out.join(relative);
         summary.replaced += csv_file::process(
             entry.path(),
+            &out,
             &target,
             &rel,
             &rules,
@@ -83,11 +90,15 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
 }
 
 /// Canonical project and output directories. Fail if the output could
-/// overwrite or contain the input.
+/// overwrite or contain the input, or lies in `secrets/` or `config/`.
 fn resolve_dirs(project: &Path, out: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     let project = project
         .canonicalize()
         .context("cannot open the project directory")?;
+    let future = resolve_future(out)?;
+    if future.starts_with(project.join("secrets")) || future.starts_with(project.join("config")) {
+        bail!("--out must not be inside secrets/ or config/ of the project");
+    }
     fs::create_dir_all(out).context("cannot create the output directory")?;
     let out = out
         .canonicalize()
@@ -99,6 +110,33 @@ fn resolve_dirs(project: &Path, out: &Path) -> anyhow::Result<(PathBuf, PathBuf)
         bail!("the project directory must not be inside --out");
     }
     Ok((project, out))
+}
+
+/// Absolute form of a path that may not exist yet: the nearest existing
+/// ancestor is canonical, the missing rest is appended.
+fn resolve_future(path: &Path) -> anyhow::Result<PathBuf> {
+    let absolute = std::path::absolute(path).context("cannot resolve the output directory")?;
+    let mut rest = Vec::new();
+    let mut existing = absolute.as_path();
+    loop {
+        if existing.exists() {
+            break;
+        }
+        match (existing.file_name(), existing.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name.to_owned());
+                existing = parent;
+            }
+            _ => bail!("cannot resolve the output directory"),
+        }
+    }
+    let mut resolved = existing
+        .canonicalize()
+        .context("cannot resolve the output directory")?;
+    for name in rest.iter().rev() {
+        resolved.push(name);
+    }
+    Ok(resolved)
 }
 
 fn is_csv(path: &Path) -> bool {
@@ -148,6 +186,33 @@ mod tests {
         let project = dir.path().join("project");
         fs::create_dir_all(&project).unwrap();
         assert!(resolve_dirs(&project, &dir.path().join("out")).is_ok());
+    }
+
+    #[test]
+    fn out_inside_secrets_or_config_fails_without_creating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["secrets", "config"] {
+            let out = dir.path().join(name).join("deep").join("out");
+            assert!(resolve_dirs(dir.path(), &out).is_err());
+            assert!(!dir.path().join(name).exists());
+        }
+        let out = dir.path().join("secrets2");
+        assert!(resolve_dirs(dir.path(), &out).is_ok());
+    }
+
+    #[test]
+    fn globs_are_case_insensitive_with_literal_separator() {
+        let matcher = |pattern: &str| {
+            GlobBuilder::new(pattern)
+                .case_insensitive(true)
+                .literal_separator(true)
+                .build()
+                .unwrap()
+                .compile_matcher()
+        };
+        assert!(matcher("*.csv").is_match("People.CSV"));
+        assert!(!matcher("*.csv").is_match("a/people.csv"));
+        assert!(matcher("**/*.csv").is_match("a/People.Csv"));
     }
 
     #[test]
