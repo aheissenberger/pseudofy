@@ -1,7 +1,7 @@
 # Feature Delta Spec: Output and key safety
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 (requirement 8) · `docs/specs/0002-pseudonym-engine-and-csv.md` · `docs/adr/0012-copy-other-project-files-unchanged.md`
 
@@ -52,27 +52,27 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] pseudofy never changes an input file (requirement 8).
-- [ ] pseudofy never writes into `secrets/` or `config/` of the project.
-- [ ] An error message contains a path, never file contents.
-- [ ] No new crate. No `unwrap()` or `expect()` outside tests.
+- [x] pseudofy never changes an input file (requirement 8).
+- [x] pseudofy never writes into `secrets/` or `config/` of the project.
+- [x] An error message contains a path, never file contents.
+- [x] No new crate. No `unwrap()` or `expect()` outside tests.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] `--out P/data` fails if `P/data` has a file and no marker. No input file changes.
-- [ ] A second run to the same output directory inside the project works (marker).
-- [ ] `--out` through a symlink to `P/secrets` fails. `--out P/Secrets` fails if `P/secrets` exists.
-- [ ] A failed key write leaves no key file. A second `init` then works.
-- [ ] A FIFO at `secrets/pseudofy.key` makes `run` fail at once.
-- [ ] `P/.hidden/a.csv` gets no copy.
-- [ ] A CSV copy of an input with mode 0600 has mode 0600.
-- [ ] A CSV with a 245-character name gets a copy.
+- [x] `--out P/data` fails if `P/data` has a file and no marker. No input file changes.
+- [x] A second run to the same output directory inside the project works (marker).
+- [x] `--out` through a symlink to `P/secrets` fails. `--out P/Secrets` fails if `P/secrets` exists.
+- [x] A failed key write leaves no key file. A second `init` then works.
+- [x] A FIFO at `secrets/pseudofy.key` makes `run` fail at once.
+- [x] `P/.hidden/a.csv` gets no copy.
+- [x] A CSV copy of an input with mode 0600 has mode 0600.
+- [x] A CSV with a 245-character name gets a copy.
 
 **Tests to add/update:**
 
-- [ ] `tests/cli.rs` and unit tests in `src/run.rs`, `src/key.rs`, `src/config.rs`, `src/cells.rs` — the behaviors above.
+- [x] `tests/cli.rs` and unit tests in `src/run.rs`, `src/key.rs`, `src/config.rs`, `src/cells.rs` — the behaviors above.
 
 **Commands that must pass:**
 
