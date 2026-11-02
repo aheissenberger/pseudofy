@@ -1,7 +1,7 @@
 # Feature Delta Spec: Restore XLSX sparklines
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** active
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 · `docs/adr/0011-restore-dropped-xlsx-parts-from-the-input.md` · `docs/specs/0012-restore-xlsx-external-links.md`
 
