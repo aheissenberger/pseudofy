@@ -307,16 +307,21 @@ fn name_in_two_sheets_gets_the_same_pseudonym() {
 fn sheets_glob_changes_only_the_matching_sheet() {
     let dir = project(Some("[\"Kunden*\"]"));
     let mut book = umya_spreadsheet::new_file_empty_worksheet();
-    for title in ["Kunden 2025", "Notizen"] {
+    // Each name occurs in one sheet only. A name in a name column is a known
+    // name, and spec 0004 replaces known names in every other text cell too.
+    for (title, name) in [
+        ("Kunden 2025", "Zorbina Quenzel"),
+        ("Notizen", "Pirmox Hulbert"),
+    ] {
         let sheet = book.new_sheet(title).unwrap();
         set(sheet, "A1", "name");
-        set(sheet, "A2", "Zorbina Quenzel");
+        set(sheet, "A2", name);
     }
     save(&book, dir.path(), "mappe.xlsx");
     let (out, _, _) = run_ok(dir.path());
     let copy = open(out.path(), "mappe.xlsx");
     assert_ne!(value(&copy, "Kunden 2025", "A2"), "Zorbina Quenzel");
-    assert_eq!(value(&copy, "Notizen", "A2"), "Zorbina Quenzel");
+    assert_eq!(value(&copy, "Notizen", "A2"), "Pirmox Hulbert");
 }
 
 #[test]

@@ -4,11 +4,13 @@
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{Context, bail};
 use regex::Regex;
 
 use crate::config::Rule;
+use crate::known_names::{KnownNames, Matcher};
 use crate::text::{self, NameRole, Part};
 
 /// Name replacement function (the signature of `text::replace_name`).
@@ -184,15 +186,141 @@ pub(crate) fn replace_spans(
     out
 }
 
-/// Replace names and emails in one cell, depending on the column role.
+/// What `transform_cell` needs besides the cell.
+pub(crate) struct CellFns<'a> {
+    pub(crate) email_regex: &'a Regex,
+    pub(crate) names: NameFn,
+    pub(crate) emails: EmailFn,
+    /// Known names for text cells (pass 2 of spec 0004); `None`: no free-text pass.
+    pub(crate) matcher: Option<&'a Matcher>,
+}
+
+/// `full_name` value without email addresses (they are no name).
+fn without_emails(value: &str) -> String {
+    static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
+    let Some(regex) = REGEX.get_or_init(|| text::email_regex().ok()).as_ref() else {
+        return value.to_owned();
+    };
+    let mut out = String::with_capacity(value.len());
+    let mut pos = 0;
+    for span in text::email_spans(value, regex) {
+        out.push_str(value.get(pos..span.start).unwrap_or(""));
+        out.push(' ');
+        pos = span.end;
+    }
+    out.push_str(value.get(pos..).unwrap_or(""));
+    out
+}
+
+/// Known names found in the name columns of one file (pass 1). They reach
+/// `KnownNames` only through `apply`, after the whole file was read.
+///
+/// A row can have several first-name and last-name cells. All of them give
+/// tokens. If a row has as many first-name as last-name cells, the i-th first
+/// value and the i-th last value form one person; otherwise there is no person.
+#[derive(Default)]
+pub(crate) struct Collector {
+    rows: Vec<(Vec<String>, Vec<String>)>,
+    fulls: Vec<String>,
+    firsts: Vec<String>,
+    lasts: Vec<String>,
+}
+
+impl Collector {
+    /// One data cell. Call `end_row` after the last cell of each row.
+    pub(crate) fn cell(&mut self, role: Option<ColRole>, value: &str) {
+        let value = value.trim();
+        if value.is_empty() {
+            return;
+        }
+        match role {
+            Some(ColRole::Name(NameRole::First)) => self.firsts.push(value.to_owned()),
+            Some(ColRole::Name(NameRole::Last)) => self.lasts.push(value.to_owned()),
+            Some(ColRole::Name(NameRole::Full)) => self.fulls.push(without_emails(value)),
+            _ => {}
+        }
+    }
+
+    /// End of a data row: the first-name and last-name cells form persons.
+    pub(crate) fn end_row(&mut self) {
+        if !self.firsts.is_empty() || !self.lasts.is_empty() {
+            self.rows.push((
+                std::mem::take(&mut self.firsts),
+                std::mem::take(&mut self.lasts),
+            ));
+        }
+    }
+
+    pub(crate) fn apply(mut self, known: &mut KnownNames) {
+        self.end_row();
+        for (firsts, lasts) in &self.rows {
+            if firsts.len() == lasts.len() {
+                for (first, last) in firsts.iter().zip(lasts) {
+                    known.add_person(first, last);
+                }
+            } else {
+                for first in firsts {
+                    known.add_first(first);
+                }
+                for last in lasts {
+                    known.add_last(last);
+                }
+            }
+        }
+        for value in &self.fulls {
+            known.add_full(value);
+        }
+    }
+}
+
+/// Replace the known names in `text` (which holds no address).
+fn free_segment(
+    matcher: &Matcher,
+    text: &str,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+    free: &mut usize,
+) -> String {
+    let (out, count) = matcher.replace(text, &mut |part, token| replace(name_kind(part), token));
+    *free += count;
+    out
+}
+
+/// Replace the addresses of a text cell; replace the known names in the text
+/// outside the addresses.
+fn replace_free_text(
+    cell: &str,
+    fns: &CellFns,
+    matcher: &Matcher,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+    free: &mut usize,
+) -> String {
+    let mut out = String::with_capacity(cell.len());
+    let mut pos = 0;
+    for span in text::email_spans(cell, fns.email_regex) {
+        let before = cell.get(pos..span.start).unwrap_or("");
+        out.push_str(&free_segment(matcher, before, replace, free));
+        out.push_str(&replace(Kind::Email, cell.get(span.clone()).unwrap_or("")));
+        pos = span.end;
+    }
+    out.push_str(&free_segment(
+        matcher,
+        cell.get(pos..).unwrap_or(""),
+        replace,
+        free,
+    ));
+    out
+}
+
+/// Replace names and emails in one cell, depending on the column role. In a
+/// cell without role, the known names count in `free`.
 pub(crate) fn transform_cell(
     cell: &str,
     role: Option<ColRole>,
-    email_regex: &Regex,
-    names: NameFn,
-    emails: EmailFn,
+    fns: &CellFns,
     replace: &mut dyn FnMut(Kind, &str) -> String,
+    free: &mut usize,
 ) -> String {
+    let (email_regex, names, emails) = (fns.email_regex, fns.names, fns.emails);
     let trimmed = cell.trim();
     if trimmed.is_empty() {
         return cell.to_owned();
@@ -222,9 +350,12 @@ pub(crate) fn transform_cell(
             out.push_str(cell.get(cell.len() - tail..).unwrap_or(""));
             out
         }
-        None => emails(cell, email_regex, &mut |address| {
-            replace(Kind::Email, address)
-        }),
+        None => match fns.matcher {
+            Some(matcher) => replace_free_text(cell, fns, matcher, replace, free),
+            None => emails(cell, email_regex, &mut |address| {
+                replace(Kind::Email, address)
+            }),
+        },
     }
 }
 
@@ -253,4 +384,68 @@ pub(crate) fn missing_headers(headers: &[String], columns: &Columns) -> Vec<(Str
         .filter(|(_, text)| !headers.contains(text))
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::FreeText;
+
+    fn count(known: &KnownNames, mode: FreeText, text: &str) -> usize {
+        let matcher = known.matcher(mode);
+        matcher.replace(text, &mut |_, _| "X".to_owned()).1
+    }
+
+    fn first() -> ColRole {
+        ColRole::Name(NameRole::First)
+    }
+
+    fn last() -> ColRole {
+        ColRole::Name(NameRole::Last)
+    }
+
+    #[test]
+    fn several_name_columns_pair_by_position() {
+        let mut c = Collector::default();
+        c.cell(Some(first()), "Zorbina");
+        c.cell(Some(first()), "Tamsorin");
+        c.cell(Some(last()), "Quenzel");
+        c.cell(Some(last()), "Velgrad");
+        c.end_row();
+        // Unequal counts: tokens only, no person.
+        c.cell(Some(first()), "Mirwen");
+        c.cell(Some(first()), "Ostrel");
+        c.cell(Some(last()), "Dunhaldt");
+        c.end_row();
+        let mut known = KnownNames::default();
+        c.apply(&mut known);
+        assert_eq!(count(&known, FreeText::Full, "Zorbina Quenzel"), 1);
+        assert_eq!(count(&known, FreeText::Full, "Tamsorin Velgrad"), 1);
+        assert_eq!(count(&known, FreeText::Full, "Zorbina Velgrad"), 0);
+        assert_eq!(count(&known, FreeText::Full, "Mirwen Dunhaldt"), 0);
+        for name in ["Tamsorin", "Velgrad", "Mirwen", "Ostrel", "Dunhaldt"] {
+            assert_eq!(count(&known, FreeText::Tokens, name), 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn full_name_without_email() {
+        let mut c = Collector::default();
+        c.cell(
+            Some(ColRole::Name(NameRole::Full)),
+            "Ottilie Wenzhart <ottilie.wenzhart@firma.test>",
+        );
+        c.cell(
+            Some(ColRole::Name(NameRole::Full)),
+            "Berta Kunzl ottilie.x@firma.test",
+        );
+        c.end_row();
+        let mut known = KnownNames::default();
+        c.apply(&mut known);
+        assert_eq!(count(&known, FreeText::Full, "Ottilie Wenzhart"), 1);
+        assert_eq!(count(&known, FreeText::Full, "Berta Kunzl"), 1);
+        for word in ["firma", "test", "x"] {
+            assert_eq!(count(&known, FreeText::Tokens, word), 0, "{word}");
+        }
+    }
 }

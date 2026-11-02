@@ -6,15 +6,14 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use csv::{ByteRecord, ReaderBuilder, Terminator, WriterBuilder};
 use encoding_rs::WINDOWS_1252;
-use regex::Regex;
 
 use crate::cells::{
-    ColRole, Columns, EmailFn, Kind, NameFn, collect_columns, missing_headers, role_of,
+    CellFns, ColRole, Collector, Columns, Kind, collect_columns, missing_headers, role_of,
     rules_without_headers, transform_cell, write_output,
 };
 use crate::config::Rule;
+use crate::known_names::KnownNames;
 use crate::pseudonym::Pseudonymizer;
-use crate::text;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
 
@@ -22,14 +21,48 @@ const BOM: &[u8] = b"\xEF\xBB\xBF";
 struct Transformed {
     bytes: Vec<u8>,
     replaced: usize,
+    /// Known names replaced in text cells.
+    free_text: usize,
     /// (rule glob, header text) pairs that the file does not have.
     missing: Vec<(String, String)>,
 }
 
+/// Counts for one processed CSV file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct CsvStats {
+    /// Replaced values (including the free-text replacements).
+    pub replaced: usize,
+    /// Known names replaced in text cells.
+    pub free_text: usize,
+}
+
+/// Pass 1: read the name columns of `input` and add the known names to
+/// `known`. Nothing is written. On an error `known` stays unchanged.
+pub fn collect(
+    input: &Path,
+    rel: &str,
+    rules: &[&Rule],
+    cells: &CellFns,
+    known: &mut KnownNames,
+) -> anyhow::Result<()> {
+    let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
+    let columns = collect_columns(rules);
+    let mut collector = Collector::default();
+    transform_encoded(
+        &bytes,
+        &columns,
+        cells,
+        &mut |_, _| String::new(),
+        rel,
+        Some(&mut collector),
+    )?;
+    collector.apply(known);
+    Ok(())
+}
+
 /// Read `input`, replace names and emails, write the copy to `output`.
 /// `out_root` is the output directory, `rel` the relative path for messages.
-/// `rules` are the rules that match the file. Returns the number of replaced
-/// values.
+/// `rules` are the rules that match the file.
 pub fn process(
     input: &Path,
     out_root: &Path,
@@ -37,8 +70,8 @@ pub fn process(
     rel: &str,
     rules: &[&Rule],
     pseudonymizer: &mut Pseudonymizer,
-    email_regex: &Regex,
-) -> anyhow::Result<usize> {
+    cells: &CellFns,
+) -> anyhow::Result<CsvStats> {
     let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
     let columns = collect_columns(rules);
     let mut replace = |kind: Kind, value: &str| match kind {
@@ -46,31 +79,25 @@ pub fn process(
         Kind::Last => pseudonymizer.last_name(value),
         Kind::Email => pseudonymizer.email(value),
     };
-    let result = transform_encoded(
-        &bytes,
-        &columns,
-        email_regex,
-        text::replace_name,
-        text::replace_emails,
-        &mut replace,
-        rel,
-    )?;
+    let result = transform_encoded(&bytes, &columns, cells, &mut replace, rel, None)?;
     for glob in rules_without_headers(rules, &result.missing) {
         eprintln!("warning: rule \"{glob}\" matches {rel}, but the file has none of its headers");
     }
     write_output(out_root, output, &result.bytes, rel)?;
-    Ok(result.replaced)
+    Ok(CsvStats {
+        replaced: result.replaced,
+        free_text: result.free_text,
+    })
 }
 
 /// Transform a UTF-8 or Windows-1252 file. The copy has the encoding of the input.
 fn transform_encoded(
     input: &[u8],
     columns: &Columns,
-    email_regex: &Regex,
-    names: NameFn,
-    emails: EmailFn,
+    cells: &CellFns,
     replace: &mut dyn FnMut(Kind, &str) -> String,
     rel: &str,
+    collect: Option<&mut Collector>,
 ) -> anyhow::Result<Transformed> {
     let damaged = || anyhow!("{rel}: unsupported or damaged encoding");
     if input.starts_with(b"\xFF\xFE") || input.starts_with(b"\xFE\xFF") || input.contains(&0) {
@@ -78,7 +105,7 @@ fn transform_encoded(
     }
     let rest = input.strip_prefix(BOM);
     if std::str::from_utf8(rest.unwrap_or(input)).is_ok() {
-        return transform(input, columns, email_regex, names, emails, replace, rel);
+        return transform(input, columns, cells, replace, rel, collect);
     }
     // Invalid UTF-8 after a UTF-8 BOM, or next to valid UTF-8 sequences, is a
     // damaged or mixed file. Decoding it as Windows-1252 would hide real names.
@@ -86,15 +113,7 @@ fn transform_encoded(
         return Err(damaged());
     }
     let (decoded, _) = WINDOWS_1252.decode_without_bom_handling(input);
-    let mut result = transform(
-        decoded.as_bytes(),
-        columns,
-        email_regex,
-        names,
-        emails,
-        replace,
-        rel,
-    )?;
+    let mut result = transform(decoded.as_bytes(), columns, cells, replace, rel, collect)?;
     let text = std::str::from_utf8(&result.bytes)
         .map_err(|_| anyhow!("{rel}: cannot encode the copy in Windows-1252"))?;
     let (encoded, _, unmappable) = WINDOWS_1252.encode(text);
@@ -166,14 +185,15 @@ fn first_record(body: &[u8]) -> (&[u8], &'static [u8]) {
     (body, b"\n")
 }
 
+/// Parse the file and transform each data row. With `collect`, no copy is
+/// built: the name cells of each row go to the collector instead.
 fn transform(
     input: &[u8],
     columns: &Columns,
-    email_regex: &Regex,
-    names: NameFn,
-    emails: EmailFn,
+    cells: &CellFns,
     replace: &mut dyn FnMut(Kind, &str) -> String,
     rel: &str,
+    mut collect: Option<&mut Collector>,
 ) -> anyhow::Result<Transformed> {
     let (bom, body) = match input.strip_prefix(BOM) {
         Some(rest) => (true, rest),
@@ -181,7 +201,6 @@ fn transform(
     };
     let (header_line, line_end) = first_record(body);
     let delimiter = detect_delimiter(header_line);
-    let crlf = line_end == b"\r\n";
     let ends_with_newline = body.ends_with(b"\n") || body.ends_with(b"\r");
 
     let mut reader = ReaderBuilder::new()
@@ -189,29 +208,18 @@ fn transform(
         .flexible(true)
         .delimiter(delimiter)
         .from_reader(body);
-    let terminator = if crlf {
-        Terminator::CRLF
-    } else if line_end == b"\r" {
-        Terminator::Any(b'\r')
-    } else {
-        Terminator::Any(b'\n')
-    };
     let mut writer_builder = WriterBuilder::new();
     writer_builder
         .delimiter(delimiter)
-        .terminator(terminator)
+        .terminator(terminator_of(line_end))
         .flexible(true);
     let mut body_out: Vec<u8> = Vec::new();
 
     let mut roles: Vec<Option<ColRole>> = Vec::new();
     let mut missing = Vec::new();
     let mut replaced = 0_usize;
+    let mut free_text = 0_usize;
     let mut record = ByteRecord::new();
-    let cells = CellFns {
-        email_regex,
-        names,
-        emails,
-    };
     let mut header_bytes: &[u8] = &[];
     let mut first = true;
     // End byte of the previous record and the physical line number there.
@@ -245,13 +253,24 @@ fn transform(
             missing = missing_headers(&headers, columns);
             continue;
         }
+        if let Some(collector) = collect.as_deref_mut() {
+            collect_record(&record, &roles, collector)
+                .ok_or_else(|| anyhow!("{rel}: line {line} is not valid UTF-8"))?;
+            continue;
+        }
         for _ in 0..blanks {
             body_out.extend_from_slice(line_end);
         }
-        let out = transform_record(&record, &roles, &cells, &mut |kind, value| {
-            replaced += 1;
-            replace(kind, value)
-        })
+        let out = transform_record(
+            &record,
+            &roles,
+            cells,
+            &mut |kind, value| {
+                replaced += 1;
+                replace(kind, value)
+            },
+            &mut free_text,
+        )
         .ok_or_else(|| anyhow!("{rel}: line {line} is not valid UTF-8"))?;
         render(&writer_builder, &out, &mut body_out)
             .ok_or_else(|| anyhow!("{rel}: cannot write line {line}"))?;
@@ -275,8 +294,17 @@ fn transform(
     Ok(Transformed {
         bytes,
         replaced,
+        free_text,
         missing,
     })
+}
+
+fn terminator_of(line_end: &[u8]) -> Terminator {
+    match line_end {
+        b"\r\n" => Terminator::CRLF,
+        b"\r" => Terminator::Any(b'\r'),
+        _ => Terminator::Any(b'\n'),
+    }
 }
 
 /// Position of the first byte at or after `pos` that is not a line break.
@@ -317,11 +345,19 @@ fn after_terminator(body: &[u8], pos: usize) -> usize {
     }
 }
 
-/// What `transform_cell` needs besides the cell.
-struct CellFns<'a> {
-    email_regex: &'a Regex,
-    names: NameFn,
-    emails: EmailFn,
+/// Give the name cells of a record to the collector. `None` if a field is
+/// not valid UTF-8.
+fn collect_record(
+    record: &ByteRecord,
+    roles: &[Option<ColRole>],
+    collector: &mut Collector,
+) -> Option<()> {
+    for (index, field) in record.iter().enumerate() {
+        let cell = std::str::from_utf8(field).ok()?;
+        collector.cell(roles.get(index).copied().flatten(), cell);
+    }
+    collector.end_row();
+    Some(())
 }
 
 /// Transform each field of a record. `None` if a field is not valid UTF-8.
@@ -330,19 +366,13 @@ fn transform_record(
     roles: &[Option<ColRole>],
     cells: &CellFns,
     replace: &mut dyn FnMut(Kind, &str) -> String,
+    free: &mut usize,
 ) -> Option<ByteRecord> {
     let mut out = ByteRecord::new();
     for (index, field) in record.iter().enumerate() {
         let cell = std::str::from_utf8(field).ok()?;
         let role = roles.get(index).copied().flatten();
-        let value = transform_cell(
-            cell,
-            role,
-            cells.email_regex,
-            cells.names,
-            cells.emails,
-            replace,
-        );
+        let value = transform_cell(cell, role, cells, replace, free);
         out.push_field(value.as_bytes());
     }
     Some(out)
@@ -362,7 +392,10 @@ fn header_texts(record: &ByteRecord, rel: &str) -> anyhow::Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cells::{EmailFn, NameFn};
+    use crate::text;
     use crate::text::{NameRole, Part};
+    use regex::Regex;
 
     fn fake_names(
         value: &str,
@@ -397,19 +430,27 @@ mod tests {
         }
     }
 
+    fn fns(regex: &Regex, names: NameFn, emails: EmailFn) -> CellFns<'_> {
+        CellFns {
+            email_regex: regex,
+            names,
+            emails,
+            matcher: None,
+        }
+    }
+
     fn run(input: &[u8], columns: &Columns) -> Transformed {
         let regex = Regex::new(r"[a-z0-9._-]+@[a-z0-9.-]+\.[a-z]+").unwrap();
         transform(
             input,
             columns,
-            &regex,
-            fake_names,
-            fake_emails,
+            &fns(&regex, fake_names, fake_emails),
             &mut |kind, _value| match kind {
                 Kind::First | Kind::Last => "N".to_owned(),
                 Kind::Email => "x@example.com".to_owned(),
             },
             "t.csv",
+            None,
         )
         .unwrap()
     }
@@ -423,15 +464,14 @@ mod tests {
         transform_encoded(
             input,
             columns,
-            &regex,
-            text::replace_name,
-            text::replace_emails,
+            &fns(&regex, text::replace_name, text::replace_emails),
             &mut |kind, _| match kind {
                 Kind::First => "Berta".to_owned(),
                 Kind::Last => "Muster".to_owned(),
                 Kind::Email => "f@x.test".to_owned(),
             },
             "t.csv",
+            None,
         )
     }
 
@@ -501,11 +541,10 @@ mod tests {
         let error = transform_encoded(
             b"name\nJ\xf6rg\n",
             &columns(),
-            &regex,
-            text::replace_name,
-            text::replace_emails,
+            &fns(&regex, text::replace_name, text::replace_emails),
             &mut |_, _| "\u{141}".to_owned(),
             "t.csv",
+            None,
         )
         .err()
         .map(|e| e.to_string())
@@ -630,11 +669,10 @@ mod tests {
         let error = transform(
             input,
             &Columns::default(),
-            &regex,
-            fake_names,
-            fake_emails,
+            &fns(&regex, fake_names, fake_emails),
             &mut |_, _| String::new(),
             "t.csv",
+            None,
         )
         .err()
         .map(|e| e.to_string())
@@ -647,15 +685,14 @@ mod tests {
         let out = transform(
             input,
             columns,
-            &regex,
-            text::replace_name,
-            text::replace_emails,
+            &fns(&regex, text::replace_name, text::replace_emails),
             &mut |kind, value| match kind {
                 Kind::First => "Berta".to_owned(),
                 Kind::Last => "Muster".to_owned(),
                 Kind::Email => format!("f{}@x.test", value.len()),
             },
             "t.csv",
+            None,
         )
         .unwrap();
         String::from_utf8(out.bytes).unwrap()

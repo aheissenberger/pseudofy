@@ -2,6 +2,7 @@ mod cells;
 mod config;
 mod csv_file;
 mod key;
+mod known_names;
 mod locale;
 mod names;
 mod panic_guard;
