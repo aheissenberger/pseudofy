@@ -897,10 +897,12 @@ fn rule_without_any_header_warns_once() {
 #[test]
 fn a_bad_file_is_reported_and_the_other_files_are_written() {
     let dir = project(KEY_A, None, &[]);
-    let bad = dir.path().join("a_bad.csv");
-    fs::write(&bad, b"first_name\nZorbina\xff\n").unwrap();
+    write_file(dir.path(), "a_bad.csv", "first_name\nZorbina\n");
     write_file(dir.path(), "b_good.csv", "first_name\nTamsorin\n");
     let out = TempDir::new().unwrap();
+    // Each byte is valid in Windows-1252 (spec 0009), so a file cannot fail on
+    // its encoding. A directory at the output path makes the write fail.
+    fs::create_dir(out.path().join("a_bad.csv")).unwrap();
     let assert = run(dir.path(), out.path()).failure();
     let stderr = stderr_text(&assert);
     assert!(stderr.contains("a_bad.csv"), "{stderr}");
@@ -908,7 +910,7 @@ fn a_bad_file_is_reported_and_the_other_files_are_written() {
     assert_no_leak(&stderr, "stderr");
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(stdout.contains("files: 1,"), "{stdout}");
-    assert!(!out.path().join("a_bad.csv").exists());
+    assert!(out.path().join("a_bad.csv").is_dir());
     let good = read(out.path(), "b_good.csv");
     assert!(!good.to_lowercase().contains("tamsorin"), "{good}");
 }
@@ -929,4 +931,184 @@ fn symlinked_input_is_skipped_with_a_warning() {
     let stderr = stderr_text(&assert);
     assert!(stderr.contains("linked.csv: symlink skipped"), "{stderr}");
     assert!(!out.path().join("linked.csv").exists());
+}
+
+// ---- Windows-1252 input (spec 0009) ----
+
+const WIN_FIXTURE: &str = "windows-1252.csv";
+const WIN_REAL_VALUES: [&str; 8] = [
+    "Jörg",
+    "Müller",
+    "Bärbel",
+    "Weiß",
+    "jm@acme.test",
+    "bw@acme.test",
+    "acme.test",
+    "Grüße",
+];
+
+fn win_fixture_bytes() -> Vec<u8> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(WIN_FIXTURE);
+    fs::read(path).unwrap()
+}
+
+/// Creates a project with a key, a config, and the given raw files.
+fn raw_project(files: &[(&str, &[u8])]) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "secrets/pseudofy.key", &format!("{KEY_A}\n"));
+    write_file(dir.path(), "config/pseudofy.toml", &config(None));
+    for (name, bytes) in files {
+        let path = dir.path().join(name);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, bytes).unwrap();
+    }
+    dir
+}
+
+fn decode_1252(bytes: &[u8]) -> String {
+    let (text, had_errors) = encoding_rs::WINDOWS_1252.decode_without_bom_handling(bytes);
+    assert!(!had_errors, "copy is not clean Windows-1252");
+    text.into_owned()
+}
+
+fn encode_1252(text: &str) -> Vec<u8> {
+    let (bytes, _, had_errors) = encoding_rs::WINDOWS_1252.encode(text);
+    assert!(!had_errors, "text is not Windows-1252");
+    bytes.into_owned()
+}
+
+fn win_copy() -> Vec<u8> {
+    let project = raw_project(&[(WIN_FIXTURE, &win_fixture_bytes())]);
+    let (out, _) = run_ok(project.path());
+    fs::read(out.path().join(WIN_FIXTURE)).unwrap()
+}
+
+#[test]
+fn windows_1252_file_gets_a_windows_1252_copy_with_pseudonyms() {
+    let copy = win_copy();
+    assert!(!copy.starts_with(&[0xEF, 0xBB, 0xBF]), "copy has a BOM");
+    // The note `Grüße` is untouched; in Windows-1252 it is `Gr\xfc\xdfe`.
+    assert!(std::str::from_utf8(&copy).is_err(), "copy is UTF-8");
+    assert!(
+        copy.windows(5).any(|window| window == b"Gr\xfc\xdfe"),
+        "copy is not Windows-1252"
+    );
+    let text = decode_1252(&copy);
+    let table = rows(&text, ';');
+    for header in ["first_name", "last_name", "name"] {
+        for cell in column(&table, header) {
+            for real in ["Jörg", "Müller", "Bärbel", "Weiß"] {
+                assert!(!cell.contains(real), "real value left in {header}");
+            }
+        }
+    }
+    assert!(!text.contains("jm@acme.test") && !text.contains("bw@acme.test"));
+}
+
+#[test]
+fn same_first_name_in_utf8_and_windows_1252_gets_the_same_pseudonym() {
+    let utf8 = "first_name,last_name,name,email,note\nJörg,Müller,Jörg Müller,jm@acme.test,x\n";
+    let project = raw_project(&[
+        (WIN_FIXTURE, &win_fixture_bytes()),
+        ("utf8.csv", utf8.as_bytes()),
+    ]);
+    let (out, _) = run_ok(project.path());
+    let utf8_table = rows(&read(out.path(), "utf8.csv"), ',');
+    let win_text = decode_1252(&fs::read(out.path().join(WIN_FIXTURE)).unwrap());
+    let win_table = rows(&win_text, ';');
+    assert_eq!(
+        column(&utf8_table, "first_name")[0],
+        column(&win_table, "first_name")[0]
+    );
+}
+
+#[test]
+fn windows_1252_copy_keeps_shape_header_delimiter_and_line_ending() {
+    let input = win_fixture_bytes();
+    let copy = win_copy();
+    let lines = |bytes: &[u8]| -> Vec<Vec<u8>> {
+        bytes
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .map(<[u8]>::to_vec)
+            .collect()
+    };
+    let (in_lines, out_lines) = (lines(&input), lines(&copy));
+    assert_eq!(in_lines.len(), out_lines.len(), "row count");
+    assert_eq!(in_lines[0], out_lines[0], "header bytes");
+    for (a, b) in in_lines.iter().zip(&out_lines) {
+        let count = |l: &[u8]| l.split(|x| *x == b';').count();
+        assert_eq!(count(a), count(b), "column count");
+        assert!(b.ends_with(b"\r"), "line ending is not CRLF");
+    }
+    let newlines = |bytes: &[u8]| bytes.split(|b| *b == b'\n').count();
+    assert_eq!(newlines(&input), newlines(&copy));
+}
+
+#[test]
+fn windows_1252_file_without_a_value_to_replace_is_byte_equal() {
+    let bytes = encode_1252("id;note\r\n1;Grüße aus Köln\r\n");
+    let project = raw_project(&[("plain.csv", &bytes)]);
+    let (out, _) = run_ok(project.path());
+    assert_eq!(fs::read(out.path().join("plain.csv")).unwrap(), bytes);
+}
+
+#[test]
+fn windows_1252_run_prints_no_real_value() {
+    let project = raw_project(&[(WIN_FIXTURE, &win_fixture_bytes())]);
+    let out = TempDir::new().unwrap();
+    let assert = run(project.path(), out.path()).success();
+    let output = assert.get_output();
+    for stream in [&output.stderr, &output.stdout] {
+        let text = String::from_utf8_lossy(stream);
+        for real in WIN_REAL_VALUES {
+            assert!(!text.contains(real), "real value in output stream");
+            let encoded = encode_1252(real);
+            assert!(
+                !stream.windows(encoded.len()).any(|w| w == encoded),
+                "real value (1252) in output stream"
+            );
+        }
+    }
+}
+
+fn assert_rejected(name: &str, bytes: &[u8]) {
+    let dir = project(KEY_A, None, &[]);
+    fs::write(dir.path().join(name), bytes).unwrap();
+    write_file(dir.path(), "z_good.csv", "first_name\nTamsorin\n");
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).failure();
+    let stderr = stderr_text(&assert);
+    assert!(
+        stderr.contains(&format!("{name}: unsupported or damaged encoding")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1 file(s) failed"), "{stderr}");
+    assert_no_leak(&stderr, "stderr");
+    assert!(!out.path().join(name).exists());
+    assert!(out.path().join("z_good.csv").exists());
+}
+
+#[test]
+fn utf8_file_with_one_invalid_byte_is_rejected() {
+    assert_rejected(
+        "mixed.csv",
+        b"first_name;name\nZorbina;Zorbina Qu\xc3\xa4nzel\xff\n",
+    );
+}
+
+#[test]
+fn utf8_bom_before_windows_1252_text_is_rejected() {
+    assert_rejected("bom.csv", b"\xEF\xBB\xBFname\r\nZorbina Qu\xe4nzel\r\n");
+}
+
+#[test]
+fn utf16_file_is_rejected() {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in "first_name\r\nZorbina\r\n".encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert_rejected("unicode.csv", &bytes);
 }
