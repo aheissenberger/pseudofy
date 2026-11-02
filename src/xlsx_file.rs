@@ -51,6 +51,16 @@ pub fn process(
     if has_pivot_parts(&bytes) {
         return Err(anyhow!("{rel}: workbook has pivot tables; not supported"));
     }
+    let found = xlsx_scrub::inspect(&bytes).map_err(|_| unreadable())?;
+    if found.unsupported {
+        return Err(anyhow!("{rel}: unsupported workbook layout"));
+    }
+    if !found.kinds.is_empty() {
+        eprintln!(
+            "warning: {rel}: not pseudonymized: {}",
+            found.kinds.join(", ")
+        );
+    }
     // The crate can panic on a damaged workbook; its error texts are not used.
     let mut book = panic_guard::catch(|| reader::xlsx::read_reader(Cursor::new(bytes), true))
         .ok_or_else(unreadable)?
@@ -111,7 +121,58 @@ fn replace_in_text(
     })
 }
 
-/// Replace the emails in the url and tooltip of the hyperlink of `cell`.
+/// Percent-decode `text` as UTF-8. An invalid escape stays as it is; if the
+/// result is not UTF-8, `text` is returned unchanged.
+fn percent_decode(text: &str) -> String {
+    fn hex(byte: u8) -> Option<u8> {
+        char::from(byte)
+            .to_digit(16)
+            .and_then(|digit| u8::try_from(digit).ok())
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+        {
+            out.push(high * 16 + low);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+}
+
+/// The new url of a hyperlink. A `mailto:` url is decoded, cut at the first
+/// `?`, and its addresses are replaced; other urls only get the replacement.
+fn new_url(
+    url: &str,
+    email_regex: &Regex,
+    emails: EmailFn,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+) -> String {
+    const SCHEME: &str = "mailto:";
+    if url.len() >= SCHEME.len()
+        && url.is_char_boundary(SCHEME.len())
+        && url[..SCHEME.len()].eq_ignore_ascii_case(SCHEME)
+    {
+        let decoded = percent_decode(&url[SCHEME.len()..]);
+        let address = decoded.split('?').next().unwrap_or_default();
+        format!(
+            "{SCHEME}{}",
+            replace_in_text(address, email_regex, emails, replace)
+        )
+    } else {
+        replace_in_text(url, email_regex, emails, replace)
+    }
+}
+
+/// Replace the emails in the url of the hyperlink of `cell` and clear its
+/// tooltip.
 fn scrub_hyperlink(
     cell: &mut umya_spreadsheet::Cell,
     email_regex: &Regex,
@@ -121,12 +182,11 @@ fn scrub_hyperlink(
     let Some(link) = cell.hyperlink() else {
         return;
     };
-    let url = replace_in_text(link.url(), email_regex, emails, replace);
-    let tooltip = replace_in_text(link.tooltip(), email_regex, emails, replace);
-    if url != link.url() || tooltip != link.tooltip() {
+    let url = new_url(link.url(), email_regex, emails, replace);
+    if url != link.url() || !link.tooltip().is_empty() {
         let link = cell.hyperlink_mut();
         link.set_url(url);
-        link.set_tooltip(tooltip);
+        link.set_tooltip("");
     }
 }
 
@@ -478,7 +538,56 @@ mod tests {
         assert!(fake.starts_with("E-"));
         let link = cell.hyperlink().unwrap();
         assert_eq!(link.url(), format!("mailto:{fake}"));
-        assert_eq!(link.tooltip(), format!("Write to {fake}"));
+        assert_eq!(link.tooltip(), "");
+    }
+
+    #[test]
+    fn mailto_is_decoded_cut_and_replaced() {
+        let mut book = book();
+        let sheet = book.sheet_by_name_mut("Kunden 2025").unwrap();
+        let cell = sheet.cell_mut("B4");
+        cell.set_value_string("zorbina@acme.test");
+        cell.hyperlink_mut()
+            .set_url("mailto:zorbina%40acme.test?subject=Hi%20Zorbina&body=x");
+        let cell = sheet.cell_mut("B5");
+        cell.set_value_string("zorbina@acme.test");
+        cell.hyperlink_mut().set_url("MAILTO:zorbina@acme.test");
+        let rule = rule(&[]);
+        run(&mut book, &[&rule]);
+        let sheet = book.sheet_by_name("Kunden 2025").unwrap();
+        let fake = sheet.cell("B4").unwrap().value().to_string();
+        assert_eq!(
+            sheet.cell("B4").unwrap().hyperlink().unwrap().url(),
+            format!("mailto:{fake}")
+        );
+        assert_eq!(
+            sheet.cell("B5").unwrap().hyperlink().unwrap().url(),
+            format!("mailto:{fake}")
+        );
+    }
+
+    #[test]
+    fn percent_decode_keeps_invalid_escapes() {
+        assert_eq!(percent_decode("a%40b"), "a@b");
+        assert_eq!(percent_decode("a%4"), "a%4");
+        assert_eq!(percent_decode("a%zzb%"), "a%zzb%");
+        assert_eq!(percent_decode("%C3%A4"), "\u{e4}");
+        assert_eq!(percent_decode("%FF"), "%FF");
+    }
+
+    #[test]
+    fn other_url_keeps_the_email_replacement_and_tooltip_is_cleared() {
+        let mut book = book();
+        let sheet = book.sheet_by_name_mut("Kunden 2025").unwrap();
+        let link = sheet.cell_mut("D5").hyperlink_mut();
+        link.set_url("https://example.test/?u=zorbina@acme.test");
+        link.set_tooltip("Invented tip");
+        let rule = rule(&[]);
+        run(&mut book, &[&rule]);
+        let sheet = book.sheet_by_name("Kunden 2025").unwrap();
+        let link = sheet.cell("D5").unwrap().hyperlink().unwrap();
+        assert!(!link.url().contains("zorbina"));
+        assert_eq!(link.tooltip(), "");
     }
 
     #[test]
