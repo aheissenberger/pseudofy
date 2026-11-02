@@ -224,16 +224,22 @@ fn hidden_sheet_is_processed_and_stays_hidden() {
     let hidden = book.new_sheet("Versteckt").unwrap();
     set(hidden, "A1", "name");
     set(hidden, "A2", "Zorbina Quenzel");
-    hidden.set_sheet_state("hidden".to_string());
+    hidden.set_state(umya_spreadsheet::SheetStateValues::Hidden);
     save(&book, dir.path(), "mappe.xlsx");
     let (out, _, _) = run_ok(dir.path());
     let copy = open(out.path(), "mappe.xlsx");
     assert_ne!(value(&copy, "Versteckt", "A2"), "Zorbina Quenzel");
     assert_ne!(value(&copy, "Versteckt", "A2"), "");
     let sheet = copy.sheet_by_name("Versteckt").unwrap();
-    assert_eq!(sheet.sheet_state(), "hidden");
+    assert!(matches!(
+        sheet.state(),
+        umya_spreadsheet::SheetStateValues::Hidden
+    ));
     let sheet = copy.sheet_by_name("Sichtbar").unwrap();
-    assert_ne!(sheet.sheet_state(), "hidden");
+    assert!(matches!(
+        sheet.state(),
+        umya_spreadsheet::SheetStateValues::Visible
+    ));
 }
 
 #[test]

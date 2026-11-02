@@ -259,7 +259,7 @@ mod tests {
         two.cell_mut("B2").set_value_string("Berta Muster");
         two.cell_mut("A2").set_value_string("Berta Muster");
         let hidden = book.new_sheet("Hidden").unwrap();
-        hidden.set_sheet_state("hidden".to_owned());
+        hidden.set_state(umya_spreadsheet::SheetStateValues::Hidden);
         hidden.cell_mut("A1").set_value_string("Name");
         hidden.cell_mut("A2").set_value_string("Carl Probe");
         book
@@ -316,7 +316,10 @@ mod tests {
         run(&mut book, &[&rule]);
         assert!(text_of(&book, "Hidden", "A2").starts_with("F-"));
         let hidden = book.sheet_by_name("Hidden").unwrap();
-        assert_eq!(hidden.sheet_state(), "hidden");
+        assert!(matches!(
+            hidden.state(),
+            umya_spreadsheet::SheetStateValues::Hidden
+        ));
     }
 
     #[test]
