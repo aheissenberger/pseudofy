@@ -41,8 +41,11 @@
 
 - [ ] No new crate. The restore step uses `zip` and `quick-xml` (ADR-0010).
 - [ ] The scrub copies only the sparkline `<ext>` element from an input sheet.
+- [ ] The scrub rebuilds the `<ext>` element from the sparkline elements of ECMA-376 and MS-XLSX: `sparklineGroups`, `sparklineGroup`, the color elements, `sparklines`, `sparkline`, `f`, and `sqref`. It drops each other element, comment, processing instruction, and CDATA section.
+- [ ] The scrub reads the namespace of a prefix only from the input `<worksheet>` and `<extLst>` elements.
+- [ ] If an input sheet has no sparklines, a fault in another part of the input does not stop the file.
 - [ ] If the copy already has a sparkline `<ext>` element in that sheet, the scrub does not add a second one.
-- [ ] If the scrub cannot find the sheet of the copy, pseudofy fails for that file. The error message contains no real value.
+- [ ] If the scrub cannot find the sheet of the input or of the copy, pseudofy fails for that file. The error message contains no real value.
 - [ ] No `unwrap()` or `expect()` outside tests.
 
 ## 4. Acceptance Criteria & Verification
