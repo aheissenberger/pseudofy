@@ -756,3 +756,115 @@ fn stderr_never_contains_real_values_from_the_fixtures() {
         assert!(!stderr.contains(part), "stderr leaks {part}");
     }
 }
+
+#[test]
+fn apostrophe_email_gives_one_fake_address_in_column_and_free_text() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "email,notes\nmary.o'neil@acme.test,Write to mary.o'neil@acme.test today\n",
+    );
+    let out = run_clean(dir.path());
+    let text = read(out.path(), "data.csv");
+    let lower = text.to_lowercase();
+    for part in ["mary", "neil", "o'n"] {
+        assert!(!lower.contains(part), "output leaks {part}: {text}");
+    }
+    assert_no_leak(&text, "output");
+    let table = rows(&text, ',');
+    let in_column = column(&table, "email");
+    let in_text = emails_in(&column(&table, "notes")[0]);
+    assert_eq!(in_text.len(), 1, "{text}");
+    assert!(in_column[0].ends_with("example.com"), "{text}");
+    assert!(in_text[0].ends_with("example.com"), "{text}");
+    assert_eq!(in_column[0], in_text[0]);
+}
+
+#[test]
+fn display_name_with_address_in_email_column_keeps_its_shape() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "email\nZorbel Quenzel <zorbel@acme.test>\n",
+    );
+    let out = run_clean(dir.path());
+    let text = read(out.path(), "data.csv");
+    let lower = text.to_lowercase();
+    for part in ["zorbel", "quenzel"] {
+        assert!(!lower.contains(part), "output leaks {part}: {text}");
+    }
+    assert_no_leak(&text, "output");
+    let table = rows(&text, ',');
+    let cell = &column(&table, "email")[0];
+    let words: Vec<&str> = cell.split(' ').collect();
+    assert_eq!(words.len(), 3, "{cell}");
+    assert!(words[0].chars().all(char::is_alphabetic), "{cell}");
+    assert!(words[1].chars().all(char::is_alphabetic), "{cell}");
+    assert!(
+        words[2].starts_with('<') && words[2].ends_with('>'),
+        "{cell}"
+    );
+    assert!(words[2].contains('@'), "{cell}");
+    assert!(strip_angle(words[2]).ends_with("example.com"), "{cell}");
+}
+
+#[test]
+fn trailing_dot_after_address_in_name_cell_is_kept_and_address_matches_email_column() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "name,email\nZorbel Quenzel zorbel@acme.test.,zorbel@acme.test\n",
+    );
+    let out = run_clean(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_leak(&text, "output");
+    let table = rows(&text, ',');
+    let name_cell = &column(&table, "name")[0];
+    assert!(name_cell.ends_with('.'), "{name_cell}");
+    let in_name = emails_in(name_cell);
+    assert_eq!(in_name.len(), 1, "{text}");
+    assert_eq!(
+        in_name[0].trim_end_matches('.'),
+        column(&table, "email")[0],
+        "{text}"
+    );
+}
+
+#[test]
+fn cr_only_line_endings_are_kept_and_names_are_replaced() {
+    let dir = project(KEY_A, None, &[]);
+    let input = "first_name,last_name\rZorbina,Quenzel\r\rTamsorin,Velgrad\r";
+    write_file(dir.path(), "data.csv", input);
+    let out = run_clean(dir.path());
+    let output = read(out.path(), "data.csv");
+    assert!(!output.contains('\n'), "{output:?}");
+    assert_eq!(
+        output.matches('\r').count(),
+        input.matches('\r').count(),
+        "{output:?}"
+    );
+    assert!(output.contains("\r\r"), "{output:?}");
+    assert_no_leak(&output, "output");
+}
+
+#[test]
+fn quoted_newline_header_and_semicolon_delimiter_are_kept() {
+    let dir = project(KEY_A, None, &[]);
+    let header = "\"Kunden\nNr\";first_name;last_name\n";
+    write_file(
+        dir.path(),
+        "data.csv",
+        &format!("{header}1;Zorbina;Quenzel\n"),
+    );
+    let out = run_clean(dir.path());
+    let output = read(out.path(), "data.csv");
+    assert!(output.starts_with(header), "{output:?}");
+    assert_no_leak(&output, "output");
+    let data_line = output[header.len()..].trim_end();
+    assert_eq!(data_line.split(';').count(), 3, "{output:?}");
+    assert!(!data_line.contains(','), "{output:?}");
+    assert!(data_line.starts_with("1;"), "{output:?}");
+}
