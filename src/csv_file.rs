@@ -80,13 +80,36 @@ pub fn process(
         &mut replace,
         rel,
     )?;
-    for (glob, header) in &result.missing {
-        eprintln!(
-            "warning: rule \"{glob}\" names the header \"{header}\", which {rel} does not have"
-        );
+    for glob in rules_without_headers(rules, &result.missing) {
+        eprintln!("warning: rule \"{glob}\" matches {rel}, but the file has none of its headers");
     }
     write_output(out_root, output, &result.bytes, rel)?;
     Ok(result.replaced)
+}
+
+/// Globs of the rules that name at least one header and find none of them
+/// in the file. A rule that finds some of its headers gives no warning.
+fn rules_without_headers<'a>(rules: &[&'a Rule], missing: &[(String, String)]) -> Vec<&'a str> {
+    rules
+        .iter()
+        .filter(|rule| {
+            let named: Vec<&String> = rule
+                .first_name
+                .iter()
+                .chain(&rule.last_name)
+                .chain(&rule.full_name)
+                .chain(&rule.email)
+                .collect();
+            !named.is_empty()
+                && named.iter().all(|header| {
+                    let header = header.trim().to_lowercase();
+                    missing
+                        .iter()
+                        .any(|(glob, miss)| *glob == rule.files && *miss == header)
+                })
+        })
+        .map(|rule| rule.files.as_str())
+        .collect()
 }
 
 fn is_not_found(error: &std::io::Error) -> bool {
@@ -574,6 +597,31 @@ mod tests {
         assert_eq!(detect_delimiter(b"a,b;c"), b',');
         assert_eq!(detect_delimiter(b"abc"), b',');
         assert_eq!(detect_delimiter(b"\"a;b;c\",d"), b',');
+    }
+
+    fn rule(files: &str, first: &[&str], email: &[&str]) -> Rule {
+        Rule {
+            files: files.to_string(),
+            first_name: first.iter().map(|s| (*s).to_string()).collect(),
+            last_name: Vec::new(),
+            full_name: Vec::new(),
+            email: email.iter().map(|s| (*s).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn warns_only_for_a_rule_without_any_header() {
+        let partial = rule("a/*.csv", &["First_Name"], &["email"]);
+        let none = rule("b/*.csv", &["vorname"], &[]);
+        let empty = rule("c/*.csv", &[], &[]);
+        let missing = vec![
+            ("a/*.csv".to_string(), "email".to_string()),
+            ("b/*.csv".to_string(), "vorname".to_string()),
+        ];
+        assert_eq!(
+            rules_without_headers(&[&partial, &none, &empty], &missing),
+            ["b/*.csv"]
+        );
     }
 
     #[test]

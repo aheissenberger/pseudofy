@@ -19,6 +19,9 @@ pub struct Summary {
     pub files: usize,
     pub replaced: usize,
     pub collisions: usize,
+    /// Files that could not be read or written. `run` reports each one and
+    /// continues with the other files.
+    pub failed: usize,
 }
 
 /// Write a pseudonymized copy of each CSV file under `project` to `out`.
@@ -56,15 +59,30 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
             path != secrets && path != config_dir && path != out
         });
     for entry in walker {
-        let entry = entry.context("cannot read the project directory")?;
-        if !entry.file_type().is_file() || !is_csv(entry.path()) {
-            continue;
-        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                let rel = error
+                    .path()
+                    .and_then(|path| path.strip_prefix(&project).ok())
+                    .map_or_else(|| ".".to_string(), relative_text);
+                eprintln!("error: cannot read {rel} in the project directory");
+                summary.failed += 1;
+                continue;
+            }
+        };
         let relative = entry
             .path()
             .strip_prefix(&project)
             .context("file outside the project")?;
         let rel = relative_text(relative);
+        if entry.path_is_symlink() {
+            eprintln!("warning: {rel}: symlink skipped");
+            continue;
+        }
+        if !entry.file_type().is_file() || !is_csv(entry.path()) {
+            continue;
+        }
         let rules: Vec<&Rule> = matchers
             .iter()
             .filter(|(matcher, _)| matcher.is_match(&rel))
@@ -74,7 +92,7 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
             eprintln!("warning: {rel}: no rule matches; only emails are replaced");
         }
         let target = out.join(relative);
-        summary.replaced += csv_file::process(
+        match csv_file::process(
             entry.path(),
             &out,
             &target,
@@ -82,8 +100,16 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
             &rules,
             &mut pseudonymizer,
             &email_regex,
-        )?;
-        summary.files += 1;
+        ) {
+            Ok(replaced) => {
+                summary.replaced += replaced;
+                summary.files += 1;
+            }
+            Err(error) => {
+                eprintln!("error: {error:#}");
+                summary.failed += 1;
+            }
+        }
     }
     summary.collisions = pseudonymizer.collisions();
     Ok(summary)
