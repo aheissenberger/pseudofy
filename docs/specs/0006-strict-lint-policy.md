@@ -1,7 +1,7 @@
 # Feature Delta Spec: Strict lint policy
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/adr/0006-strict-lint-policy-in-cargo-toml.md` · `docs/specs/0001-rust-cli-scaffold-and-devcontainer.md` · `docs/specs/0002-pseudonym-engine-and-csv.md` §3
 
