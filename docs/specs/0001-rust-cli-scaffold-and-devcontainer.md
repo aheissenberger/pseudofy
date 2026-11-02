@@ -1,7 +1,7 @@
 # Feature Delta Spec: Rust CLI scaffold and devcontainer
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2, §4 · `docs/adr/0001-use-rust-for-the-cli.md` · `docs/adr/0002-develop-in-a-devcontainer.md` · `docs/adr/0004-initial-crate-set.md`
 
