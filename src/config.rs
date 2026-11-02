@@ -13,7 +13,7 @@ use crate::locale::Language;
 /// Path of the config file, relative to the project directory.
 pub const CONFIG_FILE: &str = "config/pseudofy.toml";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub language: Language,
@@ -22,6 +22,9 @@ pub struct Config {
     /// How known names are replaced in text cells outside the name columns.
     #[serde(default)]
     pub free_text: FreeText,
+    /// Copy other files (not CSV or XLSX) unchanged to the output (spec 0014).
+    #[serde(default)]
+    pub copy_other_files: bool,
     #[serde(default, rename = "rule")]
     pub rules: Vec<Rule>,
 }
@@ -41,7 +44,7 @@ pub enum FreeText {
 }
 
 /// One `[[rule]]`: a file glob and the header texts of the name and email columns.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
     pub files: String,
@@ -69,33 +72,59 @@ pub fn load(project: &Path) -> anyhow::Result<Config> {
     toml::from_str(&text).with_context(|| format!("invalid {CONFIG_FILE}"))
 }
 
-/// Write `config/pseudofy.toml` with the language, `email_subdomains = true`,
-/// and one example rule. Fail if the file exists.
+/// Write `config/pseudofy.toml` with the language, one example rule, and the
+/// other settings as commented defaults. Fail if the file exists.
 pub fn create(project: &Path, language: Language) -> anyhow::Result<()> {
     let path = project.join(CONFIG_FILE);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("cannot create the config directory")?;
     }
     let text = format!(
-        r#"# pseudofy config
+        r##"# pseudofy config
+#
+# A setting with "#" in front shows its default value.
+# Remove the "#" to change the value.
+
+# Language of the fake names: "de" or "en".
 language = "{}"
-# false: each fake email uses example.com. true: each real domain gets one fake subdomain.
-email_subdomains = true
-# Known names in other text cells: "tokens" (default) also replaces single first
-# and last names, "full" only complete full names, "off" none.
+
+# Fake email domains.
+# true:  each real domain gets one fake subdomain of example.com.
+# false: each fake email uses example.com.
+# email_subdomains = true
+
+# Known names in other text cells (not in the name columns).
+# "tokens": replace full names and single first or last names.
+# "full":   replace only complete full names.
+# "off":    replace no names in other text cells.
 # free_text = "tokens"
 
-# Each rule selects files with a glob (relative to the project) and names the
-# header texts of the name and email columns. In XLSX files, each sheet uses
-# its first non-empty row as the header. `sheets = ["Kunden*"]` limits a rule
-# to the sheets with matching names.
+# Other files (not .csv or .xlsx).
+# false: do not copy them.
+# true:  copy them unchanged to the output directory. pseudofy does not
+#        check them. Check each copied file before you share it.
+#        Hidden files and directories (".*") are never copied.
+# copy_other_files = false
+
+# Rules. Each rule selects files and names the header texts of the name
+# and email columns. Add one [[rule]] block for each group of files.
+#
+# files:      glob relative to the project directory (case is ignored).
+# first_name: header texts of first-name columns.
+# last_name:  header texts of last-name columns.
+# full_name:  header texts of full-name columns ("First Last").
+# email:      header texts of email columns.
+# sheets:     XLSX only. Sheet-name globs. Default: each sheet.
+#
+# In XLSX files, each sheet uses its first non-empty row as the header.
 [[rule]]
 files = "**/*.{{csv,xlsx}}"
 first_name = ["first_name"]
 last_name = ["last_name"]
 full_name = ["name"]
 email = ["email"]
-"#,
+# sheets = ["*"]
+"##,
         language.code()
     );
     let mut file = OpenOptions::new()
@@ -122,5 +151,87 @@ mod tests {
         assert_eq!(config.rules.len(), 1);
         assert_eq!(config.rules[0].files, "**/*.{csv,xlsx}");
         assert!(create(dir.path(), Language::En).is_err());
+    }
+
+    fn template(language: Language) -> String {
+        let dir = tempfile::tempdir().unwrap();
+        create(dir.path(), language).unwrap();
+        fs::read_to_string(dir.path().join(CONFIG_FILE)).unwrap()
+    }
+
+    fn expected(language: Language) -> Config {
+        Config {
+            language,
+            email_subdomains: true,
+            free_text: FreeText::Tokens,
+            copy_other_files: false,
+            rules: vec![Rule {
+                files: "**/*.{csv,xlsx}".to_owned(),
+                first_name: vec!["first_name".to_owned()],
+                last_name: vec!["last_name".to_owned()],
+                full_name: vec!["name".to_owned()],
+                email: vec!["email".to_owned()],
+                sheets: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn copy_other_files_defaults_to_false_and_parses() {
+        let config: Config = toml::from_str("language = \"en\"").unwrap();
+        assert!(!config.copy_other_files);
+        let config: Config = toml::from_str("language = \"en\"\ncopy_other_files = true").unwrap();
+        assert!(config.copy_other_files);
+    }
+
+    #[test]
+    fn template_parses_to_the_defaults_plus_one_rule() {
+        for language in [Language::De, Language::En] {
+            let config: Config = toml::from_str(&template(language)).unwrap();
+            assert_eq!(config, expected(language));
+        }
+    }
+
+    #[test]
+    fn template_mentions_each_field() {
+        let text = template(Language::En);
+        for name in [
+            "language",
+            "email_subdomains",
+            "free_text",
+            "copy_other_files",
+            "files",
+            "first_name",
+            "last_name",
+            "full_name",
+            "email",
+            "sheets",
+        ] {
+            assert!(text.contains(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn commented_defaults_are_true_defaults() {
+        let text: String = template(Language::En)
+            .lines()
+            .map(|line| match line.strip_prefix("# ") {
+                Some(rest) if is_setting(rest) => rest,
+                _ => line,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let config: Config = toml::from_str(&text).unwrap();
+        // `sheets = ["*"]` matches each sheet, like the empty default.
+        let mut want = expected(Language::En);
+        want.rules[0].sheets = vec!["*".to_owned()];
+        assert_eq!(config, want);
+    }
+
+    /// A commented `key = value` line (the key is a lowercase word).
+    fn is_setting(line: &str) -> bool {
+        line.split_once(" = ").is_some_and(|(key, _)| {
+            !key.is_empty() && key.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+        })
     }
 }
