@@ -39,12 +39,12 @@ This spec starts only after spec 0005 is done and the release `v0.1.0` exists.
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] The formula has `depends_on arch: :arm64` and `depends_on :macos`.
-- [ ] The formula `version`, the release tag, and the `Cargo.toml` version are equal.
-- [ ] The formula `sha256` is equal to the value in the release `.sha256` file.
-- [ ] The formula `license` is `"Apache-2.0"`.
-- [ ] The `test do` block runs only `pseudofy --version`. It uses no real data and no project key.
-- [ ] No workflow and no repository uses a new secret (ADR-0008).
+- [x] The formula has `depends_on arch: :arm64` and `depends_on :macos`.
+- [x] The formula `version`, the release tag, and the `Cargo.toml` version are equal.
+- [x] The formula `sha256` is equal to the value in the release `.sha256` file.
+- [x] The formula `license` is `"Apache-2.0"`.
+- [x] The `test do` block runs only `pseudofy --version`. It uses no real data and no project key.
+- [x] No workflow and no repository uses a new secret (ADR-0008).
 
 ## 4. Acceptance Criteria & Verification
 
