@@ -236,7 +236,7 @@ fn restore_external_links<R: Read + std::io::Seek>(
     }
     for part in &link_parts {
         let xml = read_part(&mut source, part)?.ok_or("missing link part")?;
-        parts.insert(part.clone(), strip_cached_rows(&xml)?);
+        parts.insert(part.clone(), strip_cached_values(&xml)?);
         let rels = rels_part(part);
         if let Some(bytes) = read_part(&mut source, &rels)? {
             parts.insert(rels, bytes);
@@ -250,7 +250,7 @@ fn restore_external_links<R: Read + std::io::Seek>(
         .map(|(id, _)| id)
         .collect();
     let types = read_part(output, CONTENT_TYPES)?.ok_or("no content types")?;
-    let declared = override_names(&types)?;
+    let mut declared = override_names(&types)?;
 
     let mut references: Vec<String> = Vec::new();
     let mut relations: Vec<String> = Vec::new();
@@ -271,7 +271,8 @@ fn restore_external_links<R: Read + std::io::Seek>(
         relations.push(format!(
             r#"<Relationship Id="{id}" Type="{EXTERNAL_LINK_REL}" Target="{file}"/>"#
         ));
-        if !declared.contains(&format!("/{part}")) {
+        // `insert` also skips a part that two references share.
+        if declared.insert(format!("/{part}")) {
             overrides.push(format!(
                 r#"<Override PartName="/{part}" ContentType="{EXTERNAL_LINK_TYPE}"/>"#
             ));
@@ -358,41 +359,47 @@ fn insert_xml(xml: &[u8], snippet: &str, before: &[&[u8]]) -> Result<Vec<u8>, Fa
     }
 }
 
-/// Remove each `<row>` inside a `<sheetData>` of an external link part.
-fn strip_cached_rows(xml: &[u8]) -> Result<Vec<u8>, Failure> {
+/// Remove the cached values of an external link part: all content of each
+/// `<sheetData>` (external workbook links) and each `<values>` element (DDE
+/// links). The elements that hold no value stay.
+fn strip_cached_values(xml: &[u8]) -> Result<Vec<u8>, Failure> {
     let mut reader = Reader::from_reader(xml);
     let mut writer = Writer::new(Vec::new());
     let mut buf = Vec::new();
-    let mut in_data = false;
-    let mut skipping = 0usize;
     loop {
         let event = reader.read_event_into(&mut buf)?;
-        if skipping > 0 {
-            match event {
-                Event::Start(_) => skipping += 1,
-                Event::End(_) => skipping -= 1,
-                Event::Eof => return Err("unclosed row".into()),
-                _ => {}
-            }
-            buf.clear();
-            continue;
-        }
         match &event {
             Event::Eof => return Ok(writer.into_inner()),
-            Event::Start(start) if is_name(start, b"sheetData") => in_data = true,
-            Event::End(end) if end.local_name().as_ref() == b"sheetData" => in_data = false,
-            Event::Start(start) if in_data && is_name(start, b"row") => {
-                skipping = 1;
-                buf.clear();
-                continue;
+            Event::Start(start) if is_name(start, b"sheetData") => {
+                let end = start.to_end().into_owned();
+                writer.write_event(event.borrow())?;
+                skip_to_end(&mut reader)?;
+                writer.write_event(Event::End(end))?;
             }
-            Event::Empty(start) if in_data && is_name(start, b"row") => {
-                buf.clear();
-                continue;
+            Event::Start(start) if is_name(start, b"values") => skip_to_end(&mut reader)?,
+            Event::Empty(start) if is_name(start, b"values") => {}
+            _ => writer.write_event(event.borrow())?,
+        }
+        buf.clear();
+    }
+}
+
+/// Skip all events up to and including the end of the element just started.
+fn skip_to_end(reader: &mut Reader<&[u8]>) -> Result<(), Failure> {
+    let mut buf = Vec::new();
+    let mut depth = 1usize;
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(_) => depth += 1,
+            Event::End(_) => {
+                depth -= 1;
+                if depth == 0 {
+                    return Ok(());
+                }
             }
+            Event::Eof => return Err("unclosed element".into()),
             _ => {}
         }
-        writer.write_event(event.borrow())?;
         buf.clear();
     }
 }
@@ -819,6 +826,37 @@ mod tests {
         let text = part(&out, CONTENT_TYPES);
         assert_eq!(text.matches("externalLink1.xml").count(), 1);
         assert_eq!(text.matches("externalLink2.xml").count(), 1);
+    }
+
+    #[test]
+    fn dde_values_and_any_sheet_data_content_are_removed() {
+        let dde = r#"<externalLink xmlns="urn:m"><ddeLink ddeService="Excel" ddeTopic="Book1"><ddeItems><ddeItem name="R1C1" advise="1"><values rows="1" cols="1"><value t="str"><val>Invented Dde</val></value></values></ddeItem><ddeItem name="R2C1"><values/></ddeItem></ddeItems></ddeLink></externalLink>"#;
+        let stripped = String::from_utf8(strip_cached_values(dde.as_bytes()).unwrap()).unwrap();
+        assert!(!stripped.contains("Invented") && !stripped.contains("<value"));
+        assert!(stripped.contains(r#"<ddeItem name="R1C1" advise="1"></ddeItem>"#));
+
+        let odd = r#"<externalLink><externalBook><sheetDataSet><sheetData sheetId="0"><cell r="A1"><v>Invented NoRow</v></cell></sheetData><x:sheetData sheetId="1"><x:row/></x:sheetData></sheetDataSet></externalBook></externalLink>"#;
+        let stripped = String::from_utf8(strip_cached_values(odd.as_bytes()).unwrap()).unwrap();
+        assert!(!stripped.contains("Invented") && !stripped.contains("<cell"));
+        assert!(stripped.contains(r#"<sheetData sheetId="0"></sheetData>"#));
+        assert!(stripped.contains(r#"<x:sheetData sheetId="1"></x:sheetData>"#));
+    }
+
+    #[test]
+    fn two_references_to_one_part_declare_it_once() {
+        let rels = IN_RELS.replace(
+            "externalLinks/externalLink2.xml",
+            "/xl/externalLinks/externalLink1.xml",
+        );
+        let input = plain_package(&[
+            (CONTENT_TYPES, OUT_TYPES),
+            (WORKBOOK, IN_WORKBOOK),
+            (WORKBOOK_RELS, &rels),
+            ("xl/externalLinks/externalLink1.xml", LINK1),
+        ]);
+        let out = scrub(&input, &plain_output(OUT_WORKBOOK)).unwrap();
+        let text = part(&out, CONTENT_TYPES);
+        assert_eq!(text.matches("externalLink1.xml").count(), 1);
     }
 
     #[test]

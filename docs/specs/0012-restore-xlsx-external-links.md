@@ -19,7 +19,7 @@
 
 - `src/xlsx_scrub.rs` — a restore step for external links (ADR-0011):
   - Copy each `xl/externalLinks/externalLinkN.xml` part and its `_rels` part from the input.
-  - Remove each `<row>` element inside each `<sheetData>` element of a restored external link part.
+  - Remove all content of each `<sheetData>` element and each `<values>` element (DDE links) of a restored external link part.
   - Add an `<externalReferences>` element to `xl/workbook.xml`. Keep the order of the input, because a formula uses the position `[N]`.
   - Add one relationship for each link to `xl/_rels/workbook.xml.rels`. Use relationship ids that the copy does not use.
   - Add one `<Override>` for each link to `[Content_Types].xml`.
@@ -27,7 +27,7 @@
 ### Modified
 
 - `src/xlsx_scrub.rs` — `scrub` gets the input package as a second argument.
-- `src/xlsx_file.rs` — pass the input package to `scrub`.
+- `src/xlsx_file.rs` — pass the input package to `scrub`. `open_book` returns the bytes that it read.
 - `tests/xlsx_fidelity.rs` — remove the two external link parts from the list of lost parts.
 - `tests/xlsx.rs` — add the tests of section 4.
 - `docs/adr/0004-initial-crate-set.md` — remove external links from the list of lost parts.
@@ -47,7 +47,8 @@
 
 - [ ] No new crate. The restore step uses `zip` and `quick-xml` (ADR-0010).
 - [ ] The scrub copies only the parts that section 2 names from the input.
-- [ ] No restored part contains a `<cell>` element or a `<v>` element.
+- [ ] No restored part contains a `<cell>`, `<v>`, or `<values>` element.
+- [ ] The scrub uses the input bytes that pseudofy inspected and read. It does not read the input file again.
 - [ ] If the copy already has an `<externalReferences>` element, the scrub restores no external link.
 - [ ] If the scrub cannot restore an external link, pseudofy fails for that file. The error message contains no real value.
 - [ ] No `unwrap()` or `expect()` outside tests.
