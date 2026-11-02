@@ -897,10 +897,12 @@ fn rule_without_any_header_warns_once() {
 #[test]
 fn a_bad_file_is_reported_and_the_other_files_are_written() {
     let dir = project(KEY_A, None, &[]);
-    let bad = dir.path().join("a_bad.csv");
-    fs::write(&bad, b"first_name\nZorbina\xff\n").unwrap();
+    write_file(dir.path(), "a_bad.csv", "first_name\nZorbina\n");
     write_file(dir.path(), "b_good.csv", "first_name\nTamsorin\n");
     let out = TempDir::new().unwrap();
+    // Each byte is valid in Windows-1252 (spec 0009), so a file cannot fail on
+    // its encoding. A directory at the output path makes the write fail.
+    fs::create_dir(out.path().join("a_bad.csv")).unwrap();
     let assert = run(dir.path(), out.path()).failure();
     let stderr = stderr_text(&assert);
     assert!(stderr.contains("a_bad.csv"), "{stderr}");
@@ -908,7 +910,7 @@ fn a_bad_file_is_reported_and_the_other_files_are_written() {
     assert_no_leak(&stderr, "stderr");
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     assert!(stdout.contains("files: 1,"), "{stdout}");
-    assert!(!out.path().join("a_bad.csv").exists());
+    assert!(out.path().join("a_bad.csv").is_dir());
     let good = read(out.path(), "b_good.csv");
     assert!(!good.to_lowercase().contains("tamsorin"), "{good}");
 }
