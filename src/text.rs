@@ -20,28 +20,243 @@ pub enum Part {
     Last,
 }
 
+/// A name token: byte range in the value and its part.
+struct Token {
+    start: usize,
+    end: usize,
+    part: Part,
+}
+
+fn is_token_char(c: char) -> bool {
+    c.is_alphabetic() || c == '\''
+}
+
 /// Replace each name token in `value`.
 ///
 /// `replace(part, token)` gives the pseudonym of one token. The result gets the
 /// case style of the token (`Anna`, `ANNA`, `anna`). All separators stay.
 pub fn replace_name(
-    _value: &str,
-    _role: NameRole,
-    _replace: &mut dyn FnMut(Part, &str) -> String,
+    value: &str,
+    role: NameRole,
+    replace: &mut dyn FnMut(Part, &str) -> String,
 ) -> String {
-    todo!("task core")
+    let mut tokens = split_tokens(value);
+    assign_parts(value, role, &mut tokens);
+    let mut out = String::with_capacity(value.len());
+    let mut pos = 0;
+    for token in &tokens {
+        out.push_str(value.get(pos..token.start).unwrap_or(""));
+        let text = value.get(token.start..token.end).unwrap_or("");
+        let pseudonym = replace(token.part, text);
+        out.push_str(&apply_case(text, &pseudonym));
+        pos = token.end;
+    }
+    out.push_str(value.get(pos..).unwrap_or(""));
+    out
+}
+
+/// Maximal runs of alphabetic chars and `'`. Runs without a letter are separators.
+fn split_tokens(value: &str) -> Vec<Token> {
+    fn push(value: &str, start: usize, end: usize, tokens: &mut Vec<Token>) {
+        if value
+            .get(start..end)
+            .is_some_and(|t| t.chars().any(char::is_alphabetic))
+        {
+            tokens.push(Token {
+                start,
+                end,
+                part: Part::Last,
+            });
+        }
+    }
+
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    for (i, c) in value.char_indices() {
+        if is_token_char(c) {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start.take() {
+            push(value, s, i, &mut tokens);
+        }
+    }
+    if let Some(s) = start {
+        push(value, s, value.len(), &mut tokens);
+    }
+    tokens
+}
+
+fn assign_parts(value: &str, role: NameRole, tokens: &mut [Token]) {
+    match role {
+        NameRole::First => {
+            for t in tokens.iter_mut() {
+                t.part = Part::First;
+            }
+        }
+        NameRole::Last => {
+            for t in tokens.iter_mut() {
+                t.part = Part::Last;
+            }
+        }
+        NameRole::Full => {
+            if let Some(comma) = value.find(',') {
+                for t in tokens.iter_mut() {
+                    t.part = if t.start < comma {
+                        Part::Last
+                    } else {
+                        Part::First
+                    };
+                }
+            } else {
+                let n = tokens.len();
+                for (i, t) in tokens.iter_mut().enumerate() {
+                    t.part = if i + 1 == n { Part::Last } else { Part::First };
+                }
+            }
+        }
+    }
+}
+
+/// Give `pseudonym` the case style of `token`.
+fn apply_case(token: &str, pseudonym: &str) -> String {
+    let letters: Vec<char> = token.chars().filter(|c| c.is_alphabetic()).collect();
+    let upper = letters.iter().all(|c| c.is_uppercase());
+    let lower = letters.iter().all(|c| c.is_lowercase());
+    if letters.len() == 1 {
+        let initial: String = pseudonym.chars().take(1).collect();
+        return if upper {
+            initial.to_uppercase()
+        } else if lower {
+            initial.to_lowercase()
+        } else {
+            initial
+        };
+    }
+    if upper {
+        pseudonym.to_uppercase()
+    } else if lower {
+        pseudonym.to_lowercase()
+    } else {
+        pseudonym.to_string()
+    }
 }
 
 /// Regex that finds email addresses in a cell.
 pub fn email_regex() -> anyhow::Result<Regex> {
-    todo!("task core")
+    Ok(Regex::new(
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",
+    )?)
 }
 
 /// Replace each email address in `value` with `replace(address)`.
 pub fn replace_emails(
-    _value: &str,
-    _regex: &Regex,
-    _replace: &mut dyn FnMut(&str) -> String,
+    value: &str,
+    regex: &Regex,
+    replace: &mut dyn FnMut(&str) -> String,
 ) -> String {
-    todo!("task core")
+    let mut out = String::with_capacity(value.len());
+    let mut pos = 0;
+    for m in regex.find_iter(value) {
+        out.push_str(value.get(pos..m.start()).unwrap_or(""));
+        out.push_str(&replace(m.as_str()));
+        pos = m.end();
+    }
+    out.push_str(value.get(pos..).unwrap_or(""));
+    out
+}
+
+/// Transliterate `ä ö ü ß` (also uppercase) and lowercase, then keep `[a-z0-9-]`.
+pub(crate) fn ascii_local_part(name: &str) -> String {
+    let mut out = String::new();
+    for c in name.chars() {
+        match c {
+            'ä' | 'Ä' => out.push_str("ae"),
+            'ö' | 'Ö' => out.push_str("oe"),
+            'ü' | 'Ü' => out.push_str("ue"),
+            'ß' | 'ẞ' => out.push_str("ss"),
+            _ => {
+                let l = c.to_ascii_lowercase();
+                if l.is_ascii_lowercase() || l.is_ascii_digit() || l == '-' {
+                    out.push(l);
+                }
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run(value: &str, role: NameRole) -> String {
+        replace_name(value, role, &mut |part, _| match part {
+            Part::First => "Berta".to_string(),
+            Part::Last => "Muster".to_string(),
+        })
+    }
+
+    #[test]
+    fn tokens_split_on_separators() {
+        assert_eq!(run("Anna-Lena Maria", NameRole::First), "Berta-Berta Berta");
+        assert_eq!(run("Anna2, x", NameRole::First), "Berta2, b");
+        assert_eq!(run("O'Neil", NameRole::Last), "Muster");
+        assert_eq!(run(" 12 - ", NameRole::Full), " 12 - ");
+    }
+
+    #[test]
+    fn full_name_roles() {
+        assert_eq!(
+            run("Hans Peter Meier", NameRole::Full),
+            "Berta Berta Muster"
+        );
+        assert_eq!(run("Meier", NameRole::Full), "Muster");
+        assert_eq!(
+            run("Meier Schulz, Hans Peter", NameRole::Full),
+            "Muster Muster, Berta Berta"
+        );
+        assert_eq!(run("Meier,Hans", NameRole::Full), "Muster,Berta");
+        assert_eq!(run("Meier", NameRole::Last), "Muster");
+    }
+
+    #[test]
+    fn case_styles() {
+        assert_eq!(run("MEIER, hans", NameRole::Full), "MUSTER, berta");
+        assert_eq!(run("Hans MEIER", NameRole::Full), "Berta MUSTER");
+        assert_eq!(run("hans meier", NameRole::Full), "berta muster");
+        assert_eq!(run("HaNs", NameRole::First), "Berta");
+    }
+
+    #[test]
+    fn initials() {
+        assert_eq!(run("J. Meier", NameRole::Full), "B. Muster");
+        assert_eq!(run("j. meier", NameRole::Full), "b. muster");
+        assert_eq!(run("Meier, J", NameRole::Full), "Muster, B");
+    }
+
+    #[test]
+    fn transliteration() {
+        assert_eq!(ascii_local_part("Jürgen"), "juergen");
+        assert_eq!(ascii_local_part("Groß"), "gross");
+        assert_eq!(ascii_local_part("ÄÖÜ Ä"), "aeoeueae");
+        assert_eq!(ascii_local_part("Anne-Marie O'Neil 2"), "anne-marieoneil2");
+    }
+
+    #[test]
+    fn emails_are_replaced() -> anyhow::Result<()> {
+        let re = email_regex()?;
+        let mut seen = Vec::new();
+        let out = replace_emails("Mail a@b.org, c.d+x@e.co.uk. Bye", &re, &mut |m| {
+            seen.push(m.to_string());
+            "x@y.z".to_string()
+        });
+        assert_eq!(out, "Mail x@y.z, x@y.z. Bye");
+        assert_eq!(seen, ["a@b.org", "c.d+x@e.co.uk"]);
+        assert_eq!(
+            replace_emails("no mail @ here", &re, &mut |_| "!".into()),
+            "no mail @ here"
+        );
+        Ok(())
+    }
 }
