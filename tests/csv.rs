@@ -487,7 +487,9 @@ fn out_inside_project_works_and_is_not_read_again() {
     let first_stdout = String::from_utf8(first.get_output().stdout.clone()).unwrap();
     assert!(first_stdout.contains("files: 2,"), "{first_stdout}");
     let written = snapshot(&out);
-    assert_eq!(written.len(), 2);
+    // Two copies and the marker `.pseudofy-out` (spec 0016).
+    assert_eq!(written.len(), 3);
+    assert!(out.join(".pseudofy-out").exists());
 
     let second = run(dir.path(), &out).success();
     let second_stdout = String::from_utf8(second.get_output().stdout.clone()).unwrap();
