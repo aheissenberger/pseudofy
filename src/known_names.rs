@@ -376,6 +376,19 @@ pub struct Matcher {
     canon: HashMap<String, BTreeSet<String>>,
 }
 
+/// A one-letter initial right after a matched name (`Kesta Wolmar J.`) gets
+/// the last-name role, as the final token of a full name in a name column.
+fn trailing_initial(text: &str, toks: &[Tok], last: usize, edits: &mut Vec<(usize, Part)>) {
+    let (Some(prev), Some(next)) = (toks.get(last), toks.get(last + 1)) else {
+        return;
+    };
+    let gap = text.get(prev.end..next.start).unwrap_or("");
+    let spaced = !gap.is_empty() && gap.chars().all(char::is_whitespace);
+    if next.initial && spaced && !edits.iter().any(|(idx, _)| *idx == last + 1) {
+        edits.push((last + 1, Part::Last));
+    }
+}
+
 fn role(part: Part) -> NameRole {
     match part {
         Part::First => NameRole::First,
@@ -536,13 +549,24 @@ impl Matcher {
                     edits.push((tok, Part::First));
                 }
                 count += 1;
-                i = found.words.last().map_or(i, |w| *w) + 1;
+                let last = found.words.last().map_or(i, |w| *w);
+                trailing_initial(text, &toks, last, &mut edits);
+                i = last + 1;
                 continue;
             }
+            // A single token matches only a word that is not all lowercase
+            // (spec 0004): `Mark` and `MARK` match, `mark` does not.
+            let word = toks.get(i).and_then(|t| text.get(t.start..t.end));
+            let lowercase = word.is_some_and(|w| {
+                w.chars()
+                    .filter(|c| c.is_alphabetic())
+                    .all(char::is_lowercase)
+            });
             let part = folded.get(i).and_then(|f| self.singles.get(f.as_str()));
-            if let Some(part) = part {
+            if let (Some(part), false) = (part, lowercase) {
                 edits.push((i, *part));
                 count += 1;
+                trailing_initial(text, &toks, i, &mut edits);
             }
             i += 1;
         }
@@ -634,14 +658,14 @@ mod tests {
         let k = sample();
         let mut seen = Vec::new();
         let m = k.matcher(FreeText::Tokens);
-        let (out, n) = m.replace("ANNA MUSTER and anna", &mut |p, t| {
+        let (out, n) = m.replace("ANNA MUSTER and Anna", &mut |p, t| {
             seen.push((p, t.to_string()));
             match p {
                 Part::First => "Berta".to_string(),
                 Part::Last => "Kunz".to_string(),
             }
         });
-        assert_eq!(out, "BERTA KUNZ and berta");
+        assert_eq!(out, "BERTA KUNZ and Berta");
         assert_eq!(n, 2);
         // The callback gets the token itself (a column spelling).
         assert_eq!(seen[0], (Part::First, "ANNA".to_string()));
@@ -733,7 +757,9 @@ mod tests {
         k.add_full("Ottilie Wenzhart <ottilie.wenzhart@firma.test>");
         assert_eq!(run(&k, FreeText::Full, "Ottilie Wenzhart").1, 1);
         assert_eq!(run(&k, FreeText::Tokens, "firma test").1, 0);
-        assert_eq!(run(&k, FreeText::Tokens, "ottilie").1, 1);
+        assert_eq!(run(&k, FreeText::Tokens, "Ottilie").1, 1);
+        // An all-lowercase single word does not match.
+        assert_eq!(run(&k, FreeText::Tokens, "ottilie").1, 0);
     }
 
     #[test]
@@ -895,9 +921,12 @@ mod tests {
         let mut k = KnownNames::default();
         k.add_person("zorbina", "quenzel");
         k.add_person("Jorvik", "de Velgrad");
-        for t in ["quenzel", "Quenzel", "QUENZEL"] {
+        for t in ["Quenzel", "QUENZEL"] {
             assert_eq!(run(&k, FreeText::Tokens, t).1, 1, "{t}");
         }
+        // An all-lowercase single word does not match.
+        assert_eq!(run(&k, FreeText::Tokens, "quenzel").1, 0);
+        assert_eq!(run(&k, FreeText::Tokens, "zorbina quenzel").1, 1);
         assert_eq!(run(&k, FreeText::Tokens, "de said").1, 0);
         assert_eq!(run(&k, FreeText::Tokens, "Velgrad").1, 1);
     }
@@ -910,7 +939,7 @@ mod tests {
             "O'Brien",
             "O\u{2019}Brien",
             "O\u{2bc}Brien",
-            "o\u{2019}brien\u{2019}s",
+            "O\u{2019}Brien\u{2019}s",
         ] {
             assert_eq!(run(&k, FreeText::Tokens, t).1, 1, "{t}");
         }

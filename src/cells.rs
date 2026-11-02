@@ -392,7 +392,7 @@ mod tests {
     use crate::config::FreeText;
 
     fn count(known: &KnownNames, mode: FreeText, text: &str) -> usize {
-        let matcher = known.matcher(mode).unwrap();
+        let matcher = known.matcher(mode);
         matcher.replace(text, &mut |_, _| "X".to_owned()).1
     }
 

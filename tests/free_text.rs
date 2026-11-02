@@ -546,9 +546,29 @@ fn all_lowercase_name_columns_match_each_case_form_in_free_text() {
     let head = parts[0].strip_prefix("Ruf ").unwrap();
     let head = head.strip_suffix(" an").unwrap();
     assert_eq!(head, capitalized(&last.to_lowercase()));
-    assert_eq!(parts[1], last.to_lowercase());
+    // An all-lowercase single word does not match (spec 0004, tokens mode).
+    assert_eq!(parts[1], "quenzel");
     assert_eq!(parts[2], last.to_uppercase());
-    assert_absent(&t[1][2], &["quenzel"], "note");
+}
+
+#[test]
+fn lowercase_common_words_are_not_replaced_but_capitalized_names_are() {
+    let dir = project_with_rule(
+        "tokens",
+        "first_name = [\"first\"]\nlast_name = [\"last\"]\n",
+    );
+    write_file(
+        dir.path(),
+        "people.csv",
+        "first,last,note\nMark,Will,\"We will mark it. Mark said: WILL\"\n",
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    let (first, last) = fakes(&t, 1);
+    assert_eq!(
+        t[1][2],
+        format!("We will mark it. {first} said: {}", last.to_uppercase())
+    );
 }
 
 fn dunmor_project(mode: &str, note: &str) -> (TempDir, Vec<Vec<String>>) {
@@ -659,7 +679,9 @@ fn en_dash_and_em_dash_replace_a_hyphenated_first_name_in_full_mode() {
     let t = table(out.path(), "people.csv");
     for cells in &t[1..] {
         assert_absent(&cells[2], &["Lisandra", "Kroft"], "note");
-        assert_eq!(cells[2], format!("{} {}", cells[0], cells[1]));
+        // The note keeps its own dash; only the name parts change.
+        let note = cells[2].replace(['\u{2013}', '\u{2014}'], "-");
+        assert_eq!(note, format!("{} {}", cells[0], cells[1]));
     }
 }
 
