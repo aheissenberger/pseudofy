@@ -60,6 +60,10 @@ pub struct KnownNames {
     /// A free-text token with a column spelling gets that spelling; any other
     /// token gets the smallest one. Independent of the file order.
     canon: HashMap<String, BTreeSet<String>>,
+    /// Folded token → role of an initial that directly followed it in a name
+    /// column (`Kesta Wolmar J.` in `full_name`: Last; `Kesta J.` in `first_name`:
+    /// First).
+    initial_after: HashMap<String, Part>,
 }
 
 /// `'`, the curly apostrophe U+2019 and the modifier letter U+02BC.
@@ -218,12 +222,27 @@ impl KnownNames {
 
     /// Add the tokens of a first-name cell value. Returns the folded tokens.
     pub fn add_first(&mut self, value: &str) -> Vec<String> {
+        let nfc: String = value.nfc().collect();
+        let toks = lex(&nfc);
+        if let Some((last, rest)) = toks.split_last()
+            && last.initial
+        {
+            self.note_initial_after(&nfc, rest, Part::First);
+        }
         let tokens = name_tokens(value);
         for (t, _, raw) in &tokens {
             *self.first_count.entry(t.clone()).or_insert(0) += 1;
             self.add_spelling(t, raw);
         }
         tokens.into_iter().map(|(t, _, _)| t).collect()
+    }
+
+    /// Remember that an initial with role `part` followed the last of `rest`.
+    fn note_initial_after(&mut self, nfc: &str, rest: &[Tok], part: Part) {
+        let before = rest.last().filter(|t| !t.initial);
+        if let Some(raw) = before.and_then(|t| nfc.get(t.start..t.end)) {
+            self.initial_after.insert(fold(raw), part);
+        }
     }
 
     /// Add the tokens of a last-name cell value. Returns the folded tokens.
@@ -271,6 +290,7 @@ impl KnownNames {
         };
         if last.initial {
             self.add_first(nfc.get(..last.start).unwrap_or(""));
+            self.note_initial_after(&nfc, rest, Part::Last);
             return;
         }
         let first = match rest.first() {
@@ -288,6 +308,7 @@ impl KnownNames {
             return m;
         }
         m.canon.clone_from(&self.canon);
+        m.initial_after.clone_from(&self.initial_after);
         for (f, l) in &self.persons {
             let seq: Vec<&String> = f.iter().chain(l).collect();
             insert_split(&mut m.persons, &seq, Split::At(f.len()));
@@ -374,18 +395,39 @@ pub struct Matcher {
     singles: HashMap<String, Part>,
     max_words: usize,
     canon: HashMap<String, BTreeSet<String>>,
+    initial_after: HashMap<String, Part>,
 }
 
-/// A one-letter initial right after a matched name (`Kesta Wolmar J.`) gets
-/// the last-name role, as the final token of a full name in a name column.
-fn trailing_initial(text: &str, toks: &[Tok], last: usize, edits: &mut Vec<(usize, Part)>) {
+/// `true` if the token is one uppercase letter.
+fn upper_initial(text: &str, tok: &Tok) -> bool {
+    tok.initial
+        && text
+            .get(tok.start..tok.end)
+            .is_some_and(|t| t.chars().all(char::is_uppercase))
+}
+
+/// An uppercase initial right after a matched name is replaced only if a name
+/// column had an initial right after the same name (`Kesta Wolmar J.` in a
+/// `full_name` cell, `Kesta J.` in a `first_name` cell). It gets the role it had
+/// there.
+fn trailing_initial(
+    text: &str,
+    toks: &[Tok],
+    folded: &[String],
+    roles: &HashMap<String, Part>,
+    last: usize,
+    edits: &mut Vec<(usize, Part)>,
+) {
     let (Some(prev), Some(next)) = (toks.get(last), toks.get(last + 1)) else {
+        return;
+    };
+    let Some(part) = folded.get(last).and_then(|f| roles.get(f)) else {
         return;
     };
     let gap = text.get(prev.end..next.start).unwrap_or("");
     let spaced = !gap.is_empty() && gap.chars().all(char::is_whitespace);
-    if next.initial && spaced && !edits.iter().any(|(idx, _)| *idx == last + 1) {
-        edits.push((last + 1, Part::Last));
+    if upper_initial(text, next) && spaced && !edits.iter().any(|(idx, _)| *idx == last + 1) {
+        edits.push((last + 1, *part));
     }
 }
 
@@ -431,6 +473,7 @@ impl Matcher {
                 if comma.is_some() {
                     // `Last, First M.`: the initial follows the first-name part.
                     if !prev_init
+                        && upper_initial(text, after)
                         && matches!(classify(gap), Gap::Sep)
                         && let Some(b) = best.as_mut()
                         && b.comma.is_some()
@@ -550,7 +593,7 @@ impl Matcher {
                 }
                 count += 1;
                 let last = found.words.last().map_or(i, |w| *w);
-                trailing_initial(text, &toks, last, &mut edits);
+                trailing_initial(text, &toks, &folded, &self.initial_after, last, &mut edits);
                 i = last + 1;
                 continue;
             }
@@ -566,7 +609,7 @@ impl Matcher {
             if let (Some(part), false) = (part, lowercase) {
                 edits.push((i, *part));
                 count += 1;
-                trailing_initial(text, &toks, i, &mut edits);
+                trailing_initial(text, &toks, &folded, &self.initial_after, i, &mut edits);
             }
             i += 1;
         }
@@ -610,6 +653,47 @@ mod tests {
             Part::Last => "L",
         };
         format!("{tag}{}", token.chars().count())
+    }
+
+    #[test]
+    fn trailing_initial_only_where_a_column_had_one() {
+        let mut k = KnownNames::default();
+        k.add_full("Kesta Wolmar J.");
+        k.add_person("Lumi", "Arvo");
+        // `Wolmar` had an initial after it in a full_name cell: Last role.
+        assert_eq!(run(&k, FreeText::Tokens, "Kesta Wolmar J.").0, "F5 F6 L.");
+        // Lowercase one-letter words and names without that shape stay.
+        assert_eq!(run(&k, FreeText::Tokens, "Wolmar u. Karl").0, "F6 u. Karl");
+        assert_eq!(
+            run(&k, FreeText::Tokens, "Thanks Wolmar I will").0,
+            "Thanks F6 L will"
+        );
+        assert_eq!(
+            run(&k, FreeText::Tokens, "Thanks Lumi I will").0,
+            "Thanks F4 I will"
+        );
+        assert_eq!(
+            run(&k, FreeText::Full, "Lumi Arvo I think").0,
+            "F4 L4 I think"
+        );
+        // A first_name cell `Kesta J.`: the initial has the First role.
+        let mut f = KnownNames::default();
+        f.add_person("Kesta J.", "Arvo");
+        assert_eq!(run(&f, FreeText::Tokens, "Kesta J.").0, "F5 F.");
+    }
+
+    #[test]
+    fn comma_form_takes_only_an_uppercase_initial() {
+        let mut k = KnownNames::default();
+        k.add_full("Draven, Ilsa M.");
+        assert_eq!(
+            run(&k, FreeText::Full, "Draven, Ilsa M. said").0,
+            "L6, F4 F. said"
+        );
+        assert_eq!(
+            run(&k, FreeText::Full, "Draven, Ilsa y Pedro").0,
+            "L6, F4 y Pedro"
+        );
     }
 
     fn run(names: &KnownNames, mode: FreeText, text: &str) -> (String, usize) {

@@ -59,9 +59,19 @@ pub fn replace_name(
     out
 }
 
-/// Maximal runs of alphabetic chars and `'`. Runs without a letter are separators.
+/// Maximal runs of alphabetic chars and apostrophes, without apostrophes at
+/// either end (`‘Bob’` gives `Bob`). Runs without a letter are separators.
 fn split_tokens(value: &str) -> Vec<Token> {
     fn push(value: &str, start: usize, end: usize, tokens: &mut Vec<Token>) {
+        let is_apos = |c: char| matches!(c, '\'' | '\u{2019}' | '\u{2bc}');
+        let run = value.get(start..end).unwrap_or("");
+        let start = start + (run.len() - run.trim_start_matches(is_apos).len());
+        let end = start
+            + value
+                .get(start..end)
+                .unwrap_or("")
+                .trim_end_matches(is_apos)
+                .len();
         if value
             .get(start..end)
             .is_some_and(|t| t.chars().any(char::is_alphabetic))
@@ -230,6 +240,27 @@ mod tests {
         assert_eq!(run("Anna2, x", NameRole::First), "Berta2, b");
         assert_eq!(run("O'Neil", NameRole::Last), "Muster");
         assert_eq!(run(" 12 - ", NameRole::Full), " 12 - ");
+    }
+
+    #[test]
+    fn quotes_around_a_name_stay() {
+        assert_eq!(
+            run("\u{2018}Bob\u{2019}", NameRole::First),
+            "\u{2018}Berta\u{2019}"
+        );
+        assert_eq!(run("'Bob'", NameRole::First), "'Berta'");
+        assert_eq!(run("Kunz\u{2019}", NameRole::Last), "Muster\u{2019}");
+        assert_eq!(run("O\u{2019}Brien", NameRole::Last), "Muster");
+        let mut seen = Vec::new();
+        replace_name(
+            "Robert \u{2018}Bob\u{2019} Smith",
+            NameRole::Full,
+            &mut |_, t| {
+                seen.push(t.to_string());
+                String::from("X")
+            },
+        );
+        assert_eq!(seen, ["Robert", "Bob", "Smith"]);
     }
 
     #[test]

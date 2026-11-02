@@ -718,3 +718,45 @@ fn rich_text_cell_without_a_known_name_stays_rich_text_without_warning() {
     assert!(shared.contains("Hello "), "{shared}");
     assert_eq!(shared.matches("<r>").count(), 2, "{shared}");
 }
+
+#[test]
+fn quoted_nickname_keeps_its_quotes_and_matches_the_column() {
+    let dir = project_with_rule(
+        "tokens",
+        "first_name = [\"first\"]\nlast_name = [\"last\"]\n",
+    );
+    write_file(
+        dir.path(),
+        "people.csv",
+        "first,last,note\n\u{2018}Bob\u{2019},Kroft,Bob / \u{2018}Bob\u{2019}\n",
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    let fake = t[1][0]
+        .strip_prefix('\u{2018}')
+        .and_then(|f| f.strip_suffix('\u{2019}'))
+        .unwrap()
+        .to_string();
+    assert_eq!(t[1][2], format!("{fake} / \u{2018}{fake}\u{2019}"));
+    assert_absent(&t[1][2], &["Bob"], "note");
+}
+
+#[test]
+fn one_letter_words_after_a_name_stay() {
+    let dir = project_with_rule(
+        "tokens",
+        "first_name = [\"first\"]\nlast_name = [\"last\"]\n",
+    );
+    write_file(
+        dir.path(),
+        "people.csv",
+        "first,last,note\nKesta,Wolmar,\"Kesta u. Karl; Thanks Kesta I will; Wolmar e. V.\"\n",
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    let (first, last) = fakes(&t, 1);
+    assert_eq!(
+        t[1][2],
+        format!("{first} u. Karl; Thanks {first} I will; {last} e. V.")
+    );
+}

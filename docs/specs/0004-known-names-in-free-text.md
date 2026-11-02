@@ -49,6 +49,8 @@
 - [ ] `tokens` also replaces each single first-name and last-name token. A single token matches only if the word in the text is not all lowercase. `Mark` and `MARK` match, `mark` does not. Full-name matches stay case-insensitive.
 - [ ] `off` replaces no known name outside the name columns. Pass 1 does not run. Emails are still replaced in each cell.
 - [ ] A longer match has priority over a shorter match.
+- [ ] An uppercase one-letter initial after a matched name is replaced only if a name column had an initial after the same name. It gets the role it had in that column. Other one-letter words stay.
+- [ ] Quotes and apostrophes at the start or end of a name stay. `‘Bob’` gives `‘<fake>’` in name columns and in free text.
 - [ ] Known names stay in memory only. pseudofy never writes them to a file or a log.
 - [ ] Header rows are not changed.
 - [ ] If two column spellings fold to one key (`Strauss`, `Strauß`), each spelling in free text gets the pseudonym of the same spelling in its column. The result does not depend on file names or file order.
