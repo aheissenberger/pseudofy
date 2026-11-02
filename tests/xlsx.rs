@@ -7,6 +7,7 @@
 )]
 
 use std::fs;
+use std::io::{Cursor, Read, Write};
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -93,6 +94,41 @@ fn simple_book(name: &str, email: &str) -> Workbook {
     set(sheet, "A2", name);
     set(sheet, "B2", email);
     book
+}
+
+/// Serializes a workbook to XLSX bytes.
+fn book_bytes(book: &Workbook) -> Vec<u8> {
+    let mut buffer = Cursor::new(Vec::new());
+    umya_spreadsheet::writer::xlsx::write_writer(book, &mut buffer).unwrap();
+    buffer.into_inner()
+}
+
+/// The name and text of every part of an XLSX package.
+fn package_parts(bytes: &[u8]) -> Vec<(String, String)> {
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+    let mut parts = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        if entry.is_dir() {
+            continue;
+        }
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).unwrap();
+        parts.push((
+            entry.name().to_string(),
+            String::from_utf8_lossy(&data).into_owned(),
+        ));
+    }
+    parts
+}
+
+/// Fails if any part of the package at `path` contains a real value.
+fn assert_package_clean(path: &Path) {
+    let parts = package_parts(&fs::read(path).unwrap());
+    assert!(!parts.is_empty(), "package has no parts");
+    for (name, text) in parts {
+        assert_no_leak(&text, &format!("package part {name}"));
+    }
 }
 
 fn assert_no_leak(text: &str, what: &str) {
@@ -339,6 +375,212 @@ fn output_workbooks_and_streams_contain_no_real_value() {
         }
     }
     assert!(seen >= 8, "expected cells in the output, found {seen}");
+    assert_package_clean(&out.path().join("mappe.xlsx"));
+}
+
+/// The input must really keep the names in the shared-string table,
+/// otherwise the package check proves nothing.
+#[test]
+fn input_package_keeps_names_in_shared_strings() {
+    let dir = project(None);
+    save(
+        &simple_book("Zorbina Quenzel", "zorbina@acme.test"),
+        dir.path(),
+        "mappe.xlsx",
+    );
+    let parts = package_parts(&fs::read(dir.path().join("mappe.xlsx")).unwrap());
+    let shared = parts
+        .iter()
+        .find(|(name, _)| name == "xl/sharedStrings.xml")
+        .map(|(_, text)| text.clone())
+        .unwrap_or_default();
+    assert!(
+        shared.contains("Zorbina Quenzel"),
+        "shared strings: {shared}"
+    );
+}
+
+#[test]
+fn mailto_hyperlink_gets_the_fake_address() {
+    let dir = project(None);
+    let mut book = simple_book("Zorbina Quenzel", "zorbina@acme.test");
+    let mut link = umya_spreadsheet::Hyperlink::default();
+    link.set_url("mailto:zorbina@acme.test");
+    book.sheet_by_name_mut("Daten")
+        .unwrap()
+        .cell_mut("B2")
+        .set_hyperlink(link);
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    assert_package_clean(&out.path().join("mappe.xlsx"));
+    let copy = open(out.path(), "mappe.xlsx");
+    let sheet = copy.sheet_by_name("Daten").unwrap();
+    let cell = sheet.cell("B2").unwrap();
+    let fake = cell.value().to_string();
+    assert!(fake.contains('@'), "cell: {fake}");
+    let url = cell.hyperlink().map(|h| h.url().to_string());
+    assert_eq!(url, Some(format!("mailto:{fake}")));
+}
+
+#[test]
+fn cached_formula_result_does_not_leak_a_real_name() {
+    let dir = project(None);
+    let mut book = simple_book("Zorbina Quenzel", "zorbina@acme.test");
+    let sheet = book.sheet_by_name_mut("Daten").unwrap();
+    sheet
+        .cell_mut("A3")
+        .set_formula("A2")
+        .set_formula_result_string("Zorbina Quenzel");
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    assert_package_clean(&out.path().join("mappe.xlsx"));
+    let copy = open(out.path(), "mappe.xlsx");
+    let sheet = copy.sheet_by_name("Daten").unwrap();
+    assert_eq!(sheet.cell("A3").unwrap().formula(), "A2");
+}
+
+#[test]
+fn workbook_with_a_pivot_cache_is_refused_and_the_others_are_written() {
+    let dir = project(None);
+    let bytes = book_bytes(&simple_book("Zorbina Quenzel", "zorbina@acme.test"));
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        if entry.is_dir() {
+            continue;
+        }
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).unwrap();
+        writer
+            .start_file(entry.name(), zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&data).unwrap();
+    }
+    writer
+        .start_file(
+            "xl/pivotCache/pivotCacheDefinition1.xml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+    writer.write_all(b"<pivotCacheDefinition/>").unwrap();
+    let pivot = writer.finish().unwrap().into_inner();
+    fs::write(dir.path().join("pivot.xlsx"), pivot).unwrap();
+    write_file(
+        dir.path(),
+        "gut.csv",
+        "name,email\nZorbina Quenzel,zorbina@acme.test\n",
+    );
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(stderr.contains("pivot.xlsx"), "stderr: {stderr}");
+    assert!(stderr.to_lowercase().contains("pivot"), "stderr: {stderr}");
+    assert!(stderr.contains("1 file(s) failed"), "stderr: {stderr}");
+    assert_no_leak(&stderr, "stderr");
+    assert!(!out.path().join("pivot.xlsx").exists());
+    assert!(out.path().join("gut.csv").exists());
+}
+
+#[test]
+fn panicking_input_gives_one_error_line_without_a_real_value() {
+    let dir = project(None);
+    let bytes = book_bytes(&simple_book("Tamsorin Velgrad", "tamsorin@acme.test"));
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        if entry.is_dir() {
+            continue;
+        }
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).unwrap();
+        if entry.name() == "xl/worksheets/sheet1.xml" {
+            data = concat!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>",
+                "<worksheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">",
+                "<sheetData><row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>name</t></is></c></row>",
+                "<row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>Zorbina Quen"
+            )
+            .as_bytes()
+            .to_vec();
+        }
+        writer
+            .start_file(entry.name(), zip::write::SimpleFileOptions::default())
+            .unwrap();
+        writer.write_all(&data).unwrap();
+    }
+    let cut = writer.finish().unwrap().into_inner();
+    fs::write(dir.path().join("abgeschnitten.xlsx"), cut).unwrap();
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    let mentioning = stderr
+        .lines()
+        .filter(|line| line.contains("abgeschnitten.xlsx"))
+        .count();
+    assert_eq!(mentioning, 1, "stderr: {stderr}");
+    assert_no_leak(&stderr, "stderr");
+    assert!(!stderr.contains("internal error"), "stderr: {stderr}");
+}
+
+#[test]
+fn column_widths_and_merged_cells_survive_a_run() {
+    let dir = project(None);
+    let mut book = simple_book("Zorbina Quenzel", "zorbina@acme.test");
+    let sheet = book.sheet_by_name_mut("Daten").unwrap();
+    set(sheet, "D1", "titel");
+    sheet.column_dimension_mut("A").set_width(37.0);
+    sheet.add_merge_cells("D1:E1");
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    let copy = open(out.path(), "mappe.xlsx");
+    let sheet = copy.sheet_by_name("Daten").unwrap();
+    let width = sheet
+        .column_dimension("A")
+        .map(umya_spreadsheet::Column::width);
+    assert_eq!(width, Some(37.0));
+    let merged: Vec<String> = sheet
+        .merge_cells()
+        .iter()
+        .map(umya_spreadsheet::Range::range)
+        .collect();
+    assert_eq!(merged, ["D1:E1"]);
+}
+
+#[test]
+fn rich_text_cell_in_a_name_column_is_replaced_and_reported() {
+    let dir = project(None);
+    let mut book = simple_book("Tamsorin Velgrad", "tamsorin@acme.test");
+    let mut first = umya_spreadsheet::TextElement::default();
+    first.set_text("Zorbina ");
+    first.font_mut().set_bold(true);
+    let mut second = umya_spreadsheet::TextElement::default();
+    second.set_text("Quenzel");
+    let mut rich = umya_spreadsheet::RichText::default();
+    rich.add_rich_text_elements(first)
+        .add_rich_text_elements(second);
+    book.sheet_by_name_mut("Daten")
+        .unwrap()
+        .cell_mut("A3")
+        .set_rich_text(rich);
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, stderr) = run_ok(dir.path());
+    assert!(stderr.contains("rich-text"), "stderr: {stderr}");
+    assert_package_clean(&out.path().join("mappe.xlsx"));
+}
+
+#[test]
+fn sheets_glob_without_a_matching_sheet_warns_about_the_sheet_name() {
+    let dir = project(Some("[\"Kunden*\"]"));
+    save(
+        &simple_book("Zorbina Quenzel", "zorbina@acme.test"),
+        dir.path(),
+        "mappe.xlsx",
+    );
+    let (_out, _, stderr) = run_ok(dir.path());
+    assert!(stderr.contains("no sheet"), "stderr: {stderr}");
+    assert!(!stderr.contains("none of its headers"), "stderr: {stderr}");
 }
 
 #[test]
