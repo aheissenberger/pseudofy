@@ -131,6 +131,7 @@ impl Pseudonymizer {
 
     fn name(&mut self, kind: Kind, real: &str) -> String {
         let normalized = normalize(real);
+        let single = normalized.chars().count() == 1;
         let mut attempt = 0u32;
         let result = loop {
             let bytes = self.digest(kind, &normalized, attempt);
@@ -139,7 +140,16 @@ impl Pseudonymizer {
                 _ => &self.lists.first,
             };
             let candidate = pick(list, u64_at(&bytes, 0));
-            if candidate.to_lowercase() != normalized || attempt >= 64 || list.len() < 2 {
+            let same_initial = single
+                && candidate
+                    .chars()
+                    .next()
+                    .and_then(|c| c.to_lowercase().next())
+                    == normalized.chars().next();
+            if (candidate.to_lowercase() != normalized && !same_initial)
+                || attempt >= 64
+                || list.len() < 2
+            {
                 break candidate;
             }
             attempt += 1;
@@ -289,6 +299,29 @@ mod tests {
         for real in FIRST.iter().chain(LAST.iter()) {
             assert_ne!(p.first_name(real).to_lowercase(), real.to_lowercase());
             assert_ne!(p.last_name(real).to_lowercase(), real.to_lowercase());
+        }
+    }
+
+    #[test]
+    fn one_letter_values_never_keep_their_letter() {
+        let mut p = engine(10, false);
+        for c in ['a', 'b', 'c', 'd', 'e', 'h', 'l', 'w', 'A', 'W'] {
+            let real = c.to_string();
+            let lower = c.to_lowercase().next();
+            assert_ne!(
+                p.first_name(&real)
+                    .chars()
+                    .next()
+                    .and_then(|x| x.to_lowercase().next()),
+                lower
+            );
+            assert_ne!(
+                p.last_name(&real)
+                    .chars()
+                    .next()
+                    .and_then(|x| x.to_lowercase().next()),
+                lower
+            );
         }
     }
 
