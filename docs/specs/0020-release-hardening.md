@@ -1,7 +1,7 @@
 # Feature Delta Spec: Release hardening
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/adr/0005-build-releases-in-github-actions.md` · `docs/specs/0011-checks-only-on-release-tags.md` · `docs/specs/0008-actionlint-in-the-devcontainer.md`
 
@@ -39,7 +39,9 @@
 - `Cargo.toml` — `[profile.release] strip = true`. Do not set `panic = "abort"` (ADR-0004).
 - `.devcontainer/devcontainer.json` — pin the image by digest.
 - `README.md` — tell the user how to check the provenance with `gh attestation verify`.
-- `docs/adr/0004-initial-crate-set.md` — fix the count of direct runtime crates.
+- `docs/adr/0004-initial-crate-set.md` — fix the count of direct runtime crates. Record the accepted `zip` advisories.
+- `docs/specs/0008-actionlint-in-the-devcontainer.md` — status `superseded` (this spec installs `actionlint`).
+- `docs/specs/0011-checks-only-on-release-tags.md` — link this spec: the job `release` is now `build` and `publish`.
 
 ### Removed
 
@@ -53,22 +55,22 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] Top-level `permissions: {}`. Each job has only the permissions it needs.
-- [ ] No job with a write token runs `cargo` or a third-party build step.
-- [ ] No `${{ }}` expression in a `run:` script. Each value comes through `env:`.
-- [ ] Each action is pinned by a full commit SHA.
+- [x] Top-level `permissions: {}`. Each job has only the permissions it needs.
+- [x] No job with a write token runs `cargo` or a third-party build step.
+- [x] No `${{ }}` expression in a `run:` script. Each value comes through `env:`.
+- [x] Each action is pinned by a full commit SHA.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] `actionlint` reports no error for `.github/workflows/release.yml`.
-- [ ] `./scripts/check` runs `cargo deny`, `actionlint`, and `shellcheck`, and passes.
-- [ ] A tag on a commit that is not on `main` fails the `check` job. No release is created.
+- [x] `actionlint` reports no error for `.github/workflows/release.yml`.
+- [x] `./scripts/check` runs `cargo deny`, `actionlint`, and `shellcheck`, and passes.
+- [ ] A tag on a commit that is not on `main` fails the `check` job. No release is created. (Verify at the next release tag, with spec 0011.)
 
 **Tests to add/update:**
 
-- [ ] None in Rust. The checks above run in `./scripts/check`.
+- [x] None in Rust. The checks above run in `./scripts/check`.
 
 **Commands that must pass:**
 
@@ -84,3 +86,5 @@ devcontainer exec --workspace-folder . ./scripts/check
 ## 5. Rollback / Notes (optional)
 
 The next release tag is the first run of the new jobs (spec 0011).
+
+Rebuild the devcontainer after this change: `./scripts/check` needs `cargo-deny` and `actionlint` from `post-create.sh`. `cargo deny` fetches the advisory database, so the check needs network.
