@@ -521,3 +521,178 @@ fn a_token_that_is_mostly_a_last_name_gets_the_last_name_pseudonym() {
     assert_ne!(t[1][1], t[3][0], "test needs distinct pseudonyms");
     assert_eq!(t[4][2], format!("{} arrived", t[1][1]));
 }
+
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(head) => head.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+#[test]
+fn all_lowercase_name_columns_match_each_case_form_in_free_text() {
+    let dir = project(None);
+    write_file(
+        dir.path(),
+        "people.csv",
+        &format!("{HEADER}zorbina,quenzel,Ruf Quenzel an | quenzel | QUENZEL\n"),
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    let (_, last) = fakes(&t, 1);
+    let parts: Vec<&str> = t[1][2].split(" | ").collect();
+    assert_eq!(parts.len(), 3, "{:?}", t[1][2]);
+    let head = parts[0].strip_prefix("Ruf ").unwrap();
+    let head = head.strip_suffix(" an").unwrap();
+    assert_eq!(head, capitalized(&last.to_lowercase()));
+    assert_eq!(parts[1], last.to_lowercase());
+    assert_eq!(parts[2], last.to_uppercase());
+    assert_absent(&t[1][2], &["quenzel"], "note");
+}
+
+fn dunmor_project(mode: &str, note: &str) -> (TempDir, Vec<Vec<String>>) {
+    let dir = project_with_rule(mode, "first_name = [\"first\"]\nlast_name = [\"last\"]\n");
+    write_file(
+        dir.path(),
+        "people.csv",
+        &format!("first,last,note\nVelra,O’Dunmor,{note}\n"),
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    (out, t)
+}
+
+#[test]
+fn curly_apostrophe_name_is_replaced_as_a_full_name_in_full_mode() {
+    let (_out, t) = dunmor_project("full", "Velra O’Dunmor");
+    assert_eq!(t[1][2], format!("{} {}", t[1][0], t[1][1]));
+    assert_absent(&t[1][2], &["Velra", "Dunmor"], "note");
+}
+
+#[test]
+fn curly_apostrophe_last_name_is_replaced_as_one_token_in_tokens_mode() {
+    let (_out, t) = dunmor_project("tokens", "O’Dunmor");
+    assert_eq!(t[1][2], t[1][1]);
+}
+
+#[test]
+fn straight_apostrophe_column_matches_curly_apostrophe_in_free_text() {
+    let dir = project(None);
+    write_file(
+        dir.path(),
+        "people.csv",
+        &format!("{HEADER}Velra,O'Dunmor,Velra O’Dunmor\n"),
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    assert_absent(&t[1][2], &["Dunmor", "Velra"], "note");
+}
+
+#[test]
+fn two_spellings_get_the_pseudonym_of_the_same_spelling_independent_of_file_names() {
+    let build = |first_file: &str| {
+        let dir = project(None);
+        write_file(
+            dir.path(),
+            first_file,
+            &format!("{HEADER}Helmar,Strauss,x\n"),
+        );
+        write_file(
+            dir.path(),
+            "b.csv",
+            &format!("{HEADER}Gerda,Strauß,Strauss | Strauß\n"),
+        );
+        let (out, _, _) = run_ok(dir.path());
+        let a = table(out.path(), first_file);
+        let b = table(out.path(), "b.csv");
+        (a, b)
+    };
+    let (a, b) = build("a.csv");
+    let parts: Vec<&str> = b[1][2].split(" | ").collect();
+    assert_eq!(parts.len(), 2, "{:?}", b[1][2]);
+    assert_eq!(parts[0], a[1][1]);
+    assert_eq!(parts[1], b[1][1]);
+    let (a2, b2) = build("z.csv");
+    assert_eq!(a2[1], a[1]);
+    assert_eq!(b2[1], b[1]);
+}
+
+#[test]
+fn full_name_with_initial_is_replaced_as_the_name_cell() {
+    let dir = project(None);
+    write_file(
+        dir.path(),
+        "people.csv",
+        "name,note\nKesta Wolmar J.,Kesta Wolmar J.\n",
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    assert_eq!(t[1][1], t[1][0]);
+    assert_absent(&t[1][1], &["Kesta", "Wolmar"], "note");
+}
+
+#[test]
+fn last_comma_first_with_initial_is_replaced_as_the_name_cell() {
+    let dir = project(None);
+    write_file(
+        dir.path(),
+        "people.csv",
+        "name,note\n\"Draven, Ilsa M.\",\"Draven, Ilsa M.\"\n",
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    assert_eq!(t[1][1], t[1][0]);
+    assert_absent(&t[1][1], &["Draven", "Ilsa"], "note");
+}
+
+#[test]
+fn en_dash_and_em_dash_replace_a_hyphenated_first_name_in_full_mode() {
+    let dir = project_with_rule("full", "first_name = [\"first\"]\nlast_name = [\"last\"]\n");
+    write_file(
+        dir.path(),
+        "people.csv",
+        "first,last,note\nLisandra-Mae,Kroft,Lisandra–Mae Kroft\n\
+         Lisandra-Mae,Kroft,Lisandra—Mae Kroft\n",
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    for cells in &t[1..] {
+        assert_absent(&cells[2], &["Lisandra", "Kroft"], "note");
+        assert_eq!(cells[2], format!("{} {}", cells[0], cells[1]));
+    }
+}
+
+#[test]
+fn rich_text_cell_without_a_known_name_stays_rich_text_without_warning() {
+    let dir = project(None);
+    write_file(
+        dir.path(),
+        "people.csv",
+        &format!("{HEADER}Zorbina,Quenzel,x\n"),
+    );
+    let mut book = notes_book(&["plain"]);
+    let mut first = umya_spreadsheet::TextElement::default();
+    first.set_text("Hello ");
+    first.font_mut().set_bold(true);
+    let mut second = umya_spreadsheet::TextElement::default();
+    second.set_text("world");
+    let mut rich = umya_spreadsheet::RichText::default();
+    rich.add_rich_text_elements(first)
+        .add_rich_text_elements(second);
+    book.sheet_by_name_mut("Daten")
+        .unwrap()
+        .cell_mut("A3")
+        .set_rich_text(rich);
+    save(&book, dir.path(), "notes.xlsx");
+    let (out, _, stderr) = run_ok(dir.path());
+    assert!(!stderr.contains("rich-text"), "stderr: {stderr}");
+    let parts = package_parts(&out.path().join("notes.xlsx"));
+    let shared = parts
+        .iter()
+        .find(|(name, _)| name.ends_with("sharedStrings.xml"))
+        .map(|(_, text)| text.as_str())
+        .unwrap_or_default();
+    assert!(shared.contains("Hello "), "{shared}");
+    assert_eq!(shared.matches("<r>").count(), 2, "{shared}");
+}
