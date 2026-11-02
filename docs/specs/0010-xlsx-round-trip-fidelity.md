@@ -3,7 +3,7 @@
 **Date:** 2026-11-02
 **Status:** proposed
 **Author:** Claude (agent)
-**Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0003-xlsx-support.md` · `docs/adr/0004-initial-crate-set.md`
+**Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0003-xlsx-support.md` · `docs/adr/0004-initial-crate-set.md` · `docs/adr/0010-scrub-the-written-xlsx-package.md`
 
 ---
 
@@ -22,7 +22,6 @@
 
 ### Modified
 
-- `Cargo.toml` — add `zip = "=8.6.0"` to `[dev-dependencies]`. `zip` is already in `Cargo.lock` as a dependency of `umya-spreadsheet`.
 - `docs/adr/0004-initial-crate-set.md` — update the list of lost parts with the result of the test.
 
 ### Removed
@@ -40,7 +39,7 @@
 - [ ] The fixture contains only invented data.
 - [ ] `tests/xlsx_fidelity.rs` has a constant list of the part names that the copy may lose. Each entry has a comment with the reason.
 - [ ] The test never compares cell values of name columns. It compares only part names.
-- [ ] `zip` is a dev-dependency only. The runtime crate set of ADR-0004 does not change.
+- [ ] The test adds no crate. It uses `zip`, a runtime crate since ADR-0010.
 
 ## 4. Acceptance Criteria & Verification
 
