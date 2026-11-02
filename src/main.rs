@@ -50,6 +50,15 @@ enum Command {
 }
 
 fn main() -> ExitCode {
+    // A panic message can contain a real value. Print only the location.
+    std::panic::set_hook(Box::new(|info| match info.location() {
+        Some(location) => eprintln!(
+            "error: internal error at {}:{}",
+            location.file(),
+            location.line()
+        ),
+        None => eprintln!("error: internal error"),
+    }));
     let result = match Cli::parse().command {
         Command::Init { project, language } => init(&project, language),
         Command::Run { project, out } => run(&project, &out),
