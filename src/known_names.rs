@@ -1,189 +1,520 @@
 //! Known names: the real names from the name columns of all project files
 //! (spec 0004). They stay in memory only and are never printed.
 //!
+//! The matcher works on tokens, not on a regex: the text is split into name
+//! tokens once, and hash lookups over token windows find the names. The time
+//! is linear in the text length (a window has at most `MAX_WORDS` tokens).
+//!
 //! Matching rules:
-//! - Whole word: a name token is a maximal run of letters, combining marks and
-//!   `'` (as in `text.rs`). "Annabelle" and "Anna's" do not match "Anna".
-//! - Case-insensitive; the replacement keeps the case style of the match.
-//! - A longer match has priority over a shorter one.
-//! - One-letter tokens (initials) never match on their own and are not part
-//!   of a full-name form.
-//! - A full-name match gets its parts from the split rule of
-//!   `text::replace_name` with `NameRole::Full`.
+//! - Token: a maximal run of letters, combining marks and `'`. Leading and
+//!   trailing `'` and a trailing possessive `'s` are not part of the token, so
+//!   `'Anna Muster'` and `Anna's` match, and `O'Brien` is one token. A curly
+//!   apostrophe and a hyphen separate tokens, as in `text.rs`.
+//! - Whole word: only complete tokens match. "Annabelle" does not match "Anna".
+//! - Folding: stored and text tokens are compared after NFC, lowercase,
+//!   `ß` to `ss`, and removal of U+0307 after `i`. The replacement keeps the
+//!   case style of the matched text (`text::replace_name`).
+//! - A person (first tokens and last tokens of one row) matches as the
+//!   sequence `First Last` or `Last, First`. Inside the sequence the tokens
+//!   are separated by whitespace or hyphens. One one-letter initial (`C` or
+//!   `C.`) may stand between the first and the last part. The tokens of a
+//!   matched person get the split of that person (also for multi-token last
+//!   names). If two persons give the same sequence with different splits,
+//!   the rule of `NameRole::Full` applies (only the last token is Last).
+//! - A longer match has priority over a shorter one; a person sequence wins
+//!   over single tokens. A full name counts as one replacement.
+//! - Single tokens (mode `tokens`): a token known as first and as last name
+//!   gets the role that it has more often in the columns; a tie gives First.
+//!   A last-name token that is all lowercase in every last-name cell (a
+//!   particle like `de`, `von`) does not match alone.
+//! - One-letter tokens never match alone.
 
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
-use regex::{Regex, RegexBuilder};
-use unicode_normalization::UnicodeNormalization;
 use unicode_normalization::char::is_combining_mark;
+use unicode_normalization::{UnicodeNormalization, is_nfc};
 
 use crate::config::FreeText;
 use crate::text::{NameRole, Part, replace_name};
 
-/// Size limit for the compiled matcher, so thousands of names compile.
-const REGEX_LIMIT: usize = 512 * 1024 * 1024;
+/// Longest person sequence in tokens. A longer person is ignored.
+const MAX_WORDS: usize = 12;
 
-/// Character class body of a name character, for the word boundary.
-const WORD: &str = r"\p{L}\p{M}'";
+/// Separator of the tokens in a lookup key.
+const KEY_SEP: char = '\u{1}';
 
 /// The known names of one project. Pass 1 of `run` fills it.
 #[derive(Default)]
 pub struct KnownNames {
-    firsts: BTreeSet<String>,
-    lasts: BTreeSet<String>,
-    persons: BTreeSet<(Vec<String>, Vec<String>)>,
+    first_count: HashMap<String, usize>,
+    last_count: HashMap<String, usize>,
+    /// Last-name tokens that were all lowercase in some cell.
+    lower_last: HashSet<String>,
+    /// Last-name tokens that were not all lowercase in some cell.
+    cased_last: HashSet<String>,
+    persons: HashSet<(Vec<String>, Vec<String>)>,
 }
 
 fn is_token_char(c: char) -> bool {
     c.is_alphabetic() || c == '\'' || is_combining_mark(c)
 }
 
-/// Normalized name tokens of `value` (NFC, lowercase), without initials.
-fn tokens(value: &str) -> Vec<String> {
+/// A name token: byte range in the (NFC) text.
+struct Tok {
+    start: usize,
+    end: usize,
+    /// One letter: an initial.
+    initial: bool,
+}
+
+fn push_run(text: &str, from: usize, to: usize, out: &mut Vec<Tok>) {
+    let Some(run) = text.get(from..to) else {
+        return;
+    };
+    let start = from + (run.len() - run.trim_start_matches('\'').len());
+    let trim = |s: usize, e: usize| s + text.get(s..e).unwrap_or("").trim_end_matches('\'').len();
+    let mut end = trim(start, to);
+    let b = text.as_bytes();
+    let possessive = end >= start + 3
+        && b.get(end - 2) == Some(&b'\'')
+        && matches!(b.get(end - 1), Some(b's' | b'S'));
+    if possessive {
+        end = trim(start, end - 2);
+    }
+    let Some(token) = text.get(start..end) else {
+        return;
+    };
+    if !token.chars().any(char::is_alphabetic) {
+        return;
+    }
+    out.push(Tok {
+        start,
+        end,
+        initial: token.chars().count() == 1,
+    });
+}
+
+fn lex(text: &str) -> Vec<Tok> {
+    let mut out = Vec::new();
+    let mut run: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        if is_token_char(c) {
+            if run.is_none() {
+                run = Some(i);
+            }
+        } else if let Some(s) = run.take() {
+            push_run(text, s, i, &mut out);
+        }
+    }
+    if let Some(s) = run {
+        push_run(text, s, text.len(), &mut out);
+    }
+    out
+}
+
+/// Fold a token: NFC, lowercase, `ß` to `ss`, no U+0307 after `i`.
+fn fold(token: &str) -> String {
+    let mut out = String::with_capacity(token.len());
+    for c in token.nfc() {
+        for l in c.to_lowercase() {
+            match l {
+                'ß' => out.push_str("ss"),
+                '\u{307}' if out.ends_with('i') => {}
+                _ => out.push(l),
+            }
+        }
+    }
+    out
+}
+
+fn is_sep_char(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '-' | '\u{2010}' | '\u{2011}')
+}
+
+enum Gap {
+    /// Whitespace and hyphens.
+    Sep,
+    /// Whitespace around exactly one comma.
+    Comma,
+    Bad,
+}
+
+fn classify(gap: &str) -> Gap {
+    if !gap.is_empty() && gap.chars().all(is_sep_char) {
+        Gap::Sep
+    } else if gap.chars().all(|c| c == ',' || c.is_whitespace()) && gap.matches(',').count() == 1 {
+        Gap::Comma
+    } else {
+        Gap::Bad
+    }
+}
+
+/// Gap after an initial: an optional `.`, then whitespace or hyphens.
+fn initial_gap(gap: &str) -> bool {
+    match gap.strip_prefix('.') {
+        Some(rest) => rest.chars().all(is_sep_char),
+        None => !gap.is_empty() && gap.chars().all(is_sep_char),
+    }
+}
+
+/// Folded tokens of `value` without initials, each with the flag whether it
+/// is all lowercase in the value.
+fn name_tokens(value: &str) -> Vec<(String, bool)> {
     let nfc: String = value.nfc().collect();
-    nfc.split(|c: char| !is_token_char(c))
-        .filter(|t| t.chars().any(char::is_alphabetic) && t.chars().count() > 1)
-        .map(str::to_lowercase)
+    lex(&nfc)
+        .iter()
+        .filter(|t| !t.initial)
+        .filter_map(|t| nfc.get(t.start..t.end))
+        .map(|raw| {
+            let lower = raw
+                .chars()
+                .filter(|c| c.is_alphabetic())
+                .all(char::is_lowercase);
+            (fold(raw), lower)
+        })
         .collect()
 }
 
-fn join_pattern(parts: &[String]) -> String {
-    parts
-        .iter()
-        .map(|t| regex::escape(t))
-        .collect::<Vec<_>>()
-        .join(r"\s+")
-}
-
-fn size_of(parts: &[String]) -> usize {
-    parts.iter().map(|t| t.chars().count() + 1).sum()
+/// Remove `<...>` parts (an unclosed `<` runs to the end).
+fn strip_angle(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut inside = false;
+    for c in value.chars() {
+        match c {
+            '<' => inside = true,
+            '>' if inside => {
+                inside = false;
+                out.push(' ');
+            }
+            _ if !inside => out.push(c),
+            _ => {}
+        }
+    }
+    out
 }
 
 impl KnownNames {
+    /// Add the tokens of a first-name cell value. Returns the folded tokens.
+    pub fn add_first(&mut self, value: &str) -> Vec<String> {
+        let tokens = name_tokens(value);
+        for (t, _) in &tokens {
+            *self.first_count.entry(t.clone()).or_insert(0) += 1;
+        }
+        tokens.into_iter().map(|(t, _)| t).collect()
+    }
+
+    /// Add the tokens of a last-name cell value. Returns the folded tokens.
+    pub fn add_last(&mut self, value: &str) -> Vec<String> {
+        let tokens = name_tokens(value);
+        for (t, lower) in &tokens {
+            *self.last_count.entry(t.clone()).or_insert(0) += 1;
+            let set = if *lower {
+                &mut self.lower_last
+            } else {
+                &mut self.cased_last
+            };
+            set.insert(t.clone());
+        }
+        tokens.into_iter().map(|(t, _)| t).collect()
+    }
+
     /// Add one person from one row: the first-name and last-name cell values
     /// (each may hold several tokens, e.g. "Anna Lena"). Either may be empty.
     pub fn add_person(&mut self, first: &str, last: &str) {
-        let f = tokens(first);
-        let l = tokens(last);
-        self.firsts.extend(f.iter().cloned());
-        self.lasts.extend(l.iter().cloned());
-        if !f.is_empty() && !l.is_empty() {
+        let f = self.add_first(first);
+        let l = self.add_last(last);
+        if !f.is_empty() && !l.is_empty() && f.len() + l.len() <= MAX_WORDS {
             self.persons.insert((f, l));
         }
     }
 
-    /// Add the value of one `full_name` cell ("First Middle Last" or "Last, First").
+    /// Add the value of one `full_name` cell ("First Middle Last" or
+    /// "Last, First"). Angle-bracket parts (`<...>`) are ignored.
     pub fn add_full(&mut self, value: &str) {
-        let nfc: String = value.nfc().collect();
-        let (first, last) = if let Some((before, after)) = nfc.split_once(',') {
-            (after.to_string(), before.to_string())
-        } else {
-            let all: Vec<&str> = nfc
-                .split(|c: char| !is_token_char(c))
-                .filter(|t| t.chars().any(char::is_alphabetic))
-                .collect();
-            match all.split_last() {
-                Some((last, rest)) => (rest.join(" "), (*last).to_string()),
-                None => return,
-            }
-        };
-        self.add_person(&first, &last);
+        let clean = strip_angle(value);
+        let nfc: String = clean.nfc().collect();
+        if let Some((before, after)) = nfc.split_once(',') {
+            self.add_person(after, before);
+            return;
+        }
+        let toks: Vec<Tok> = lex(&nfc).into_iter().filter(|t| !t.initial).collect();
+        if let Some((last, rest)) = toks.split_last() {
+            let first = match rest.first() {
+                Some(a) => nfc.get(a.start..last.start).unwrap_or(""),
+                None => "",
+            };
+            let last = nfc.get(last.start..last.end).unwrap_or("");
+            self.add_person(first, last);
+        }
     }
 
     /// Build the whole-word matcher for `mode`.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the signature is part of the interface of spec 0004"
+    )]
     pub fn matcher(&self, mode: FreeText) -> anyhow::Result<Matcher> {
-        // (sort length, pattern)
-        let mut alts: BTreeSet<(usize, String)> = BTreeSet::new();
-        let persons = self.persons.iter().filter(|_| mode != FreeText::Off);
-        for (f, l) in persons {
-            let total = size_of(f) + size_of(l);
-            let (fp, lp) = (join_pattern(f), join_pattern(l));
-            alts.insert((total, format!(r"{fp}\s+{lp}")));
-            alts.insert((total, format!(r"{lp}\s*,\s*{fp}")));
+        let mut m = Matcher::default();
+        if mode == FreeText::Off {
+            return Ok(m);
+        }
+        for (f, l) in &self.persons {
+            let seq: Vec<&String> = f.iter().chain(l).collect();
+            insert_split(&mut m.persons, &seq, Split::At(f.len()));
+            let rev: Vec<&String> = l.iter().chain(f).collect();
+            insert_split(&mut m.commas, &rev, Split::At(l.len()));
+            for s in [&seq, &rev] {
+                if let Some(head) = s.first() {
+                    m.heads.insert((*head).clone());
+                }
+            }
+            m.max_words = m.max_words.max(seq.len());
         }
         if mode == FreeText::Tokens {
-            for t in self.firsts.iter().chain(self.lasts.iter()) {
-                alts.insert((size_of(std::slice::from_ref(t)), regex::escape(t)));
+            let all: HashSet<&String> = self
+                .first_count
+                .keys()
+                .chain(self.last_count.keys())
+                .collect();
+            for t in all {
+                let firsts = self.first_count.get(t).copied().unwrap_or(0);
+                let particle = self.lower_last.contains(t) && !self.cased_last.contains(t);
+                let lasts = if particle {
+                    0
+                } else {
+                    self.last_count.get(t).copied().unwrap_or(0)
+                };
+                if firsts == 0 && lasts == 0 {
+                    continue;
+                }
+                let part = if firsts >= lasts {
+                    Part::First
+                } else {
+                    Part::Last
+                };
+                m.singles.insert(t.clone(), part);
             }
         }
-        if alts.is_empty() {
-            return Ok(Matcher {
-                regex: None,
-                firsts: BTreeSet::new(),
-                lasts: BTreeSet::new(),
-            });
-        }
-        // Longest first: regex alternation is leftmost-first.
-        let body = alts
-            .iter()
-            .rev()
-            .map(|(_, p)| p.as_str())
-            .collect::<Vec<_>>()
-            .join("|");
-        let pattern = format!(r"(?:^|[^{WORD}])({body})(?:$|[^{WORD}])");
-        let regex = RegexBuilder::new(&pattern)
-            .case_insensitive(true)
-            .unicode(true)
-            .size_limit(REGEX_LIMIT)
-            .dfa_size_limit(REGEX_LIMIT)
-            .build()
-            .map_err(|_| anyhow::anyhow!("cannot build the known-name matcher"))?;
-        Ok(Matcher {
-            regex: Some(regex),
-            firsts: self.firsts.clone(),
-            lasts: self.lasts.clone(),
-        })
+        Ok(m)
     }
 }
 
+/// Split of a person sequence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Split {
+    /// The first n tokens are First, the rest Last. In the comma form the
+    /// first n tokens are the last name.
+    At(usize),
+    /// Persons disagree: the rule of `NameRole::Full`.
+    Full,
+}
+
+fn insert_split(map: &mut HashMap<String, Split>, seq: &[&String], split: Split) {
+    let key = seq
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(&KEY_SEP.to_string());
+    match map.entry(key) {
+        Entry::Occupied(mut e) => {
+            if *e.get() != split {
+                e.insert(Split::Full);
+            }
+        }
+        Entry::Vacant(v) => {
+            v.insert(split);
+        }
+    }
+}
+
+/// A person match: token indexes and the split.
+struct Found {
+    words: Vec<usize>,
+    init: Option<usize>,
+    comma: Option<usize>,
+    split: Split,
+}
+
 /// Whole-word, case-insensitive matcher for the known names.
+#[derive(Default)]
 pub struct Matcher {
-    regex: Option<Regex>,
-    firsts: BTreeSet<String>,
-    lasts: BTreeSet<String>,
+    persons: HashMap<String, Split>,
+    commas: HashMap<String, Split>,
+    heads: HashSet<String>,
+    singles: HashMap<String, Part>,
+    max_words: usize,
+}
+
+fn role(part: Part) -> NameRole {
+    match part {
+        Part::First => NameRole::First,
+        Part::Last => NameRole::Last,
+    }
 }
 
 impl Matcher {
+    fn is_empty(&self) -> bool {
+        self.persons.is_empty() && self.singles.is_empty()
+    }
+
+    /// Longest person sequence that starts at token `i`.
+    fn find_window(
+        &self,
+        text: &str,
+        toks: &[Tok],
+        folded: &[String],
+        from: usize,
+    ) -> Option<Found> {
+        let head = folded.get(from)?;
+        if !self.heads.contains(head.as_str()) {
+            return None;
+        }
+        let mut key = head.clone();
+        let mut words = vec![from];
+        let mut init: Option<(usize, usize)> = None; // (words before, token)
+        let mut comma: Option<usize> = None; // words before the comma
+        let (mut prev, mut prev_init) = (from, false);
+        let mut best = None;
+        let mut next = from + 1;
+        while next < toks.len() && words.len() < self.max_words {
+            let (before, after) = (toks.get(prev)?, toks.get(next)?);
+            let Some(gap) = text.get(before.end..after.start) else {
+                break;
+            };
+            if after.initial {
+                let ok = !prev_init
+                    && init.is_none()
+                    && comma.is_none()
+                    && matches!(classify(gap), Gap::Sep);
+                if !ok {
+                    break;
+                }
+                init = Some((words.len(), next));
+                (prev, prev_init) = (next, true);
+                next += 1;
+                continue;
+            }
+            if prev_init {
+                if !initial_gap(gap) {
+                    break;
+                }
+            } else {
+                match classify(gap) {
+                    Gap::Sep => {}
+                    Gap::Comma if comma.is_none() && init.is_none() => comma = Some(words.len()),
+                    Gap::Comma | Gap::Bad => break,
+                }
+            }
+            words.push(next);
+            key.push(KEY_SEP);
+            key.push_str(folded.get(next)?);
+            (prev, prev_init) = (next, false);
+            next += 1;
+            let hit = match comma {
+                None => self.persons.get(key.as_str()).copied().filter(|split| {
+                    let head_len = match split {
+                        Split::At(head_len) => *head_len,
+                        Split::Full => words.len() - 1,
+                    };
+                    init.is_none_or(|(pos, _)| pos == head_len)
+                }),
+                Some(at) => self
+                    .commas
+                    .get(key.as_str())
+                    .copied()
+                    .filter(|split| match split {
+                        Split::At(want) => *want == at,
+                        Split::Full => true,
+                    }),
+            };
+            if let Some(split) = hit {
+                best = Some(Found {
+                    words: words.clone(),
+                    init: init.map(|(_, tok)| tok),
+                    comma,
+                    split,
+                });
+            }
+        }
+        best
+    }
+
     /// Replace each known name in `text`. `replace(part, token)` gives the
     /// pseudonym of one real token; the result keeps the case style of the
     /// matched text. Returns the new text and the number of replaced names.
+    /// Without a match the text is returned unchanged.
     pub fn replace(
         &self,
-        text: &str,
+        input: &str,
         replace: &mut dyn FnMut(Part, &str) -> String,
     ) -> (String, usize) {
-        let text: String = text.nfc().collect();
-        let Some(regex) = &self.regex else {
-            return (text, 0);
+        if self.is_empty() {
+            return (input.to_string(), 0);
+        }
+        let nfc: Cow<str> = if is_nfc(input) {
+            Cow::Borrowed(input)
+        } else {
+            Cow::Owned(input.nfc().collect())
         };
-        let mut out = String::with_capacity(text.len());
-        let mut pos = 0;
+        let text = nfc.as_ref();
+        let toks = lex(text);
+        let folded: Vec<String> = toks
+            .iter()
+            .map(|t| {
+                if t.initial {
+                    String::new()
+                } else {
+                    fold(text.get(t.start..t.end).unwrap_or(""))
+                }
+            })
+            .collect();
+        // (token index, part), and the number of names.
+        let mut edits: Vec<(usize, Part)> = Vec::new();
         let mut count = 0;
-        while pos <= text.len() {
-            let Some(caps) = regex.captures_at(&text, pos) else {
-                break;
-            };
-            let Some(m) = caps.get(1) else { break };
-            out.push_str(text.get(pos..m.start()).unwrap_or(""));
-            let matched = m.as_str();
-            pos = m.end();
-            if matched.contains(|c: char| c.is_whitespace() || c == ',') {
-                out.push_str(&replace_name(matched, NameRole::Full, replace));
-                count += 1;
+        let mut i = 0;
+        while i < toks.len() {
+            if toks.get(i).is_some_and(|t| t.initial) {
+                i += 1;
                 continue;
             }
-            let lower = matched.to_lowercase();
-            let role = if self.firsts.contains(&lower) {
-                NameRole::First
-            } else if self.lasts.contains(&lower) {
-                NameRole::Last
-            } else {
-                // Not reachable: every single-token alternative is known.
-                out.push_str(matched);
+            if let Some(found) = self.find_window(text, &toks, &folded, i) {
+                let n = found.words.len();
+                for (k, &w) in found.words.iter().enumerate() {
+                    let first = match (found.comma, found.split) {
+                        (Some(c), _) => k >= c,
+                        (None, Split::At(m)) => k < m,
+                        (None, Split::Full) => k + 1 != n,
+                    };
+                    edits.push((w, if first { Part::First } else { Part::Last }));
+                }
+                if let Some(tok) = found.init {
+                    edits.push((tok, Part::First));
+                }
+                count += 1;
+                i = found.words.last().map_or(i, |w| *w) + 1;
                 continue;
-            };
-            out.push_str(&replace_name(matched, role, replace));
-            count += 1;
+            }
+            let part = folded.get(i).and_then(|f| self.singles.get(f.as_str()));
+            if let Some(part) = part {
+                edits.push((i, *part));
+                count += 1;
+            }
+            i += 1;
+        }
+        if count == 0 {
+            return (input.to_string(), 0);
+        }
+        edits.sort_by_key(|(idx, _)| *idx);
+        let mut out = String::with_capacity(text.len());
+        let mut pos = 0;
+        for (idx, part) in edits {
+            let Some(t) = toks.get(idx) else { continue };
+            out.push_str(text.get(pos..t.start).unwrap_or(""));
+            let token = text.get(t.start..t.end).unwrap_or("");
+            out.push_str(&replace_name(token, role(part), replace));
+            pos = t.end;
         }
         out.push_str(text.get(pos..).unwrap_or(""));
         (out, count)
@@ -220,9 +551,27 @@ mod tests {
             run(&k, FreeText::Tokens, "Annabelle Mustering"),
             ("Annabelle Mustering".to_string(), 0)
         );
-        // An apostrophe is a name character: "Anna's" is another token.
-        assert_eq!(run(&k, FreeText::Tokens, "Anna's").1, 0);
         assert_eq!(run(&k, FreeText::Tokens, "(Anna), ok").0, "(F4), ok");
+    }
+
+    #[test]
+    fn apostrophes() {
+        let mut k = KnownNames::default();
+        k.add_person("Zorbina", "Quenzel");
+        k.add_person("Tamsorin", "O'Brien");
+        assert_eq!(
+            run(&k, FreeText::Full, "Hi 'Zorbina Quenzel'!"),
+            ("Hi 'F7 L7'!".to_string(), 1)
+        );
+        assert_eq!(
+            run(&k, FreeText::Tokens, "Zorbina's and Zorbina\u{2019}s"),
+            ("F7's and F7\u{2019}s".to_string(), 2)
+        );
+        assert_eq!(
+            run(&k, FreeText::Tokens, "Mr O'Brien, O'Brien's"),
+            ("Mr L7, L7's".to_string(), 2)
+        );
+        assert_eq!(run(&k, FreeText::Tokens, "O'Brienx").1, 0);
     }
 
     #[test]
@@ -289,6 +638,7 @@ mod tests {
             ("F4 said".into(), 1)
         );
         assert_eq!(run(&k, FreeText::Full, "Anna  Muster").1, 1);
+        assert_eq!(run(&k, FreeText::Off, "Anna Muster").1, 0);
     }
 
     #[test]
@@ -305,6 +655,101 @@ mod tests {
         assert_eq!(run(&k, FreeText::Full, "Jörg Müller").1, 1);
         assert_eq!(run(&k, FreeText::Full, "Berta Kunz").1, 1);
         assert_eq!(run(&k, FreeText::Tokens, "C. said").1, 0);
+    }
+
+    #[test]
+    fn add_full_ignores_angle_brackets() {
+        let mut k = KnownNames::default();
+        k.add_full("Ottilie Wenzhart <ottilie.wenzhart@firma.test>");
+        assert_eq!(run(&k, FreeText::Full, "Ottilie Wenzhart").1, 1);
+        assert_eq!(run(&k, FreeText::Tokens, "firma test").1, 0);
+        assert_eq!(run(&k, FreeText::Tokens, "ottilie").1, 1);
+    }
+
+    #[test]
+    fn hyphen_and_initial() {
+        let mut k = KnownNames::default();
+        k.add_person("Lisandra-Mae", "Kroft");
+        k.add_full("Berta C. Kunzl");
+        assert_eq!(
+            run(&k, FreeText::Full, "Hi Lisandra-Mae Kroft"),
+            ("Hi F8-F3 L5".to_string(), 1)
+        );
+        assert_eq!(run(&k, FreeText::Full, "Lisandra Mae  Kroft").1, 1);
+        assert_eq!(
+            run(&k, FreeText::Full, "Berta C. Kunzl"),
+            ("F5 F. L5".to_string(), 1)
+        );
+        assert_eq!(run(&k, FreeText::Full, "Berta C Kunzl").1, 1);
+        assert_eq!(run(&k, FreeText::Full, "Berta Kunzl").1, 1);
+        assert_eq!(run(&k, FreeText::Full, "Berta C. D. Kunzl").1, 0);
+    }
+
+    #[test]
+    fn case_folding() {
+        let mut k = KnownNames::default();
+        k.add_person("İlkay", "Strauß");
+        for text in ["ilkay Strauss", "İLKAY STRAUSS", "I\u{307}lkay STRAUSS"] {
+            assert_eq!(run(&k, FreeText::Full, text).1, 1, "{text}");
+        }
+        assert_eq!(run(&k, FreeText::Tokens, "STRAUSS").1, 1);
+        let mut k2 = KnownNames::default();
+        k2.add_person("ilkay", "STRAUSS");
+        assert_eq!(run(&k2, FreeText::Full, "İlkay Strauß").1, 1);
+    }
+
+    #[test]
+    fn multi_token_last_name_split() {
+        let mut k = KnownNames::default();
+        k.add_person("Jorvik", "van der Hallen");
+        assert_eq!(
+            run(&k, FreeText::Full, "Jorvik van der Hallen"),
+            ("F6 l3 l3 L6".to_string(), 1)
+        );
+        assert_eq!(
+            run(&k, FreeText::Full, "van der Hallen, Jorvik"),
+            ("l3 l3 L6, F6".to_string(), 1)
+        );
+        // Particles do not match alone; the capitalized part does.
+        assert_eq!(
+            run(&k, FreeText::Tokens, "van der Hallen said"),
+            ("van der L6 said".to_string(), 1)
+        );
+    }
+
+    #[test]
+    fn conflicting_splits_use_full_rule() {
+        let mut k = KnownNames::default();
+        k.add_person("Anna Maria", "Muster");
+        k.add_person("Anna", "Maria Muster");
+        assert_eq!(
+            run(&k, FreeText::Full, "Anna Maria Muster"),
+            ("F4 F5 L6".to_string(), 1)
+        );
+    }
+
+    #[test]
+    fn untouched_text_is_returned_as_is() {
+        let k = sample();
+        let nfd = "Jo\u{308}rg said";
+        assert_eq!(run(&k, FreeText::Tokens, nfd), (nfd.to_string(), 0));
+    }
+
+    #[test]
+    fn token_role_by_frequency() {
+        let mut k = KnownNames::default();
+        k.add_person("Renvik", "Dalmora");
+        k.add_person("Alva", "Renvik");
+        k.add_person("Alva", "Renvik");
+        // Renvik: once first, twice last.
+        assert_eq!(run(&k, FreeText::Tokens, "Renvik").0, "L6");
+        // Alva: twice first; Dalmora: once last.
+        assert_eq!(run(&k, FreeText::Tokens, "Alva").0, "F4");
+        // Tie: First.
+        let mut t = KnownNames::default();
+        t.add_person("Renvik", "Dalmora");
+        t.add_person("Alva", "Renvik");
+        assert_eq!(run(&t, FreeText::Tokens, "Renvik").0, "F6");
     }
 
     #[test]
@@ -328,18 +773,38 @@ mod tests {
     }
 
     #[test]
-    fn many_names_compile() {
-        let mut k = KnownNames::default();
-        for i in 0..2000 {
-            let code: String = i
-                .to_string()
+    fn many_names_are_fast() {
+        let code = |i: usize| -> String {
+            i.to_string()
                 .chars()
                 .map(|d| (b'a' + (d as u8 - b'0')) as char)
-                .collect();
-            k.add_person(&format!("Vorname{code}"), &format!("Nachname{code}"));
+                .collect()
+        };
+        let mut k = KnownNames::default();
+        for i in 0..5000 {
+            k.add_person(
+                &format!("Vorname{}", code(i)),
+                &format!("Nachname{}", code(i)),
+            );
         }
         k.add_person("Anna", "Muster");
-        assert_eq!(run(&k, FreeText::Tokens, "Call Anna Muster").1, 1);
+        let texts: Vec<String> = (0..10_000)
+            .map(|i| {
+                format!(
+                    "Please call Vorname{} Nachname{} or ask Anna Muster today",
+                    code(i % 6000),
+                    code(i % 5000)
+                )
+            })
+            .collect();
+        let start = std::time::Instant::now();
+        let m = k.matcher(FreeText::Tokens).unwrap();
+        let mut total = 0;
+        for text in &texts {
+            total += m.replace(text, &mut fake).1;
+        }
+        assert!(total >= 10_000);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(
             run(&k, FreeText::Off, "Call Anna Muster"),
             ("Call Anna Muster".to_string(), 0)
