@@ -374,6 +374,40 @@ pub(crate) fn role_of(header: &str, columns: &Columns) -> Option<ColRole> {
     }
 }
 
+/// Number of non-empty rows (CSV records, sheet rows) in which the header is searched.
+pub(crate) const HEADER_SEARCH_ROWS: usize = 20;
+
+/// `true` if one of the normalized `texts` is a configured header text.
+pub(crate) fn row_has_header(texts: &[String], columns: &Columns) -> bool {
+    texts.iter().any(|text| role_of(text, columns).is_some())
+}
+
+/// Replace emails and known names in a title row or header cell. A cell whose
+/// text is a configured header text stays unchanged.
+pub(crate) fn transform_text_cell(
+    cell: &str,
+    columns: &Columns,
+    fns: &CellFns,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+    free: &mut usize,
+) -> String {
+    if role_of(&cell.trim().to_lowercase(), columns).is_some() {
+        return cell.to_owned();
+    }
+    transform_cell(cell, None, fns, replace, free)
+}
+
+/// Glob of the first rule that names headers and has none of them in the
+/// header row. `header` is `None` if the search found no header row.
+pub(crate) fn failing_rule<'a>(
+    rules: &[&'a Rule],
+    header: Option<&[String]>,
+    columns: &Columns,
+) -> Option<&'a str> {
+    let missing = missing_headers(header.unwrap_or(&[]), columns);
+    rules_without_headers(rules, &missing).into_iter().next()
+}
+
 pub(crate) fn missing_headers(headers: &[String], columns: &Columns) -> Vec<(String, String)> {
     columns
         .first
@@ -426,6 +460,70 @@ mod tests {
         for name in ["Tamsorin", "Velgrad", "Mirwen", "Ostrel", "Dunhaldt"] {
             assert_eq!(count(&known, FreeText::Tokens, name), 1, "{name}");
         }
+    }
+
+    fn columns() -> Columns {
+        Columns {
+            full: vec![("*.csv".into(), "name".into())],
+            email: vec![("*.csv".into(), "email".into())],
+            ..Columns::default()
+        }
+    }
+
+    fn rule() -> Rule {
+        Rule {
+            files: "*.csv".to_owned(),
+            first_name: vec![],
+            last_name: vec![],
+            full_name: vec!["Name".to_owned()],
+            email: vec!["Email".to_owned()],
+            sheets: vec![],
+        }
+    }
+
+    #[test]
+    fn header_row_needs_a_configured_text() {
+        let yes = vec!["titel".to_owned(), "email".to_owned()];
+        let no = vec!["titel".to_owned(), "datum".to_owned()];
+        assert!(row_has_header(&yes, &columns()));
+        assert!(!row_has_header(&no, &columns()));
+        assert!(!row_has_header(&[], &columns()));
+    }
+
+    #[test]
+    fn failing_rule_names_the_glob_only() {
+        let rule = rule();
+        let rules = [&rule];
+        let columns = collect_columns(&rules);
+        let none = vec!["x".to_owned()];
+        assert_eq!(failing_rule(&rules, Some(&none), &columns), Some("*.csv"));
+        assert_eq!(failing_rule(&rules, None, &columns), Some("*.csv"));
+        let some = vec!["x".to_owned(), "name".to_owned()];
+        assert_eq!(failing_rule(&rules, Some(&some), &columns), None);
+        let empty = Columns::default();
+        assert_eq!(failing_rule(&[], None, &empty), None);
+    }
+
+    #[test]
+    fn header_text_cell_stays_and_others_get_emails_replaced() {
+        let regex = text::email_regex().unwrap();
+        let fns = CellFns {
+            email_regex: &regex,
+            names: text::replace_name,
+            emails: text::replace_emails,
+            matcher: None,
+        };
+        let mut free = 0;
+        let mut replace = |_: Kind, _: &str| "x@y.test".to_owned();
+        let cols = columns();
+        assert_eq!(
+            transform_text_cell(" Email ", &cols, &fns, &mut replace, &mut free),
+            " Email "
+        );
+        assert_eq!(
+            transform_text_cell("Liste von a.b@c.test", &cols, &fns, &mut replace, &mut free),
+            "Liste von x@y.test"
+        );
     }
 
     #[test]
