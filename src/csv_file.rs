@@ -1,9 +1,10 @@
 //! Pseudonymize one CSV file.
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 
-use anyhow::{Context, anyhow};
+use anyhow::{Context, anyhow, bail};
 use csv::{ByteRecord, ReaderBuilder, Terminator, WriterBuilder};
 use regex::Regex;
 
@@ -26,6 +27,13 @@ enum Kind {
     Email,
 }
 
+/// Role of a column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ColRole {
+    Name(NameRole),
+    Email,
+}
+
 /// Header texts (trimmed, lowercase), each with the glob of its rule.
 #[derive(Debug, Default)]
 struct Columns {
@@ -44,10 +52,12 @@ struct Transformed {
 }
 
 /// Read `input`, replace names and emails, write the copy to `output`.
-/// `rel` is the relative path for messages. `rules` are the rules that match
-/// the file. Returns the number of replaced values.
+/// `out_root` is the output directory, `rel` the relative path for messages.
+/// `rules` are the rules that match the file. Returns the number of replaced
+/// values.
 pub fn process(
     input: &Path,
+    out_root: &Path,
     output: &Path,
     rel: &str,
     rules: &[&Rule],
@@ -75,11 +85,70 @@ pub fn process(
             "warning: rule \"{glob}\" names the header \"{header}\", which {rel} does not have"
         );
     }
-    if let Some(parent) = output.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("cannot create directory for {rel}"))?;
-    }
-    fs::write(output, &result.bytes).with_context(|| format!("cannot write {rel}"))?;
+    write_output(out_root, output, &result.bytes, rel)?;
     Ok(result.replaced)
+}
+
+fn is_not_found(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
+/// Write `bytes` to `output` without following a symlink: check each directory
+/// below `out_root`, refuse a symlink target, write a temp file, rename it.
+fn write_output(out_root: &Path, output: &Path, bytes: &[u8], rel: &str) -> anyhow::Result<()> {
+    let parent = output.parent().unwrap_or(out_root);
+    let below = parent
+        .strip_prefix(out_root)
+        .unwrap_or_else(|_| Path::new(""));
+    let mut current = out_root.to_path_buf();
+    for part in below.components() {
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                bail!("{rel}: an output directory is a symlink");
+            }
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => bail!("{rel}: an output path is not a directory"),
+            Err(error) if is_not_found(&error) => {
+                fs::create_dir(&current)
+                    .with_context(|| format!("cannot create directory for {rel}"))?;
+            }
+            Err(_) => bail!("cannot check the output directory for {rel}"),
+        }
+    }
+    match fs::symlink_metadata(output) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            bail!("{rel}: the output file is a symlink");
+        }
+        Ok(meta) if meta.is_dir() => bail!("{rel}: the output path is a directory"),
+        Ok(_) => {}
+        Err(error) if is_not_found(&error) => {}
+        Err(_) => bail!("cannot check the output file for {rel}"),
+    }
+    let name = output
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = parent.join(format!(".{name}.pseudofy-tmp"));
+    match fs::remove_file(&temp) {
+        Ok(()) => {}
+        Err(error) if is_not_found(&error) => {}
+        Err(_) => bail!("cannot write {rel}"),
+    }
+    let written = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(bytes)?;
+            file.sync_all()
+        })
+        .and_then(|()| fs::rename(&temp, output));
+    if written.is_err() {
+        // Best effort: the temp file holds pseudonymized data only.
+        drop(fs::remove_file(&temp));
+    }
+    written.with_context(|| format!("cannot write {rel}"))
 }
 
 fn collect_columns(rules: &[&Rule]) -> Columns {
@@ -138,6 +207,8 @@ fn transform(
     let header_line = body.split(|&b| b == b'\n').next().unwrap_or(&[]);
     let crlf = body.contains(&b'\n') && header_line.ends_with(b"\r");
     let delimiter = detect_delimiter(header_line);
+    let line_end: &[u8] = if crlf { b"\r\n" } else { b"\n" };
+    let ends_with_newline = body.ends_with(b"\n") || body.ends_with(b"\r");
 
     let mut reader = ReaderBuilder::new()
         .has_headers(false)
@@ -149,74 +220,219 @@ fn transform(
     } else {
         Terminator::Any(b'\n')
     };
-    let mut writer = WriterBuilder::new()
+    let mut writer_builder = WriterBuilder::new();
+    writer_builder
         .delimiter(delimiter)
         .terminator(terminator)
-        .flexible(true)
-        .from_writer(Vec::new());
+        .flexible(true);
+    let mut body_out: Vec<u8> = Vec::new();
 
-    let mut roles: Vec<Option<NameRole>> = Vec::new();
+    let mut roles: Vec<Option<ColRole>> = Vec::new();
     let mut missing = Vec::new();
     let mut replaced = 0_usize;
     let mut record = ByteRecord::new();
-    let mut row = 0_usize;
+    let cells = CellFns {
+        email_regex,
+        names,
+        emails,
+    };
+    let mut header_bytes: &[u8] = &[];
+    let mut first = true;
+    // End byte of the previous record and the physical line number there.
+    let mut prev_end = 0_usize;
+    let mut running_line: u64 = 1;
     loop {
         let more = reader
             .read_byte_record(&mut record)
-            .map_err(|_| anyhow!("{rel}: cannot parse row {}", row + 1))?;
+            .map_err(|_| anyhow!("{rel}: cannot parse the record after line {running_line}"))?;
         if !more {
             break;
         }
-        row += 1;
-        if row == 1 {
+        let start = record
+            .position()
+            .and_then(|pos| usize::try_from(pos.byte()).ok())
+            .unwrap_or(prev_end);
+        // The reader puts the skipped empty lines at the start of the record.
+        let start = skip_breaks(body, start);
+        let end = usize::try_from(reader.position().byte())
+            .map_or(body.len(), |pos| after_terminator(body, pos));
+        let gap = body.get(prev_end..start).unwrap_or(&[]);
+        let blanks = count_breaks(gap);
+        let line = running_line + blanks;
+        running_line = line + count_breaks(body.get(start..end).unwrap_or(&[]));
+        prev_end = end;
+        if first {
+            first = false;
+            header_bytes = body.get(..end).unwrap_or(&[]);
             let headers = header_texts(&record, rel)?;
             roles = headers.iter().map(|h| role_of(h, columns)).collect();
             missing = missing_headers(&headers, columns);
-            writer
-                .write_byte_record(&record)
-                .map_err(|_| anyhow!("{rel}: cannot write row 1"))?;
             continue;
         }
-        let mut out = ByteRecord::new();
-        for (index, field) in record.iter().enumerate() {
-            let cell = std::str::from_utf8(field)
-                .map_err(|_| anyhow!("{rel}: row {row} is not valid UTF-8"))?;
-            let mut value = cell.to_owned();
-            if !value.trim().is_empty() {
-                if let Some(Some(role)) = roles.get(index) {
-                    value = names(&value, *role, &mut |part, token| {
-                        replaced += 1;
-                        match part {
-                            Part::First => replace(Kind::First, token),
-                            Part::Last => replace(Kind::Last, token),
-                        }
-                    });
-                }
-                value = emails(&value, email_regex, &mut |address| {
-                    replaced += 1;
-                    replace(Kind::Email, address)
-                });
-            }
-            out.push_field(value.as_bytes());
+        for _ in 0..blanks {
+            body_out.extend_from_slice(line_end);
         }
-        writer
-            .write_byte_record(&out)
-            .map_err(|_| anyhow!("{rel}: cannot write row {row}"))?;
+        let out = transform_record(&record, &roles, &cells, &mut |kind, value| {
+            replaced += 1;
+            replace(kind, value)
+        })
+        .ok_or_else(|| anyhow!("{rel}: line {line} is not valid UTF-8"))?;
+        render(&writer_builder, &out, &mut body_out)
+            .ok_or_else(|| anyhow!("{rel}: cannot write line {line}"))?;
+    }
+    if ends_with_newline && !first {
+        let rest = body.get(prev_end..).unwrap_or(&[]);
+        for _ in 0..count_breaks(rest) {
+            body_out.extend_from_slice(line_end);
+        }
     }
 
-    let body_out = writer
-        .into_inner()
-        .map_err(|_| anyhow!("{rel}: cannot write the output"))?;
-    let mut bytes = Vec::with_capacity(body_out.len() + BOM.len());
+    let mut bytes = Vec::with_capacity(body_out.len() + header_bytes.len() + BOM.len());
     if bom {
         bytes.extend_from_slice(BOM);
     }
+    bytes.extend_from_slice(header_bytes);
     bytes.extend_from_slice(&body_out);
+    if !ends_with_newline && bytes.ends_with(line_end) {
+        bytes.truncate(bytes.len() - line_end.len());
+    }
     Ok(Transformed {
         bytes,
         replaced,
         missing,
     })
+}
+
+/// Position of the first byte at or after `pos` that is not a line break.
+fn skip_breaks(body: &[u8], pos: usize) -> usize {
+    pos + body
+        .get(pos..)
+        .unwrap_or(&[])
+        .iter()
+        .take_while(|&&byte| byte == b'\r' || byte == b'\n')
+        .count()
+}
+
+/// Append `record` as one CSV line to `target`.
+fn render(builder: &WriterBuilder, record: &ByteRecord, target: &mut Vec<u8>) -> Option<()> {
+    let mut writer = builder.from_writer(Vec::new());
+    writer.write_byte_record(record).ok()?;
+    target.extend_from_slice(&writer.into_inner().ok()?);
+    Some(())
+}
+
+/// Number of line breaks (`\n`, `\r\n`, lone `\r`) in `bytes`.
+fn count_breaks(bytes: &[u8]) -> u64 {
+    let mut count = 0;
+    for (index, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' || (byte == b'\r' && bytes.get(index + 1) != Some(&b'\n')) {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// The CSV reader may stop between the `\r` and the `\n` of a CRLF terminator.
+fn after_terminator(body: &[u8], pos: usize) -> usize {
+    if pos > 0 && body.get(pos - 1) == Some(&b'\r') && body.get(pos) == Some(&b'\n') {
+        pos + 1
+    } else {
+        pos
+    }
+}
+
+/// What `transform_cell` needs besides the cell.
+struct CellFns<'a> {
+    email_regex: &'a Regex,
+    names: NameFn,
+    emails: EmailFn,
+}
+
+/// Transform each field of a record. `None` if a field is not valid UTF-8.
+fn transform_record(
+    record: &ByteRecord,
+    roles: &[Option<ColRole>],
+    cells: &CellFns,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+) -> Option<ByteRecord> {
+    let mut out = ByteRecord::new();
+    for (index, field) in record.iter().enumerate() {
+        let cell = std::str::from_utf8(field).ok()?;
+        let role = roles.get(index).copied().flatten();
+        let value = transform_cell(
+            cell,
+            role,
+            cells.email_regex,
+            cells.names,
+            cells.emails,
+            replace,
+        );
+        out.push_field(value.as_bytes());
+    }
+    Some(out)
+}
+
+fn name_kind(part: Part) -> Kind {
+    match part {
+        Part::First => Kind::First,
+        Part::Last => Kind::Last,
+    }
+}
+
+/// Replace names and emails in one cell, depending on the column role.
+fn transform_cell(
+    cell: &str,
+    role: Option<ColRole>,
+    email_regex: &Regex,
+    names: NameFn,
+    emails: EmailFn,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+) -> String {
+    let trimmed = cell.trim();
+    if trimmed.is_empty() {
+        return cell.to_owned();
+    }
+    match role {
+        Some(ColRole::Name(name_role)) => {
+            // Emails first; names only in the text outside the matches.
+            let mut out = String::with_capacity(cell.len());
+            let mut pos = 0;
+            for found in email_regex.find_iter(cell) {
+                let before = cell.get(pos..found.start()).unwrap_or("");
+                out.push_str(&names(before, name_role, &mut |part, token| {
+                    replace(name_kind(part), token)
+                }));
+                out.push_str(&replace(Kind::Email, found.as_str()));
+                pos = found.end();
+            }
+            let rest = cell.get(pos..).unwrap_or("");
+            out.push_str(&names(rest, name_role, &mut |part, token| {
+                replace(name_kind(part), token)
+            }));
+            out
+        }
+        Some(ColRole::Email) => {
+            let mut matched = false;
+            let result = emails(cell, email_regex, &mut |address| {
+                matched = true;
+                replace(Kind::Email, address)
+            });
+            if matched {
+                return result;
+            }
+            // No address found: the whole trimmed cell is the address.
+            let lead = cell.len() - cell.trim_start().len();
+            let tail = cell.len() - cell.trim_end().len();
+            let mut out = String::with_capacity(cell.len());
+            out.push_str(cell.get(..lead).unwrap_or(""));
+            out.push_str(&replace(Kind::Email, trimmed));
+            out.push_str(cell.get(cell.len() - tail..).unwrap_or(""));
+            out
+        }
+        None => emails(cell, email_regex, &mut |address| {
+            replace(Kind::Email, address)
+        }),
+    }
 }
 
 fn header_texts(record: &ByteRecord, rel: &str) -> anyhow::Result<Vec<String>> {
@@ -230,14 +446,16 @@ fn header_texts(record: &ByteRecord, rel: &str) -> anyhow::Result<Vec<String>> {
         .collect()
 }
 
-fn role_of(header: &str, columns: &Columns) -> Option<NameRole> {
+fn role_of(header: &str, columns: &Columns) -> Option<ColRole> {
     let has = |list: &[(String, String)]| list.iter().any(|(_, text)| text == header);
     if has(&columns.first) {
-        Some(NameRole::First)
+        Some(ColRole::Name(NameRole::First))
     } else if has(&columns.last) {
-        Some(NameRole::Last)
+        Some(ColRole::Name(NameRole::Last))
     } else if has(&columns.full) {
-        Some(NameRole::Full)
+        Some(ColRole::Name(NameRole::Full))
+    } else if has(&columns.email) {
+        Some(ColRole::Email)
     } else {
         None
     }
@@ -266,7 +484,13 @@ mod tests {
     ) -> String {
         value
             .split(' ')
-            .map(|token| replace(Part::First, token))
+            .map(|token| {
+                if token.is_empty() {
+                    String::new()
+                } else {
+                    replace(Part::First, token)
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -303,6 +527,10 @@ mod tests {
         .unwrap()
     }
 
+    fn text(out: Transformed) -> String {
+        String::from_utf8(out.bytes).unwrap()
+    }
+
     #[test]
     fn delimiter_detection() {
         assert_eq!(detect_delimiter(b"a;b;c"), b';');
@@ -334,5 +562,95 @@ mod tests {
         );
         let heads: Vec<_> = out.missing.iter().map(|(_, h)| h.as_str()).collect();
         assert_eq!(heads, ["first_name", "email"]);
+    }
+
+    #[test]
+    fn email_column_replaces_matches_or_whole_cell() {
+        let input = b"email,x\n a@b.test ,1\n  not an address ,2\nsee a@b.test ok,3\n";
+        let out = run(input, &columns());
+        assert_eq!(out.replaced, 3);
+        assert_eq!(
+            text(out),
+            "email,x\n x@example.com ,1\n  x@example.com ,2\nsee x@example.com ok,3\n"
+        );
+    }
+
+    #[test]
+    fn email_inside_name_column_is_not_split_into_names() {
+        let input = b"name,x\nab a@b.test cd,1\nab cd,2\n";
+        let out = run(input, &columns());
+        assert_eq!(out.replaced, 5);
+        assert_eq!(text(out), "name,x\nN x@example.com N,1\nN N,2\n");
+    }
+
+    #[test]
+    fn keeps_blank_lines_and_final_newline_state() {
+        let input = b"id,m\n\n1,a@b.test\n\n\n2,c\n";
+        let out = run(input, &Columns::default());
+        assert_eq!(text(out), "id,m\n\n1,x@example.com\n\n\n2,c\n");
+        let input = b"id,m\r\n1,a\r\n\r\n2,b";
+        let out = run(input, &Columns::default());
+        assert_eq!(text(out), "id,m\r\n1,a\r\n\r\n2,b");
+        let input = b"id,m\n1,a\n\n";
+        let out = run(input, &Columns::default());
+        assert_eq!(text(out), "id,m\n1,a\n\n");
+    }
+
+    #[test]
+    fn header_bytes_stay_unchanged() {
+        let input = b"\xEF\xBB\xBF\"id\" , m\r\n1,a\r\n";
+        let out = run(input, &Columns::default());
+        assert_eq!(out.bytes, input);
+        let out = run(b"id,m", &Columns::default());
+        assert_eq!(out.bytes, b"id,m");
+    }
+
+    #[test]
+    fn error_names_the_real_line_number() {
+        let regex = Regex::new("x").unwrap();
+        let input = b"id,m\n\n\n1,\xFF\n";
+        let error = transform(
+            input,
+            &Columns::default(),
+            &regex,
+            fake_names,
+            fake_emails,
+            &mut |_, _| String::new(),
+            "t.csv",
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap();
+        assert_eq!(error, "t.csv: line 4 is not valid UTF-8");
+    }
+
+    #[test]
+    fn writes_by_rename_and_refuses_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("out");
+        fs::create_dir(&root).unwrap();
+        let file = root.join("sub").join("a.csv");
+        write_output(&root, &file, b"one", "sub/a.csv").unwrap();
+        write_output(&root, &file, b"two", "sub/a.csv").unwrap();
+        assert_eq!(fs::read(&file).unwrap(), b"two");
+        assert!(!root.join("sub").join(".a.csv.pseudofy-tmp").exists());
+
+        #[cfg(unix)]
+        {
+            let victim = dir.path().join("victim.txt");
+            fs::write(&victim, b"keep").unwrap();
+            let link = root.join("b.csv");
+            std::os::unix::fs::symlink(&victim, &link).unwrap();
+            let error = write_output(&root, &link, b"x", "b.csv").unwrap_err();
+            assert!(error.to_string().contains("b.csv"));
+            assert_eq!(fs::read(&victim).unwrap(), b"keep");
+
+            let target_dir = dir.path().join("elsewhere");
+            fs::create_dir(&target_dir).unwrap();
+            std::os::unix::fs::symlink(&target_dir, root.join("linked")).unwrap();
+            let inner = root.join("linked").join("c.csv");
+            assert!(write_output(&root, &inner, b"x", "linked/c.csv").is_err());
+            assert!(!target_dir.join("c.csv").exists());
+        }
     }
 }
