@@ -466,7 +466,7 @@ mod tests {
         let input = "name\nJ\u{f6}rg\n".as_bytes();
         let out = run_enc(input, &columns()).unwrap();
         assert_eq!(out.bytes, b"name\nMuster\n");
-        let bom = b"\xEF\xBB\xBFname\nab\n";
+        let bom = b"\xEF\xBB\xBFname\nAb\n";
         let out = run_enc(bom, &columns()).unwrap();
         assert_eq!(out.bytes, b"\xEF\xBB\xBFname\nMuster\n");
     }
