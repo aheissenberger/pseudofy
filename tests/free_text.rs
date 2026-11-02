@@ -657,9 +657,9 @@ fn en_dash_and_em_dash_replace_a_hyphenated_first_name_in_full_mode() {
     );
     let (out, _, _) = run_ok(dir.path());
     let t = table(out.path(), "people.csv");
-    for row in 1..=2 {
-        assert_absent(&t[row][2], &["Lisandra", "Kroft"], "note");
-        assert_eq!(t[row][2], format!("{} {}", t[row][0], t[row][1]));
+    for cells in &t[1..] {
+        assert_absent(&cells[2], &["Lisandra", "Kroft"], "note");
+        assert_eq!(cells[2], format!("{} {}", cells[0], cells[1]));
     }
 }
 
