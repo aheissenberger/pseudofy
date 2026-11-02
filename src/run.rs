@@ -57,15 +57,18 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
     let mut others: Vec<(PathBuf, PathBuf, String)> = Vec::new();
     summary.copied = config.copy_other_files.then_some(0);
 
-    let secrets = project.join("secrets");
-    let config_dir = project.join("config");
+    // `secrets/` and `config/` are compared without case: on a case-insensitive
+    // file system (the macOS default), `Secrets/` is the same directory.
     let walker = WalkDir::new(&project)
         .follow_links(false)
         .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| {
-            let path = entry.path();
-            path != secrets && path != config_dir && path != out
+            let top_dir = entry.depth() == 1
+                && ["secrets", "config"]
+                    .iter()
+                    .any(|dir| entry.file_name().eq_ignore_ascii_case(dir));
+            !top_dir && entry.path() != out
         });
     for entry in walker {
         let entry = match entry {
@@ -336,22 +339,22 @@ fn copy_file(input: &Path, out_root: &Path, output: &Path) -> Result<(), ()> {
         Err(error) if is_not_found(&error) => {}
         Err(_) => return Err(()),
     }
-    let name = output
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let temp = parent.join(format!(".{name}.pseudofy-tmp"));
+    // A short fixed name: a long but legal file name still fits.
+    let temp = parent.join(".pseudofy-copy.tmp");
     match fs::remove_file(&temp) {
         Ok(()) => {}
         Err(error) if is_not_found(&error) => {}
         Err(_) => return Err(()),
     }
     let mut source = fs::File::open(input).map_err(drop)?;
+    let permissions = source.metadata().map_err(drop)?.permissions();
     let written = fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp)
         .and_then(|mut file| {
+            // Keep the permission bits: a private file stays private.
+            file.set_permissions(permissions)?;
             io::copy(&mut source, &mut file)?;
             file.sync_all()
         })

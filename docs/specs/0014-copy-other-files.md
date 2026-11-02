@@ -1,7 +1,7 @@
 # Feature Delta Spec: Copy other files and explain each config setting
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 · `docs/adr/0012-copy-other-project-files-unchanged.md`
 
@@ -51,30 +51,31 @@ The config that `init` writes explains each setting. Each setting with a default
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] The walk keeps its exclusions: `secrets/`, `config/`, and the output directory.
-- [ ] pseudofy never copies a `.csv` or `.xlsx` file unchanged. The extension check ignores case.
-- [ ] pseudofy never copies a file with a path component that starts with `.`, for example `.private_key` or `.git/config`.
-- [ ] The copy uses the same safe write as the other outputs: no write through a symlink in the output directory.
-- [ ] The copy streams the file. It does not read the full file into memory.
-- [ ] No new crate. No `unwrap()` or `expect()` outside tests.
+- [x] The walk keeps its exclusions: `secrets/`, `config/`, and the output directory. The names `secrets` and `config` are compared without case, because macOS file systems ignore case by default.
+- [x] A copy keeps the permission bits of the input file.
+- [x] pseudofy never copies a `.csv` or `.xlsx` file unchanged. The extension check ignores case.
+- [x] pseudofy never copies a file with a path component that starts with `.`, for example `.private_key` or `.git/config`.
+- [x] The copy uses the same safe write as the other outputs: no write through a symlink in the output directory.
+- [x] The copy streams the file. It does not read the full file into memory.
+- [x] No new crate. No `unwrap()` or `expect()` outside tests.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] Without the setting, `run` copies no other file. The summary line is the same as before this change.
-- [ ] With `copy_other_files = true`, `run` copies `notes.txt` and `sub/image.png` byte-identical to the output directory.
-- [ ] With `copy_other_files = true`, `run` does not copy a file in `secrets/` or `config/`, a `.private_x` file, a file in `.git/`, `.DS_Store`, `~$book.xlsx`, or a symlink.
-- [ ] With `copy_other_files = true`, `run` prints `notes.txt: copied unchanged`. The summary line gives the number of copied files.
-- [ ] `init` writes `# copy_other_files = false`, `# email_subdomains = true`, and `# free_text = "tokens"`.
-- [ ] The config that `init` writes gives the same settings as the defaults, with the example rule.
-- [ ] The config that `init` writes names each field of `Config` and `Rule`.
+- [x] Without the setting, `run` copies no other file. The summary line is the same as before this change.
+- [x] With `copy_other_files = true`, `run` copies `notes.txt` and `sub/image.png` byte-identical to the output directory.
+- [x] With `copy_other_files = true`, `run` does not copy a file in `secrets/` or `config/`, a `.private_x` file, a file in `.git/`, `.DS_Store`, `~$book.xlsx`, or a symlink.
+- [x] With `copy_other_files = true`, `run` prints `notes.txt: copied unchanged`. The summary line gives the number of copied files.
+- [x] `init` writes `# copy_other_files = false`, `# email_subdomains = true`, and `# free_text = "tokens"`.
+- [x] The config that `init` writes gives the same settings as the defaults, with the example rule.
+- [x] The config that `init` writes names each field of `Config` and `Rule`.
 
 **Tests to add/update:**
 
-- [ ] `tests/cli.rs` — the behaviors above.
-- [ ] `src/config.rs` — the default and the parse of `copy_other_files`.
-- [ ] `src/config.rs` — the template parses to the defaults and names each field.
+- [x] `tests/cli.rs` — the behaviors above.
+- [x] `src/config.rs` — the default and the parse of `copy_other_files`.
+- [x] `src/config.rs` — the template parses to the defaults and names each field.
 
 **Commands that must pass:**
 

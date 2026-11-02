@@ -291,3 +291,76 @@ fn run_with_copy_other_files_never_copies_uppercase_csv_or_xlsx_unchanged() {
         }
     }
 }
+
+#[test]
+fn run_with_copy_other_files_skips_secrets_and_config_in_any_case() {
+    // On a case-insensitive file system `Secrets/` is `secrets/`. The test
+    // creates both spellings, so it also works on a case-sensitive one.
+    let dir = other_files_project("copy_other_files = true\n");
+    write_at(dir.path(), "Secrets/other.key", b"secret");
+    write_at(dir.path(), "CONFIG/other.toml", b"config");
+    let out = tempfile::TempDir::new().unwrap();
+    run_project(dir.path(), out.path());
+    assert!(!out.path().join("Secrets").exists());
+    assert!(!out.path().join("CONFIG").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn run_with_copy_other_files_keeps_permissions_and_skips_directory_symlinks() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = other_files_project("copy_other_files = true\n");
+    let private = dir.path().join("private.txt");
+    std::fs::write(&private, b"private notes").unwrap();
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink("sub", dir.path().join("linkdir")).unwrap();
+    let out = tempfile::TempDir::new().unwrap();
+    run_project(dir.path(), out.path());
+    let mode = std::fs::metadata(out.path().join("private.txt"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+    assert!(!out.path().join("linkdir").exists());
+}
+
+#[test]
+fn run_with_copy_other_files_copies_a_long_file_name() {
+    let dir = other_files_project("copy_other_files = true\n");
+    let name = format!("{}.txt", "a".repeat(245));
+    write_at(dir.path(), &name, b"long");
+    let out = tempfile::TempDir::new().unwrap();
+    run_project(dir.path(), out.path());
+    assert_eq!(std::fs::read(out.path().join(&name)).unwrap(), b"long");
+}
+
+#[test]
+fn run_with_copy_other_files_and_out_inside_the_project_does_not_copy_the_output() {
+    let dir = other_files_project("copy_other_files = true\n");
+    let out = dir.path().join("out");
+    run_project(dir.path(), &out);
+    run_project(dir.path(), &out);
+    assert!(out.join("notes.txt").exists());
+    assert!(!out.join("out").exists());
+}
+
+#[test]
+fn run_with_copy_other_files_reports_a_failed_copy_by_path() {
+    let dir = other_files_project("copy_other_files = true\n");
+    let out = tempfile::TempDir::new().unwrap();
+    // A directory in place of the target makes the copy fail.
+    std::fs::create_dir_all(out.path().join("notes.txt")).unwrap();
+    let assert = pseudofy()
+        .args(["run", "--project"])
+        .arg(dir.path())
+        .arg("--out")
+        .arg(out.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).to_string();
+    assert!(
+        stderr.lines().any(|l| l == "error: cannot copy notes.txt"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("some notes"), "{stderr}");
+}
