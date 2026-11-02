@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Spec-driven development: document check for feature specs and ADRs.
+# Dependencies: Bash and POSIX awk. Works with any project language.
+#
+# Configuration (environment variables):
+#   SPEC_DIR  spec directory (default: docs/specs)
+#   ADR_DIR   ADR directory  (default: docs/adr)
+#   MD_LINT   optional Markdown lint command, for example "rumdl check ." or
+#             "markdownlint-cli2 docs/**/*.md". Empty = no lint.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")/.."
+
+spec_dir="${SPEC_DIR:-docs/specs}"
+adr_dir="${ADR_DIR:-docs/adr}"
+failures=0
+
+if [[ -n "${MD_LINT:-}" ]]; then
+  eval "$MD_LINT" || failures=$((failures + 1))
+fi
+
+# Required headings in this sequence. Other headings between them are permitted.
+spec_headings='## 1. Objective & Context|## 2. Scope|### Added|### Modified|### Removed|### Out of scope (explicitly)|## 3. Architectural Rules & Invariants|## 4. Acceptance Criteria & Verification|## 5. Rollback / Notes (optional)'
+adr_headings='## Context|## Decision|## Consequences|### Positive|### Negative / Accepted costs|## Alternatives considered|## Compliance & verification (optional)'
+
+read -r -d '' check <<'AWK' || true
+function fail(msg, at) { printf "docs-check: %s:%d: %s\n", FILENAME, (at ? at : FNR), msg > "/dev/stderr"; failures++ }
+BEGIN { nf = split(fields, required, " "); nh = split(headings, heading, "|"); next_heading = 1 }
+/^```/ { fence = !fence; if (fence && kind == "spec" && section ~ /^## 4\./ && $0 ~ /^```(sh|bash)$/) command_block = 1; next }
+fence { next }
+FNR == 1 && !template && $0 !~ title { fail("title must match the pattern " title) }
+FNR == 1 && !template && kind == "adr" && $0 !~ ("^# ADR-" number ":") { fail("ADR number in the title is not the file number " number) }
+/^\*\*(Date|Status|Author|Deciders|Related):\*\*/ {
+  name = $0; sub(/^\*\*/, "", name); sub(/:\*\*.*/, "", name)
+  if ($0 !~ /^\*\*[A-Za-z]+:\*\* [^ ]/) fail("**" name ":** must have exactly one space, then the value")
+  seen[name] = 1; line[name] = FNR; value[name] = $0; sub(/^\*\*[A-Za-z]+:\*\* */, "", value[name])
+}
+{ text = $0; gsub(/`[^`]*`/, "", text) }
+!template && (text ~ /<[^>]+>/ || text ~ /<!--/) { fail("template placeholder <...> or template comment remains") }
+/^#+ / {
+  section = ($0 ~ /^## /) ? $0 : section
+  if (next_heading <= nh && $0 == heading[next_heading]) next_heading++
+}
+kind == "spec" && /^> (Delta specs|Delete the guidance)/ { guidance = FNR }
+kind == "adr" && /^\| Alternative \| Why rejected \|$/ { table = 1 }
+END {
+  for (i = 1; i <= nf; i++) if (!seen[required[i]]) fail("metadata field is missing: **" required[i] ":**")
+  if (next_heading <= nh) fail("required heading is missing or out of sequence: " heading[next_heading])
+  if (!template) {
+    if (value["Date"] !~ /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$/) fail("Date must be YYYY-MM-DD", line["Date"])
+    if (value["Status"] !~ ("^(" status ")$")) fail("Status must be one of " status, line["Status"])
+    if (kind == "spec" && guidance && value["Status"] ~ /^(active|done)$/) fail("an active or done spec must not contain the template guidance blockquotes", guidance)
+  }
+  if (kind == "spec" && !command_block) fail("section 4 needs a sh or bash command block")
+  if (kind == "adr" && !table) fail("table | Alternative | Why rejected | is missing")
+  exit (failures > 0)
+}
+AWK
+
+check_documents() { # kind dir title status fields headings
+  local kind="$1" dir="$2" title="$3" status="$4" fields="$5" headings="$6" file name template
+  [[ -d "$dir" ]] || return 0
+  for file in "$dir"/*.md; do
+    [[ -e "$file" ]] || continue
+    name="$(basename "$file")"
+    template=0
+    case "$name" in TEMPLATE.md | 0000-template.md) template=1 ;; esac
+    if [[ "$kind" == adr && "$template" == 0 && ! "$name" =~ ^[0-9]{4}-[a-z0-9]+(-[a-z0-9]+)*\.md$ ]]; then
+      echo "docs-check: $file: file name must be NNNN-kebab-case-title.md" >&2
+      failures=$((failures + 1))
+    fi
+    awk -v kind="$kind" -v template="$template" -v number="${name%%-*}" -v title="$title" \
+      -v status="$status" -v fields="$fields" -v headings="$headings" "$check" "$file" ||
+      failures=$((failures + 1))
+  done
+}
+
+#               kind  directory    title pattern                         status values                                                          required fields               headings
+check_documents spec  "$spec_dir"  '^# Feature Delta Spec: .+'           'proposed|active|done|superseded'                                      'Date Status Author Related'   "$spec_headings"
+check_documents adr   "$adr_dir"   '^# ADR-[0-9][0-9][0-9][0-9]: .+'     'proposed|accepted|deprecated|superseded by ADR-[0-9][0-9][0-9][0-9]'  'Date Status Deciders Related' "$adr_headings"
+
+if ((failures > 0)); then
+  echo "docs-check: $failures check(s) failed" >&2
+  exit 1
+fi
+echo "docs-check: ok"
