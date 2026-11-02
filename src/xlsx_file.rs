@@ -37,7 +37,8 @@ pub struct XlsxStats {
 type SheetRule<'a> = (Option<GlobSet>, &'a Rule);
 
 /// Read the workbook at `input`. With `quiet`, nothing is printed.
-fn open_book(input: &Path, rel: &str, quiet: bool) -> anyhow::Result<Workbook> {
+/// Read `input` once. Return the workbook and the package bytes it came from.
+fn open_book(input: &Path, rel: &str, quiet: bool) -> anyhow::Result<(Workbook, Vec<u8>)> {
     let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
     let unreadable = || anyhow!("{rel}: cannot read the workbook");
     if has_pivot_parts(&bytes) {
@@ -54,9 +55,11 @@ fn open_book(input: &Path, rel: &str, quiet: bool) -> anyhow::Result<Workbook> {
         );
     }
     // The crate can panic on a damaged workbook; its error texts are not used.
-    panic_guard::catch(|| reader::xlsx::read_reader(Cursor::new(bytes), true))
-        .ok_or_else(unreadable)?
-        .map_err(|_| unreadable())
+    let book =
+        panic_guard::catch(|| reader::xlsx::read_reader(Cursor::new(bytes.as_slice()), true))
+            .ok_or_else(unreadable)?
+            .map_err(|_| unreadable())?;
+    Ok((book, bytes))
 }
 
 /// Pass 1: read the name columns of `input` and add the known names to
@@ -68,7 +71,7 @@ pub fn collect(
     cells: &CellFns,
     known: &mut KnownNames,
 ) -> anyhow::Result<()> {
-    let mut book = open_book(input, rel, true)?;
+    let (mut book, _) = open_book(input, rel, true)?;
     let mut collector = Collector::default();
     transform(
         &mut book,
@@ -93,7 +96,8 @@ pub fn process(
     pseudonymizer: &mut Pseudonymizer,
     cells: &CellFns,
 ) -> anyhow::Result<XlsxStats> {
-    let mut book = open_book(input, rel, false)?;
+    // The scrub restores parts from the same bytes that were inspected and read.
+    let (mut book, original) = open_book(input, rel, false)?;
 
     let mut replace = |kind: Kind, value: &str| match kind {
         Kind::First => pseudonymizer.first_name(value),
@@ -117,7 +121,7 @@ pub fn process(
     panic_guard::catch(|| writer::xlsx::write_writer(&book, &mut out))
         .ok_or_else(unwritable)?
         .map_err(|_| unwritable())?;
-    let out = xlsx_scrub::scrub(&out).map_err(|_| unwritable())?;
+    let out = xlsx_scrub::scrub(&original, &out).map_err(|_| unwritable())?;
     write_output(out_root, output, &out, rel)?;
     Ok(result.stats)
 }
