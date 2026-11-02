@@ -38,10 +38,6 @@ pub struct Rule {
     pub email: Vec<String>,
     /// Sheet-name globs for XLSX files. Empty: the rule applies to each sheet.
     #[serde(default)]
-    #[expect(
-        dead_code,
-        reason = "spec 0003 skeleton; xlsx_file reads it, the orchestrator removes this after the merge"
-    )]
     pub sheets: Vec<String>,
 }
 
