@@ -1,5 +1,6 @@
 //! `pseudofy run`: find the CSV and XLSX files, apply the rules, write the copies.
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -8,7 +9,7 @@ use anyhow::{Context, bail};
 use globset::{GlobBuilder, GlobMatcher};
 use walkdir::WalkDir;
 
-use crate::cells::{CellFns, is_not_found};
+use crate::cells::{CellFns, is_not_found, set_input_permissions};
 use crate::config::{self, FreeText, Rule};
 use crate::csv_file;
 use crate::key;
@@ -28,6 +29,27 @@ pub struct Summary {
     pub failed: usize,
     /// Other files copied unchanged. `None` if `copy_other_files` is off (spec 0014).
     pub copied: Option<usize>,
+}
+
+/// Name of the marker file in an output directory inside the project.
+const OUT_MARKER: &str = ".pseudofy-out";
+
+/// Identity of a file: device and inode on unix, the canonical path elsewhere.
+#[cfg(unix)]
+type FileId = (u64, u64);
+#[cfg(not(unix))]
+type FileId = PathBuf;
+
+/// Identity of an existing file or directory. A symlink is followed.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(path: &Path) -> Option<FileId> {
+    path.canonicalize().ok()
 }
 
 /// A CSV or XLSX file of the project that both passes handle.
@@ -68,7 +90,9 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
                 && ["secrets", "config"]
                     .iter()
                     .any(|dir| entry.file_name().eq_ignore_ascii_case(dir));
-            !top_dir && entry.path() != out
+            // A path with a component that starts with `.` is hidden: skipped.
+            let hidden = entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.');
+            !top_dir && !hidden && entry.path() != out
         });
     for entry in walker {
         let entry = match entry {
@@ -139,24 +163,44 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
         ..pass1
     };
 
+    let inputs = input_ids(&items, &others);
+
     // Pass 2: write the copies.
-    write_items(&items, &out, &mut pseudonymizer, &pass2, &mut summary);
+    write_items(
+        &items,
+        &out,
+        &inputs,
+        &mut pseudonymizer,
+        &pass2,
+        &mut summary,
+    );
     summary.collisions = pseudonymizer.collisions();
 
-    copy_others(&others, &out, &mut summary);
+    copy_others(&others, &out, &inputs, &mut summary);
     Ok(summary)
+}
+
+/// Identities of the walked input files: an output path must not be one of them.
+fn input_ids(items: &[Item], others: &[(PathBuf, PathBuf, String)]) -> HashSet<FileId> {
+    items
+        .iter()
+        .map(|item| &item.path)
+        .chain(others.iter().map(|(path, _, _)| path))
+        .filter_map(|path| file_id(path))
+        .collect()
 }
 
 /// Pass 2 over all files. A failed file is reported and counted.
 fn write_items(
     items: &[Item],
     out: &Path,
+    inputs: &HashSet<FileId>,
     pseudonymizer: &mut Pseudonymizer,
     cells: &CellFns,
     summary: &mut Summary,
 ) {
     for item in items {
-        let result = write_item(item, out, pseudonymizer, cells);
+        let result = write_item(item, out, inputs, pseudonymizer, cells);
         match result {
             Ok((replaced, free_text)) => {
                 if free_text > 0 {
@@ -192,17 +236,30 @@ fn rule_matchers(rules: &[Rule]) -> anyhow::Result<Vec<(GlobMatcher, &Rule)>> {
 fn write_item(
     item: &Item,
     out: &Path,
+    inputs: &HashSet<FileId>,
     pseudonymizer: &mut Pseudonymizer,
     cells: &CellFns,
 ) -> anyhow::Result<(usize, usize)> {
     let target = out.join(&item.relative);
     let (path, rel, rules) = (&item.path, &item.rel, &item.rules);
-    if item.csv {
-        let stats = csv_file::process(path, out, &target, rel, rules, pseudonymizer, cells)?;
-        Ok((stats.replaced, stats.free_text))
+    if is_input(&target, inputs) {
+        bail!("{rel}: the output path is an input file");
+    }
+    // The copy gets the permission bits of the input.
+    set_input_permissions(fs::metadata(path).ok().map(|meta| meta.permissions()));
+    let result = if item.csv {
+        csv_file::process(path, out, &target, rel, rules, pseudonymizer, cells)
+            .map(|stats| (stats.replaced, stats.free_text))
     } else {
         process_xlsx(path, out, &target, rel, rules, pseudonymizer, cells)
-    }
+    };
+    set_input_permissions(None);
+    result
+}
+
+/// Whether `target` exists and is one of the walked input files.
+fn is_input(target: &Path, inputs: &HashSet<FileId>) -> bool {
+    file_id(target).is_some_and(|id| inputs.contains(&id))
 }
 
 /// Pass 1 over all files. A file that fails adds no names and is skipped.
@@ -243,25 +300,96 @@ fn process_xlsx(
 
 /// Canonical project and output directories. Fail if the output could
 /// overwrite or contain the input, or lies in `secrets/` or `config/`.
+/// An output directory inside the project must be new, empty, or marked.
 fn resolve_dirs(project: &Path, out: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
     let project = project
         .canonicalize()
         .context("cannot open the project directory")?;
+    let protected: Vec<PathBuf> = ["secrets", "config"]
+        .iter()
+        .filter_map(|name| project.join(name).canonicalize().ok())
+        .collect();
     let future = resolve_future(out)?;
-    if future.starts_with(project.join("secrets")) || future.starts_with(project.join("config")) {
-        bail!("--out must not be inside secrets/ or config/ of the project");
-    }
+    check_not_protected(&project, &protected, &future)?;
+    let needs_marker = future.starts_with(&project) && future != project && marker_needed(&future)?;
     fs::create_dir_all(out).context("cannot create the output directory")?;
     let out = out
         .canonicalize()
         .context("cannot open the output directory")?;
+    check_not_protected(&project, &protected, &out)?;
     if out == project {
         bail!("--out must not be the project directory");
     }
     if project.starts_with(&out) {
         bail!("the project directory must not be inside --out");
     }
+    if needs_marker {
+        fs::write(out.join(OUT_MARKER), b"pseudofy output directory\n")
+            .context("cannot write the marker file in the output directory")?;
+    }
+    warn_if_writable_by_others(&out);
     Ok((project, out))
+}
+
+/// Fail if `path` is, or lies in, `secrets/` or `config/` of the project.
+/// The check uses the name (any letter case), the canonical path, and the
+/// device and inode of each existing ancestor, so a symlink does not get past.
+fn check_not_protected(project: &Path, protected: &[PathBuf], path: &Path) -> anyhow::Result<()> {
+    let by_name = path.strip_prefix(project).is_ok_and(|rest| {
+        rest.components().next().is_some_and(|first| {
+            ["secrets", "config"]
+                .iter()
+                .any(|dir| first.as_os_str().eq_ignore_ascii_case(dir))
+        })
+    });
+    let by_path = protected.iter().any(|dir| path.starts_with(dir));
+    let ids: Vec<FileId> = protected.iter().filter_map(|dir| file_id(dir)).collect();
+    let by_id = path
+        .ancestors()
+        .filter_map(file_id)
+        .any(|id| ids.contains(&id));
+    if by_name || by_path || by_id {
+        bail!("--out must not be inside secrets/ or config/ of the project");
+    }
+    Ok(())
+}
+
+/// For an output directory inside the project: does the run write the marker?
+/// Yes if the directory is new or empty. No if it has the marker. Fail if it
+/// has other content (it may hold input files).
+fn marker_needed(dir: &Path) -> anyhow::Result<bool> {
+    match fs::metadata(dir) {
+        Err(error) if is_not_found(&error) => Ok(true),
+        Ok(meta) if meta.is_dir() => {
+            if fs::symlink_metadata(dir.join(OUT_MARKER)).is_ok() {
+                return Ok(false);
+            }
+            let mut entries = fs::read_dir(dir).context("cannot read the output directory")?;
+            if entries.next().is_none() {
+                Ok(true)
+            } else {
+                bail!(
+                    "--out is inside the project and not empty; it needs the marker file \
+                     {OUT_MARKER}, or use an empty or new directory"
+                )
+            }
+        }
+        Ok(_) => bail!("--out is not a directory"),
+        Err(_) => bail!("cannot check the output directory"),
+    }
+}
+
+/// Warn if other users can write to the output directory (unix).
+fn warn_if_writable_by_others(out: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if fs::metadata(out).is_ok_and(|meta| meta.permissions().mode() & 0o022 != 0) {
+            eprintln!("warning: --out is writable by other users");
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = out;
 }
 
 /// Absolute form of a path that may not exist yet: the nearest existing
@@ -293,9 +421,15 @@ fn resolve_future(path: &Path) -> anyhow::Result<PathBuf> {
 
 /// Copy each other file unchanged and count it. A failure is reported and
 /// counted in `failed`.
-fn copy_others(others: &[(PathBuf, PathBuf, String)], out: &Path, summary: &mut Summary) {
+fn copy_others(
+    others: &[(PathBuf, PathBuf, String)],
+    out: &Path,
+    inputs: &HashSet<FileId>,
+    summary: &mut Summary,
+) {
     for (path, relative, rel) in others {
-        if copy_file(path, out, &out.join(relative)).is_ok() {
+        let target = out.join(relative);
+        if !is_input(&target, inputs) && copy_file(path, out, &target).is_ok() {
             println!("{rel}: copied unchanged");
             summary.copied = summary.copied.map(|n| n + 1);
         } else {
@@ -441,6 +575,61 @@ mod tests {
         }
         let out = dir.path().join("secrets2");
         assert!(resolve_dirs(dir.path(), &out).is_ok());
+    }
+
+    #[test]
+    fn out_inside_project_needs_new_empty_or_marked_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let used = dir.path().join("data");
+        fs::create_dir(&used).unwrap();
+        fs::write(used.join("a.csv"), "x").unwrap();
+        assert!(resolve_dirs(dir.path(), &used).is_err());
+        assert!(!used.join(OUT_MARKER).exists());
+        fs::write(used.join(OUT_MARKER), "").unwrap();
+        assert!(resolve_dirs(dir.path(), &used).is_ok());
+        let empty = dir.path().join("empty");
+        fs::create_dir(&empty).unwrap();
+        assert!(resolve_dirs(dir.path(), &empty).is_ok());
+        assert!(empty.join(OUT_MARKER).exists());
+        // Outside the project: no marker, any directory.
+        let other = tempfile::tempdir().unwrap();
+        fs::write(other.path().join("a.csv"), "x").unwrap();
+        let project = dir.path().join("p");
+        fs::create_dir(&project).unwrap();
+        assert!(resolve_dirs(&project, other.path()).is_ok());
+        assert!(!other.path().join(OUT_MARKER).exists());
+    }
+
+    #[test]
+    fn out_in_secrets_in_another_case_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("secrets")).unwrap();
+        assert!(resolve_dirs(dir.path(), &dir.path().join("Secrets")).is_err());
+        assert!(resolve_dirs(dir.path(), &dir.path().join("CONFIG/x")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn out_through_a_symlink_to_secrets_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("secrets")).unwrap();
+        std::os::unix::fs::symlink("secrets", dir.path().join("link")).unwrap();
+        assert!(resolve_dirs(dir.path(), &dir.path().join("link")).is_err());
+        assert!(resolve_dirs(dir.path(), &dir.path().join("link/new")).is_err());
+        assert!(!dir.path().join("secrets/new").exists());
+    }
+
+    #[test]
+    fn an_output_that_is_an_input_file_is_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("a.csv");
+        fs::write(&input, "x").unwrap();
+        let other = dir.path().join("b.csv");
+        fs::write(&other, "y").unwrap();
+        let inputs: HashSet<FileId> = file_id(&input).into_iter().collect();
+        assert!(is_input(&input, &inputs));
+        assert!(!is_input(&other, &inputs));
+        assert!(!is_input(&dir.path().join("missing.csv"), &inputs));
     }
 
     #[test]
