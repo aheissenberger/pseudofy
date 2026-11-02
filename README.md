@@ -11,6 +11,28 @@ In XLSX files, pseudofy does not change comments, charts, data validations, head
 pseudofy prints a warning for each workbook that has one of these parts, except sheet names, defined names, and document properties. Check these parts before you share the file.
 pseudofy refuses workbooks with pivot tables.
 
+## Install on macOS
+
+pseudofy has a binary for Macs with Apple Silicon. Download it from the GitHub release:
+
+```sh
+version=0.1.0
+asset="pseudofy-${version}-aarch64-apple-darwin.tar.gz"
+curl -LO "https://github.com/aheissenberger/pseudofy/releases/download/v${version}/${asset}"
+curl -LO "https://github.com/aheissenberger/pseudofy/releases/download/v${version}/${asset}.sha256"
+shasum -a 256 -c "${asset}.sha256"
+tar -xzf "${asset}"
+```
+
+The binary has no Apple Developer ID signature. macOS blocks a downloaded binary until you remove the quarantine attribute:
+
+```sh
+xattr -d com.apple.quarantine pseudofy
+./pseudofy --version
+```
+
+Move `pseudofy` to a directory in your `PATH`, for example `/usr/local/bin`.
+
 ## Development
 
 Development runs in a devcontainer. The host needs Docker and an editor.
