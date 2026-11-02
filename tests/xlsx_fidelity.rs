@@ -6,8 +6,9 @@
     reason = "test helpers outside #[test] functions may panic"
 )]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -113,4 +114,89 @@ fn unexpected_lost_names_each_missing_part_that_is_not_allowed() {
         vec!["b.xml".to_owned(), "d.xml".to_owned()]
     );
     assert_eq!(unexpected_lost(&input, &input, &[]), Vec::<String>::new());
+}
+
+// ---- Sparklines (spec 0013) ----
+
+fn part_text(path: &Path, name: &str) -> Option<String> {
+    let file = fs::File::open(path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let mut entry = archive.by_name(name).ok()?;
+    let mut text = String::new();
+    entry.read_to_string(&mut text).unwrap();
+    Some(text)
+}
+
+/// The attributes of every start tag with local name `local`.
+fn tags(xml: &str, local: &str) -> Vec<BTreeMap<String, String>> {
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut found = Vec::new();
+    loop {
+        match reader.read_event().unwrap() {
+            quick_xml::events::Event::Eof => break,
+            quick_xml::events::Event::Start(e) | quick_xml::events::Event::Empty(e)
+                if e.local_name().as_ref() == local.as_bytes() =>
+            {
+                let attributes = e
+                    .attributes()
+                    .map(|a| {
+                        let a = a.unwrap();
+                        (
+                            String::from_utf8_lossy(a.key.as_ref()).into_owned(),
+                            a.normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                                .unwrap()
+                                .into_owned(),
+                        )
+                    })
+                    .collect();
+                found.push(attributes);
+            }
+            _ => {}
+        }
+    }
+    found
+}
+
+/// The number of `sparkline` elements of each sheet, by sheet name.
+fn sparkline_counts(path: &Path) -> BTreeMap<String, usize> {
+    let workbook = part_text(path, "xl/workbook.xml").unwrap();
+    let rels = part_text(path, "xl/_rels/workbook.xml.rels").unwrap();
+    let targets: BTreeMap<String, String> = tags(&rels, "Relationship")
+        .into_iter()
+        .map(|r| (r["Id"].clone(), r["Target"].clone()))
+        .collect();
+    let mut counts = BTreeMap::new();
+    for sheet in tags(&workbook, "sheet") {
+        let target = &targets[&sheet["r:id"]];
+        let part = match target.strip_prefix('/') {
+            Some(absolute) => absolute.to_owned(),
+            None => format!("xl/{target}"),
+        };
+        let xml = part_text(path, &part).unwrap();
+        counts.insert(sheet["name"].clone(), tags(&xml, "sparkline").len());
+    }
+    counts
+}
+
+#[test]
+fn copy_keeps_the_sparkline_count_of_each_sheet() {
+    let project = project();
+    let out = TempDir::new().unwrap();
+    Command::cargo_bin("pseudofy")
+        .unwrap()
+        .args(["run", "--project"])
+        .arg(project.path())
+        .arg("--out")
+        .arg(out.path())
+        .assert()
+        .success();
+
+    let mut total = 0;
+    for name in FIXTURES {
+        let input = sparkline_counts(&project.path().join(name));
+        let output = sparkline_counts(&out.path().join(name));
+        assert_eq!(input, output, "{name}: sparkline count per sheet differs");
+        total += input.values().sum::<usize>();
+    }
+    assert!(total >= 10, "the fixtures must contain sparklines");
 }

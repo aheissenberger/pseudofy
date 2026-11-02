@@ -1056,3 +1056,212 @@ fn generated_workbook_gets_no_external_links() {
     assert!(!has_external_link_parts(&copy));
     assert!(!part_text(&copy, "xl/workbook.xml").contains("<externalReferences"));
 }
+
+// ---- Sparklines (spec 0013, ADR-0011) ----
+
+const SPARKLINE_URI: &str = "{05C60535-1F16-4fd2-B633-F4F36F0B64E0}";
+
+/// Sheet name and part text of each worksheet, mapped through workbook.xml.
+fn sheets_by_name(parts: &[(String, String)]) -> Vec<(String, String)> {
+    let workbook = part_text(parts, "xl/workbook.xml");
+    let rels = part_text(parts, "xl/_rels/workbook.xml.rels");
+    let relationships = start_tags(&rels, "Relationship");
+    start_tags(&workbook, "sheet")
+        .iter()
+        .map(|sheet| {
+            let id = attribute(sheet, "r:id").unwrap();
+            let tag = relationships
+                .iter()
+                .find(|t| attribute(t, "Id").as_deref() == Some(id.as_str()))
+                .unwrap();
+            let target = attribute(tag, "Target").unwrap();
+            let part = match target.strip_prefix('/') {
+                Some(absolute) => absolute.to_owned(),
+                None => format!("xl/{target}"),
+            };
+            (attribute(sheet, "name").unwrap(), part_text(parts, &part))
+        })
+        .collect()
+}
+
+/// The `(xm:f, xm:sqref)` text of each sparkline element, in document order.
+fn sparkline_ranges(xml: &str) -> Vec<(String, String)> {
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut ranges = Vec::new();
+    let mut current: Option<(String, String)> = None;
+    let mut field = String::new();
+    loop {
+        match reader.read_event().unwrap() {
+            Event::Eof => break,
+            Event::Start(e) => {
+                let local = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
+                if local == "sparkline" {
+                    current = Some((String::new(), String::new()));
+                }
+                field = local;
+            }
+            Event::Text(t) => {
+                if let Some((f, sqref)) = current.as_mut() {
+                    let text = t.decode().unwrap().into_owned();
+                    match field.as_str() {
+                        "f" => f.push_str(&text),
+                        "sqref" => sqref.push_str(&text),
+                        _ => {}
+                    }
+                }
+            }
+            Event::End(e) => {
+                if e.local_name().as_ref() == b"sparkline" {
+                    ranges.extend(current.take());
+                }
+                field.clear();
+            }
+            _ => {}
+        }
+    }
+    ranges
+}
+
+/// Returns each namespace prefix that the sparkline extension uses and that is
+/// not in scope there.
+fn undeclared_prefixes_in_sparkline_ext(xml: &str) -> Vec<String> {
+    use quick_xml::events::{BytesStart, Event};
+    fn declared(e: &BytesStart) -> Vec<String> {
+        e.attributes()
+            .map(|a| String::from_utf8_lossy(a.unwrap().key.as_ref()).into_owned())
+            .filter_map(|k| k.strip_prefix("xmlns:").map(str::to_owned))
+            .collect()
+    }
+    fn used(e: &BytesStart) -> Vec<String> {
+        let mut names = vec![String::from_utf8_lossy(e.name().as_ref()).into_owned()];
+        names.extend(
+            e.attributes()
+                .map(|a| String::from_utf8_lossy(a.unwrap().key.as_ref()).into_owned()),
+        );
+        names
+            .iter()
+            .filter(|n| !n.starts_with("xmlns"))
+            .filter_map(|n| n.split_once(':').map(|(p, _)| p.to_owned()))
+            .filter(|p| p != "xml")
+            .collect()
+    }
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut scopes: Vec<Vec<String>> = Vec::new();
+    let mut ext_depth: Option<usize> = None;
+    let mut missing = Vec::new();
+    loop {
+        let event = reader.read_event().unwrap();
+        match &event {
+            Event::Eof => break,
+            Event::Start(e) | Event::Empty(e) => {
+                scopes.push(declared(e));
+                let is_ext = e.local_name().as_ref() == b"ext"
+                    && e.attributes()
+                        .any(|a| a.unwrap().value.as_ref() == SPARKLINE_URI.as_bytes());
+                if is_ext && ext_depth.is_none() {
+                    ext_depth = Some(scopes.len());
+                }
+                if ext_depth.is_some() {
+                    for prefix in used(e) {
+                        if !scopes.iter().flatten().any(|d| *d == prefix) {
+                            missing.push(prefix);
+                        }
+                    }
+                }
+                if matches!(event, Event::Empty(_)) {
+                    scopes.pop();
+                    if ext_depth.is_some_and(|d| scopes.len() < d) {
+                        ext_depth = None;
+                    }
+                }
+            }
+            Event::End(_) => {
+                scopes.pop();
+                if ext_depth.is_some_and(|d| scopes.len() < d) {
+                    ext_depth = None;
+                }
+            }
+            _ => {}
+        }
+    }
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+#[test]
+fn restored_sparklines_keep_formula_and_cell_of_the_input_sheet() {
+    let input = sheets_by_name(&package_parts(&fixture_bytes("fidelity.xlsx")));
+    let copy = sheets_by_name(&copy_parts(&fixture_bytes("fidelity.xlsx")));
+    let mut total = 0;
+    for (name, xml) in &input {
+        let expected = sparkline_ranges(xml);
+        total += expected.len();
+        let (_, copied) = copy
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("the copy has no sheet {name}"));
+        assert_eq!(
+            sparkline_ranges(copied),
+            expected,
+            "sparkline ranges of sheet {name} differ"
+        );
+    }
+    assert_eq!(total, 10, "the fixture has 10 sparklines");
+}
+
+#[test]
+fn sheet_with_sparklines_is_well_formed_and_declares_each_prefix() {
+    let copy = sheets_by_name(&copy_parts(&fixture_bytes("fidelity.xlsx")));
+    let mut checked = 0;
+    for (name, xml) in &copy {
+        let mut reader = quick_xml::Reader::from_str(xml);
+        let mut depth: i64 = 0;
+        loop {
+            match reader
+                .read_event()
+                .unwrap_or_else(|_| panic!("sheet {name} is not well-formed"))
+            {
+                quick_xml::events::Event::Eof => break,
+                quick_xml::events::Event::Start(_) => depth += 1,
+                quick_xml::events::Event::End(_) => depth -= 1,
+                _ => {}
+            }
+        }
+        assert_eq!(depth, 0, "sheet {name} has unbalanced elements");
+        if xml.contains(SPARKLINE_URI) {
+            checked += 1;
+            let missing = undeclared_prefixes_in_sparkline_ext(xml);
+            assert!(
+                missing.is_empty(),
+                "sheet {name}: prefixes not declared: {missing:?}"
+            );
+        }
+    }
+    assert_eq!(checked, 1, "one sheet of the copy has the sparkline ext");
+}
+
+#[test]
+fn undeclared_prefix_in_sparkline_ext_is_detected() {
+    let xml = format!(
+        "<worksheet xmlns=\"{MAIN_NS}\"><extLst><ext uri=\"{SPARKLINE_URI}\">\
+         <x14:sparklines><xm:f>A1</xm:f></x14:sparklines></ext></extLst></worksheet>"
+    );
+    assert_eq!(
+        undeclared_prefixes_in_sparkline_ext(&xml),
+        vec!["x14".to_owned(), "xm".to_owned()]
+    );
+}
+
+#[test]
+fn workbook_without_sparklines_gets_no_sparkline_extension() {
+    let bytes = book_bytes(&simple_book("Tamsorin Velgrad", "tamsorin@acme.test"));
+    let copy = copy_parts(&bytes);
+    let sheets = sheets_by_name(&copy);
+    assert_eq!(sheets.len(), 1);
+    for (name, xml) in &sheets {
+        assert!(!xml.contains("x14:sparkline"), "sheet {name}");
+        assert!(!xml.contains(SPARKLINE_URI), "sheet {name}");
+    }
+}
