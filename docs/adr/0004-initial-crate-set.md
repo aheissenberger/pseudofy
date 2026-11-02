@@ -27,10 +27,11 @@ We will use these crates and no other runtime crates without a new ADR:
 | `sys-locale` | System language for `pseudofy init` |
 | `unicode-normalization` | NFC normalization of real values |
 | `globset`, `walkdir` | File selection in the project |
-| `anyhow`, `thiserror` | Error handling |
+| `anyhow` | Error handling |
 
 Test-only crates: `assert_cmd`, `predicates`, `tempfile`.
-ADR-0010 adds `zip` and `quick-xml` as runtime crates. Spec 0010 also uses `zip` in a test.
+ADR-0010 adds `zip` and `quick-xml` as runtime crates. ADR-0009 adds `encoding_rs`. Spec 0010 also uses `zip` in a test.
+`thiserror` is not a direct crate (spec 0020).
 `Cargo.lock` is committed. Each version is pinned in `Cargo.toml`.
 
 ## Consequences
@@ -48,10 +49,11 @@ ADR-0010 adds `zip` and `quick-xml` as runtime crates. Spec 0010 also uses `zip`
   - `xl/calcChain.xml` — Excel rebuilds it on the next calculation.
 - The scrub restores external links from the input package (ADR-0011, spec 0012).
 - The scrub restores the sparklines in the `extLst` element of a sheet from the input package (ADR-0011, spec 0013).
+- `zip` 8.6.0 has the advisories RUSTSEC-2026-0367, -0368, -0369, and -0429. Each is about `extract`. pseudofy and `umya-spreadsheet` never call `extract`. `umya-spreadsheet` 3.1.1 requires `zip` ^8.6, so `deny.toml` accepts these advisories until `umya-spreadsheet` accepts `zip` 9 (spec 0020).
 - `umya-spreadsheet` can panic on damaged input. pseudofy catches the panic (spec 0003). A release profile must not set `panic = "abort"`.
 - `umya-spreadsheet` adds approximately 89 crates to the build.
 - `umya-spreadsheet` is slower than `calamine` and uses more memory on large workbooks.
-- Fifteen direct runtime crates increase compile time.
+- Seventeen direct runtime crates increase compile time (spec 0020).
 
 ## Alternatives considered
 

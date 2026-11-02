@@ -1,0 +1,44 @@
+# cargo-deny config (spec 0020). Run by ./scripts/check: cargo deny --locked check
+
+[graph]
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+]
+
+[advisories]
+unmaintained = "workspace"
+yanked = "deny"
+# zip 8.6.0: umya-spreadsheet 3.1.1 requires zip ^8.6, so zip 9 is not possible
+# yet. Each advisory is about ZipArchive::extract or ZipStreamReader::extract.
+# pseudofy and umya-spreadsheet never call extract (ADR-0004, spec 0020).
+# Remove these entries when umya-spreadsheet accepts zip >= 9.
+ignore = [
+    { id = "RUSTSEC-2026-0367", reason = "extract only; not called" },
+    { id = "RUSTSEC-2026-0368", reason = "extract only; not called" },
+    { id = "RUSTSEC-2026-0369", reason = "extract only; not called" },
+    { id = "RUSTSEC-2026-0429", reason = "extract only; not called" },
+]
+
+[bans]
+multiple-versions = "allow"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[licenses]
+unused-allowed-license = "allow"
+allow = [
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]

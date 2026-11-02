@@ -1,9 +1,9 @@
 # Feature Delta Spec: actionlint in the devcontainer
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** superseded
 **Author:** Claude (agent)
-**Related:** `docs/specs/0005-ci-and-macos-release.md` · `docs/specs/0007-claude-code-project-setup.md` · `docs/adr/0005-build-releases-in-github-actions.md`
+**Related:** `docs/specs/0020-release-hardening.md` (supersedes this spec) · `docs/specs/0005-ci-and-macos-release.md` · `docs/specs/0007-claude-code-project-setup.md` · `docs/adr/0005-build-releases-in-github-actions.md`
 
 ---
 

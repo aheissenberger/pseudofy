@@ -7,3 +7,6 @@ cargo fmt --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 ./scripts/docs-check
+cargo deny --locked check
+actionlint
+shellcheck scripts/* .devcontainer/*.sh .claude/hooks/*
