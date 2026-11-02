@@ -1,6 +1,13 @@
 {
 	"name": "pseudofy",
 	"image": "mcr.microsoft.com/devcontainers/rust:2.1.5-trixie",
+	"mounts": [
+		"source=pseudofy-claude-config,target=/home/vscode/.claude,type=volume"
+	],
+	"containerEnv": {
+		"CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+	},
+	"postCreateCommand": "sudo chown vscode:vscode /home/vscode/.claude",
 	"customizations": {
 		"vscode": {
 			"extensions": [
