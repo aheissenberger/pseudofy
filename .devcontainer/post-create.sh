@@ -2,8 +2,8 @@
 # Run once after the devcontainer is created.
 set -euo pipefail
 
-# The volume for ~/.claude is created as root.
-sudo chown vscode:vscode /home/vscode/.claude
+# The volumes for ~/.claude and ~/.config/gh are created as root.
+sudo chown vscode:vscode /home/vscode/.claude /home/vscode/.config/gh
 
 # Tools for Claude Code: code search, file search, shell script lint.
 sudo apt-get update

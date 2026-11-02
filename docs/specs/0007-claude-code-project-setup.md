@@ -27,13 +27,13 @@
 - `.claude/agents/rust-reviewer.md` — `model: opus`, `effort: high`, no `Write` and no `Edit`. Reviews a diff against the spec, the invariants, and real-value leaks.
 - `.claude/agents/check-runner.md` — `model: haiku`, `effort: low`, tools `Bash`, `Read`. Runs `./scripts/check`. Returns only the failed checks and their first errors.
 - `.claude/agents/crate-researcher.md` — `model: haiku`, `effort: low`, no `Write` and no `Edit`. Answers API questions for the pinned crate versions from the sources in the Cargo registry.
-- `.devcontainer/post-create.sh` — give `~/.claude` to the user `vscode`. Install `ripgrep`, `fd-find` (as `fd`), and `shellcheck` from the Debian packages.
+- `.devcontainer/post-create.sh` — give `~/.claude` and `~/.config/gh` to the user `vscode`. Install `ripgrep`, `fd-find` (as `fd`), and `shellcheck` from the Debian packages.
 - `.devcontainer/devcontainer-lock.json` — the devcontainer CLI writes it. It pins the digest of each feature.
 
 ### Modified
 
 - `.gitignore` — add `.claude/worktrees/` and `.claude/settings.local.json`.
-- `.devcontainer/devcontainer.json` — add the feature `ghcr.io/devcontainers/features/github-cli:1`. `postCreateCommand` runs `.devcontainer/post-create.sh`.
+- `.devcontainer/devcontainer.json` — add the feature `ghcr.io/devcontainers/features/github-cli:1`. A named volume `pseudofy-gh-config` keeps `~/.config/gh` across container rebuilds. `postCreateCommand` runs `.devcontainer/post-create.sh`.
 
 ### Removed
 
@@ -63,6 +63,7 @@
 - [ ] `/agents` in Claude Code lists the five project agents.
 - [ ] A `Read` of `secrets/x` is denied.
 - [x] `rg`, `fd`, `shellcheck`, and `gh` exist in the devcontainer.
+- [ ] A `gh` login stays after a container rebuild.
 - [x] `shellcheck` gives no finding for `.claude/hooks/stop-check` and `.devcontainer/post-create.sh`.
 
 **Tests to add/update:**

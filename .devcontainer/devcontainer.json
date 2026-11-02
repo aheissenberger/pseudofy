@@ -5,7 +5,8 @@
 		"ghcr.io/devcontainers/features/github-cli:1": {}
 	},
 	"mounts": [
-		"source=pseudofy-claude-config,target=/home/vscode/.claude,type=volume"
+		"source=pseudofy-claude-config,target=/home/vscode/.claude,type=volume",
+		"source=pseudofy-gh-config,target=/home/vscode/.config/gh,type=volume"
 	],
 	"containerEnv": {
 		"CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
