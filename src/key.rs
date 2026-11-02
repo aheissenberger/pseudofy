@@ -1,12 +1,17 @@
 //! Project key in `secrets/pseudofy.key` (ADR-0003).
 
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
+use std::io::{self, ErrorKind, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
 use anyhow::{Context, anyhow, bail};
+
+use crate::config;
+
+/// Largest key file that `load` reads.
+const MAX_KEY_BYTES: u64 = 1024;
 
 /// Path of the key file, relative to the project directory.
 pub const KEY_FILE: &str = "secrets/pseudofy.key";
@@ -40,28 +45,102 @@ pub fn create(project: &Path) -> anyhow::Result<()> {
     }
     text.push('\n');
 
+    create_with(project, &text, Write::write_all)
+}
+
+/// `create` with an injectable writer. The key is written to a temp file in
+/// `secrets/`, synced, and linked to `pseudofy.key` (the link fails if the key
+/// exists). A file system without hard links (FAT, exFAT, some network
+/// shares) gets the key through `create_new` on the final path. The files that
+/// this call made are removed on failure.
+fn create_with(
+    project: &Path,
+    text: &str,
+    write: impl Fn(&mut fs::File, &[u8]) -> io::Result<()>,
+) -> anyhow::Result<()> {
     let path = project.join(KEY_FILE);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("cannot create directory for {KEY_FILE}"))?;
     }
+    if path.exists() {
+        bail!("{KEY_FILE} exists; init does not overwrite it");
+    }
+    let (temp, mut file) = open_temp(&path)?;
+    let written = write(&mut file, text.as_bytes()).and_then(|()| file.sync_all());
+    drop(file);
+    let linked = written.and_then(|()| fs::hard_link(&temp, &path));
+    // The temp file holds the key: remove it in every case.
+    drop(fs::remove_file(&temp));
+    match linked {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            bail!("{KEY_FILE} exists; init does not overwrite it")
+        }
+        Err(_) => write_direct(&path, text, &write),
+    }
+}
+
+/// Open a new temp file with a random name in `secrets/`. A left-over temp
+/// file from a killed run cannot block this, because each name is new.
+fn open_temp(path: &Path) -> anyhow::Result<(std::path::PathBuf, fs::File)> {
+    for _ in 0..8 {
+        let mut suffix = [0_u8; 8];
+        getrandom::fill(&mut suffix).map_err(|_| anyhow!("cannot get random bytes"))?;
+        let hex = suffix
+            .iter()
+            .fold(String::with_capacity(16), |mut text, byte| {
+                for nibble in [byte >> 4, byte & 0x0f] {
+                    text.push(char::from_digit(u32::from(nibble), 16).unwrap_or('0'));
+                }
+                text
+            });
+        let temp = path.with_file_name(format!(".pseudofy-key.{hex}.tmp"));
+        match key_options().open(&temp) {
+            Ok(file) => return Ok((temp, file)),
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(_) => bail!("cannot create {KEY_FILE}"),
+        }
+    }
+    bail!("cannot create {KEY_FILE}")
+}
+
+/// Write the key directly to `path` (no hard link). Remove it on failure.
+fn write_direct(
+    path: &Path,
+    text: &str,
+    write: &impl Fn(&mut fs::File, &[u8]) -> io::Result<()>,
+) -> anyhow::Result<()> {
+    let mut file = match key_options().open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+            bail!("{KEY_FILE} exists; init does not overwrite it")
+        }
+        Err(_) => bail!("cannot write {KEY_FILE}"),
+    };
+    let written = write(&mut file, text.as_bytes()).and_then(|()| file.sync_all());
+    drop(file);
+    if written.is_err() {
+        drop(fs::remove_file(path));
+        bail!("cannot write {KEY_FILE}");
+    }
+    Ok(())
+}
+
+/// New file, owner read and write only.
+fn key_options() -> OpenOptions {
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
     options.mode(0o600);
-    let mut file = options
-        .open(&path)
-        .with_context(|| format!("cannot create {KEY_FILE}"))?;
-    file.write_all(text.as_bytes())
-        .with_context(|| format!("cannot write {KEY_FILE}"))?;
-    Ok(())
+    options
 }
 
 /// Load `secrets/pseudofy.key`. If the file is missing, the error tells the
 /// user to run `pseudofy init`. No error message contains the key.
 pub fn load(project: &Path) -> anyhow::Result<ProjectKey> {
     let path = project.join(KEY_FILE);
-    let text = match fs::read_to_string(&path) {
+    let text = match config::read_limited(&path, MAX_KEY_BYTES) {
         Ok(text) => text,
         Err(error) if error.kind() == ErrorKind::NotFound => {
             bail!("{KEY_FILE} not found; run `pseudofy init --project <DIR>` first");
@@ -95,6 +174,77 @@ mod tests {
         let key = load(dir.path()).unwrap();
         assert_eq!(key.as_bytes().len(), 32);
         assert!(create(dir.path()).is_err());
+    }
+
+    #[test]
+    fn failed_key_write_leaves_no_file_and_init_can_retry() {
+        let dir = tempfile::tempdir().unwrap();
+        let failing = |file: &mut fs::File, data: &[u8]| {
+            file.write_all(&data[..10])?;
+            Err(io::Error::other("disk full"))
+        };
+        assert!(create_with(dir.path(), "0123456789abcdef\n", failing).is_err());
+        let names: Vec<_> = fs::read_dir(dir.path().join("secrets")).unwrap().collect();
+        assert!(names.is_empty());
+        create(dir.path()).unwrap();
+        assert!(load(dir.path()).is_ok());
+        let names = fs::read_dir(dir.path().join("secrets")).unwrap().count();
+        assert_eq!(names, 1);
+    }
+
+    #[test]
+    fn direct_write_works_without_hard_links_and_cleans_up_on_failure() {
+        // The fallback for file systems without hard links (FAT, exFAT).
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("secrets")).unwrap();
+        let path = dir.path().join(KEY_FILE);
+        let text = format!("{}\n", "ab".repeat(32));
+        write_direct(&path, &text, &|file: &mut fs::File, data: &[u8]| {
+            file.write_all(data)
+        })
+        .unwrap();
+        assert!(load(dir.path()).is_ok());
+        let again = write_direct(&path, &text, &|_: &mut fs::File, _: &[u8]| Ok(()));
+        assert!(again.unwrap_err().to_string().contains("exists"));
+        fs::remove_file(&path).unwrap();
+        let failing = |_: &mut fs::File, _: &[u8]| Err(io::Error::other("disk full"));
+        assert!(write_direct(&path, &text, &failing).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn left_over_temp_files_do_not_block_init() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("secrets")).unwrap();
+        let stale = dir
+            .path()
+            .join("secrets")
+            .join(format!(".pseudofy-key.{}.tmp", std::process::id()));
+        fs::write(&stale, "old").unwrap();
+        create(dir.path()).unwrap();
+        assert!(load(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn existing_key_is_kept_and_no_temp_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        create(dir.path()).unwrap();
+        let before = fs::read(dir.path().join(KEY_FILE)).unwrap();
+        let message = create(dir.path()).err().unwrap().to_string();
+        assert!(message.contains("exists"));
+        assert_eq!(fs::read(dir.path().join(KEY_FILE)).unwrap(), before);
+        assert_eq!(fs::read_dir(dir.path().join("secrets")).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn oversized_or_non_regular_key_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("secrets")).unwrap();
+        fs::write(dir.path().join(KEY_FILE), "a".repeat(2000)).unwrap();
+        assert!(load(dir.path()).is_err());
+        fs::remove_file(dir.path().join(KEY_FILE)).unwrap();
+        fs::create_dir(dir.path().join(KEY_FILE)).unwrap();
+        assert!(load(dir.path()).is_err());
     }
 
     #[test]

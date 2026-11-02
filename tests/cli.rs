@@ -364,3 +364,205 @@ fn run_with_copy_other_files_reports_a_failed_copy_by_path() {
     );
     assert!(!stderr.contains("some notes"), "{stderr}");
 }
+
+fn run_output(project: &std::path::Path, out: &std::path::Path) -> std::process::Output {
+    pseudofy()
+        .args(["run", "--project"])
+        .arg(project)
+        .arg("--out")
+        .arg(out)
+        .output()
+        .unwrap()
+}
+
+fn stderr_of(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
+
+#[test]
+fn run_refuses_out_inside_the_project_with_files_and_no_marker() {
+    let dir = other_files_project("");
+    write_at(dir.path(), "data/a.csv", b"name\nZorbina Quenzel\n");
+    write_at(dir.path(), "data/b.csv", b"name\nVelmar Drossel\n");
+    let output = run_output(dir.path(), &dir.path().join("data"));
+    assert!(!output.status.success());
+    assert!(!stderr_of(&output).contains("Zorbina"));
+    assert_eq!(
+        std::fs::read(dir.path().join("data/a.csv")).unwrap(),
+        b"name\nZorbina Quenzel\n"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("data/b.csv")).unwrap(),
+        b"name\nVelmar Drossel\n"
+    );
+    assert!(!dir.path().join("data/.pseudofy-out").exists());
+}
+
+#[test]
+fn run_twice_to_the_same_out_inside_the_project_works_with_the_marker() {
+    let dir = other_files_project("");
+    let out = dir.path().join("out");
+    run_project(dir.path(), &out);
+    assert!(out.join(".pseudofy-out").exists());
+    run_project(dir.path(), &out);
+    assert!(out.join("data.csv").exists());
+    assert!(!out.join("out").exists());
+}
+
+#[test]
+fn run_uses_an_empty_out_inside_the_project_and_marks_it() {
+    let dir = other_files_project("");
+    let out = dir.path().join("empty");
+    std::fs::create_dir(&out).unwrap();
+    run_project(dir.path(), &out);
+    assert!(out.join(".pseudofy-out").exists());
+    assert!(out.join("data.csv").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn run_refuses_out_in_secrets_through_a_symlink_or_another_case() {
+    let dir = other_files_project("");
+    let key_before = std::fs::read(dir.path().join("secrets/pseudofy.key")).unwrap();
+    std::os::unix::fs::symlink("secrets", dir.path().join("sneaky")).unwrap();
+    let config_link = dir.path().join("cfglink");
+    std::os::unix::fs::symlink(dir.path().join("config"), &config_link).unwrap();
+    for out in [
+        dir.path().join("sneaky"),
+        dir.path().join("sneaky/deep/out"),
+        dir.path().join("Secrets"),
+        dir.path().join("CONFIG/x"),
+        config_link.join("out"),
+    ] {
+        let output = run_output(dir.path(), &out);
+        assert!(!output.status.success(), "{}", out.display());
+    }
+    assert_eq!(
+        std::fs::read(dir.path().join("secrets/pseudofy.key")).unwrap(),
+        key_before
+    );
+    assert!(!dir.path().join("secrets/data.csv").exists());
+    assert!(!dir.path().join("secrets/deep").exists());
+    assert!(!dir.path().join("Secrets").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_key_write_leaves_no_key_and_a_second_init_works() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::TempDir::new().unwrap();
+    let secrets = dir.path().join("secrets");
+    std::fs::create_dir(&secrets).unwrap();
+    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let first = init_command(dir.path())
+        .args(["--language", "en"])
+        .output()
+        .unwrap();
+    std::fs::set_permissions(&secrets, std::fs::Permissions::from_mode(0o700)).unwrap();
+    if first.status.success() {
+        // Root ignores the mode: the failure cannot be simulated.
+        return;
+    }
+    assert!(!secrets.join("pseudofy.key").exists());
+    assert_eq!(std::fs::read_dir(&secrets).unwrap().count(), 0);
+    init_command(dir.path())
+        .args(["--language", "en"])
+        .assert()
+        .success();
+    assert!(secrets.join("pseudofy.key").exists());
+}
+
+#[cfg(unix)]
+fn run_with_fifo_at(relative: &str) {
+    let dir = other_files_project("");
+    let path = dir.path().join(relative);
+    std::fs::remove_file(&path).unwrap();
+    let made = std::process::Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .unwrap();
+    assert!(made.success());
+    let out = tempfile::TempDir::new().unwrap();
+    pseudofy()
+        .args(["run", "--project"])
+        .arg(dir.path())
+        .arg("--out")
+        .arg(out.path())
+        .timeout(std::time::Duration::from_secs(10))
+        .assert()
+        .failure()
+        .stderr(contains(format!("cannot read {relative}")));
+}
+
+#[cfg(unix)]
+#[test]
+fn run_fails_at_once_when_the_key_is_a_fifo() {
+    run_with_fifo_at("secrets/pseudofy.key");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_fails_at_once_when_the_config_is_a_fifo() {
+    run_with_fifo_at("config/pseudofy.toml");
+}
+
+#[test]
+fn run_gives_no_copy_for_csv_in_hidden_directories_or_hidden_files() {
+    let dir = other_files_project("");
+    write_at(dir.path(), ".hidden/a.csv", b"name\nZorbina Quenzel\n");
+    write_at(dir.path(), "sub/.deep/b.csv", b"name\nZorbina Quenzel\n");
+    write_at(dir.path(), ".dot.csv", b"name\nZorbina Quenzel\n");
+    let out = tempfile::TempDir::new().unwrap();
+    let output = run_output(dir.path(), out.path());
+    assert!(output.status.success());
+    assert!(out.path().join("data.csv").exists());
+    assert!(!out.path().join(".hidden").exists());
+    assert!(!out.path().join("sub/.deep").exists());
+    assert!(!out.path().join(".dot.csv").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn run_keeps_the_permissions_of_a_csv() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = other_files_project("");
+    let private = dir.path().join("data.csv");
+    std::fs::set_permissions(&private, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let out = tempfile::TempDir::new().unwrap();
+    run_project(dir.path(), out.path());
+    let mode = std::fs::metadata(out.path().join("data.csv"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[test]
+fn run_copies_a_csv_with_a_245_character_name() {
+    let dir = other_files_project("");
+    let name = format!("{}.csv", "c".repeat(245));
+    write_at(dir.path(), &name, b"name\nZorbina Quenzel\n");
+    let out = tempfile::TempDir::new().unwrap();
+    run_project(dir.path(), out.path());
+    let copy = std::fs::read_to_string(out.path().join(&name)).unwrap();
+    assert!(!copy.contains("Zorbina"), "{copy}");
+}
+
+#[cfg(unix)]
+#[test]
+fn run_warns_if_out_is_writable_by_other_users() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = other_files_project("");
+    let out = tempfile::TempDir::new().unwrap();
+    std::fs::set_permissions(out.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+    let output = run_output(dir.path(), out.path());
+    assert!(output.status.success());
+    assert!(
+        stderr_of(&output)
+            .lines()
+            .any(|l| l == "warning: --out is writable by other users")
+    );
+    std::fs::set_permissions(out.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = run_output(dir.path(), out.path());
+    assert!(!stderr_of(&output).contains("writable by other users"));
+}

@@ -1,7 +1,7 @@
 //! Project config in `config/pseudofy.toml`.
 
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{self, Read, Write};
 use std::path::Path;
 
 use anyhow::Context;
@@ -65,9 +65,37 @@ fn default_email_subdomains() -> bool {
     true
 }
 
-/// Load `config/pseudofy.toml`.
+/// Largest config file that `load` reads.
+const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+
+/// Read a regular file of at most `max` bytes as UTF-8 text. A FIFO, a
+/// directory, or a device is refused before it is opened, so it cannot block.
+/// The error carries no file content.
+pub(crate) fn read_limited(path: &Path, max: u64) -> io::Result<String> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).map_or(true, |len| len > max) {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "file too large"));
+    }
+    String::from_utf8(bytes).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "not UTF-8"))
+}
+
+/// Load `config/pseudofy.toml`: a regular file of at most 1 MiB.
 pub fn load(project: &Path) -> anyhow::Result<Config> {
-    let text = fs::read_to_string(project.join(CONFIG_FILE))
+    let text = read_limited(&project.join(CONFIG_FILE), MAX_CONFIG_BYTES)
         .with_context(|| format!("cannot read {CONFIG_FILE}"))?;
     toml::from_str(&text).with_context(|| format!("invalid {CONFIG_FILE}"))
 }
@@ -140,6 +168,22 @@ email = ["email"]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_must_be_a_small_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("config")).unwrap();
+        // A directory in place of the file.
+        fs::create_dir(dir.path().join(CONFIG_FILE)).unwrap();
+        assert!(load(dir.path()).is_err());
+        fs::remove_dir(dir.path().join(CONFIG_FILE)).unwrap();
+        // Too large.
+        let big = format!("language = \"en\"\n#{}\n", "x".repeat(1024 * 1024));
+        fs::write(dir.path().join(CONFIG_FILE), big).unwrap();
+        assert!(load(dir.path()).is_err());
+        fs::write(dir.path().join(CONFIG_FILE), "language = \"en\"\n").unwrap();
+        assert!(load(dir.path()).is_ok());
+    }
 
     #[test]
     fn created_config_loads() {
