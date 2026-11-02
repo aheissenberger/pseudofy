@@ -1,6 +1,7 @@
 //! Pseudonymize one CSV file.
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
@@ -17,6 +18,29 @@ use crate::known_names::KnownNames;
 use crate::pseudonym::Pseudonymizer;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// The largest CSV file that pseudofy reads (the file is held in memory).
+const MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read `input`. A file above `MAX_BYTES` is refused before and while it is
+/// read, so a file that grows during the read cannot pass.
+fn read_input(input: &Path, rel: &str) -> anyhow::Result<Vec<u8>> {
+    let unreadable = || format!("cannot read {rel}");
+    let too_large = || anyhow!("{rel}: file is larger than 256 MiB");
+    let file = fs::File::open(input).with_context(unreadable)?;
+    let size = file.metadata().with_context(unreadable)?.len();
+    if size > MAX_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(unreadable)?;
+    if u64::try_from(bytes.len()).is_ok_and(|len| len > MAX_BYTES) {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
 
 /// Result of the transformation of one file.
 struct Transformed {
@@ -44,7 +68,7 @@ pub fn collect(
     cells: &CellFns,
     known: &mut KnownNames,
 ) -> anyhow::Result<()> {
-    let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
+    let bytes = read_input(input, rel)?;
     let columns = collect_columns(rules);
     let mut collector = Collector::default();
     transform_encoded(
@@ -72,7 +96,7 @@ pub fn process(
     pseudonymizer: &mut Pseudonymizer,
     cells: &CellFns,
 ) -> anyhow::Result<CsvStats> {
-    let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
+    let bytes = read_input(input, rel)?;
     let columns = collect_columns(rules);
     let mut replace = |kind: Kind, value: &str| match kind {
         Kind::First => pseudonymizer.first_name(value),

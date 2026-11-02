@@ -6,6 +6,8 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
+use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 
 use anyhow::anyhow;
 use quick_xml::events::{BytesEnd, BytesStart, Event};
@@ -26,8 +28,7 @@ pub fn scrub(input: &[u8], output: &[u8]) -> anyhow::Result<Vec<u8>> {
         let mut file = archive.by_index(index).map_err(|_| bad())?;
         let name = file.name().to_owned();
         if name.starts_with("xl/worksheets/") && is_xml(&name) {
-            let mut xml = Vec::new();
-            file.read_to_end(&mut xml).map_err(|_| bad())?;
+            let xml = read_limited(&mut file).map_err(|_| bad())?;
             collect_used(&xml, &mut used).map_err(|_| bad())?;
         }
     }
@@ -45,12 +46,8 @@ pub fn scrub(input: &[u8], output: &[u8]) -> anyhow::Result<Vec<u8>> {
         };
         let replacement = restored.remove(&name);
         if name == SHARED_STRINGS {
-            let mut xml = Vec::new();
-            archive
-                .by_index(index)
-                .map_err(|_| bad())?
-                .read_to_end(&mut xml)
-                .map_err(|_| bad())?;
+            let xml =
+                read_limited(archive.by_index(index).map_err(|_| bad())?).map_err(|_| bad())?;
             let cleaned = blank_unused(&xml, &used).map_err(|_| bad())?;
             writer
                 .start_file(SHARED_STRINGS, options)
@@ -105,11 +102,7 @@ fn read_part<R: Read + std::io::Seek>(
     name: &str,
 ) -> Result<Option<Vec<u8>>, Failure> {
     match archive.by_name(name) {
-        Ok(mut file) => {
-            let mut bytes = Vec::new();
-            file.read_to_end(&mut bytes)?;
-            Ok(Some(bytes))
-        }
+        Ok(file) => Ok(Some(read_limited(file)?)),
         Err(zip::result::ZipError::FileNotFound) => Ok(None),
         Err(error) => Err(error.into()),
     }
@@ -219,20 +212,20 @@ fn restore_external_links<R: Read + std::io::Seek>(
     if ids.is_empty() {
         return Ok(parts);
     }
+    if ids.len() > MAX_RELATIONSHIPS {
+        return Err("too many external references".into());
+    }
     let out_workbook = read_part(output, WORKBOOK)?.ok_or("no workbook part")?;
     if has_element(&out_workbook, b"externalReferences")? {
         return Ok(parts);
     }
     let in_rels = read_part(&mut source, WORKBOOK_RELS)?.ok_or("no relationships")?;
-    let in_rels = relationships(&in_rels)?;
+    let in_rels = rel_map(&in_rels)?;
 
     // The link parts, in the order of the input.
     let mut link_parts = Vec::new();
     for id in &ids {
-        let (_, target) = in_rels
-            .iter()
-            .find(|(candidate, _)| candidate == id)
-            .ok_or("unknown relationship")?;
+        let target = in_rels.get(id).ok_or("unknown relationship")?;
         link_parts.push(link_part(target)?);
     }
     for part in &link_parts {
@@ -322,9 +315,17 @@ fn resolve_target(target: &str) -> Result<String, Failure> {
     Ok(segments.join("/"))
 }
 
-/// The sheets of a workbook as `(name, part)`, through its relationships.
-fn sheet_parts(workbook: &[u8], rels: &[u8]) -> Result<Vec<(String, String)>, Failure> {
-    let rels = relationships(rels)?;
+/// The relationship targets by id. The first of two equal ids wins.
+fn rel_map(rels: &[u8]) -> Result<HashMap<String, String>, Failure> {
+    let mut map = HashMap::new();
+    for (id, target) in relationships(rels)? {
+        map.entry(id).or_insert(target);
+    }
+    Ok(map)
+}
+
+/// The `<sheet>` entries of a workbook as `(name, relationship id)`.
+fn sheet_refs(workbook: &[u8]) -> Result<Vec<(String, String)>, Failure> {
     let mut reader = Reader::from_reader(workbook);
     let mut buf = Vec::new();
     let mut sheets = Vec::new();
@@ -333,17 +334,24 @@ fn sheet_parts(workbook: &[u8], rels: &[u8]) -> Result<Vec<(String, String)>, Fa
             Event::Start(start) | Event::Empty(start) if is_name(&start, b"sheet") => {
                 let name = attr(&start, b"name")?.ok_or("missing name")?;
                 let id = attr(&start, b"id")?.ok_or("missing id")?;
-                let (_, target) = rels
-                    .iter()
-                    .find(|(candidate, _)| *candidate == id)
-                    .ok_or("unknown relationship")?;
-                sheets.push((name, resolve_target(target)?));
+                sheets.push((name, id));
             }
             Event::Eof => return Ok(sheets),
             _ => {}
         }
         buf.clear();
     }
+}
+
+/// The sheets of a workbook as `(name, part)`, through its relationships.
+fn sheet_parts(workbook: &[u8], rels: &[u8]) -> Result<Vec<(String, String)>, Failure> {
+    let rels = rel_map(rels)?;
+    let mut sheets = Vec::new();
+    for (name, id) in sheet_refs(workbook)? {
+        let target = rels.get(&id).ok_or("unknown relationship")?;
+        sheets.push((name, resolve_target(target)?));
+    }
+    Ok(sheets)
 }
 
 /// The `xmlns:prefix` declarations of a start tag.
@@ -652,19 +660,22 @@ fn restore_sparklines<R: Read + std::io::Seek>(
 ) -> Result<HashMap<String, Vec<u8>>, Failure> {
     let mut parts = HashMap::new();
     let mut source = ZipArchive::new(Cursor::new(input))?;
-    // Input parts that have a sparkline `<ext>`.
-    let mut found: Vec<(String, Vec<u8>)> = Vec::new();
+    // Input parts that have a sparkline `<ext>`, by normalized name, and the
+    // normalized names of all input parts.
+    let mut found: HashMap<String, Vec<u8>> = HashMap::new();
+    let mut present: HashSet<String> = HashSet::new();
     for index in 0..source.len() {
-        let mut file = source.by_index(index)?;
-        let name = file.name().to_owned();
+        let file = source.by_index(index)?;
+        let name = fold(file.name());
         if file.is_dir() || !is_xml(&name) {
+            present.insert(name);
             continue;
         }
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
+        let bytes = read_limited(file)?;
         if contains(&bytes, SPARKLINE_URI.as_bytes()) && !sparkline_exts(&bytes, "")?.is_empty() {
-            found.push((name, bytes));
+            found.insert(name.clone(), bytes);
         }
+        present.insert(name);
     }
     if found.is_empty() {
         return Ok(parts);
@@ -673,18 +684,19 @@ fn restore_sparklines<R: Read + std::io::Seek>(
     let in_rels = read_part(&mut source, WORKBOOK_RELS)?.ok_or("no relationships")?;
     let out_workbook = read_part(output, WORKBOOK)?.ok_or("no workbook part")?;
     let out_rels = read_part(output, WORKBOOK_RELS)?.ok_or("no relationships")?;
-    let targets = sheet_parts(&out_workbook, &out_rels)?;
+    let mut targets: HashMap<String, String> = HashMap::new();
+    for (name, part) in sheet_parts(&out_workbook, &out_rels)? {
+        targets.entry(name).or_insert(part);
+    }
     for (name, part) in sheet_parts(&in_workbook, &in_rels)? {
-        let Some((_, sheet)) = found.iter().find(|(candidate, _)| *candidate == part) else {
-            if read_part(&mut source, &part)?.is_none() {
+        let part = fold(&part);
+        let Some(sheet) = found.get(&part) else {
+            if !present.contains(&part) {
                 return Err("missing sheet part".into());
             }
             continue;
         };
-        let (_, out_part) = targets
-            .iter()
-            .find(|(candidate, _)| *candidate == name)
-            .ok_or("no sheet in the copy")?;
+        let out_part = targets.get(&name).ok_or("no sheet in the copy")?;
         let out_sheet = read_part(output, out_part)?.ok_or("missing sheet part")?;
         let qual = root_qualifier(&out_sheet)?;
         let exts = sparkline_exts(sheet, &qual)?;
@@ -799,6 +811,388 @@ fn skip_to_end(reader: &mut Reader<&[u8]>) -> Result<(), Failure> {
     }
 }
 
+// ---- Package check (spec 0017) ----
+
+const MAX_ENTRIES: usize = 10_000;
+const MAX_RELATIONSHIPS: usize = 10_000;
+const MAX_DEPTH: usize = 16;
+const MAX_BYTES: u64 = 512 * 1024 * 1024;
+/// Limit for the work of the case-insensitive part lookups of the crate
+/// (entries scanned in total).
+const MAX_SLOW_LOOKUPS: u64 = 5_000_000;
+
+const UNREADABLE: &str = "cannot read the workbook";
+const PIVOT: &str = "workbook has pivot tables; not supported";
+const TOO_LARGE: &str = "workbook is too large";
+const CYCLE: &str = "workbook has a relationship cycle";
+const TOO_DEEP: &str = "workbook has relationships nested too deeply";
+
+/// Normalized part name: `\` becomes `/`, ASCII lowercase.
+fn fold(name: &str) -> String {
+    name.replace('\\', "/").to_ascii_lowercase()
+}
+
+/// Read `reader` up to `MAX_BYTES`. A longer stream is an error.
+fn read_limited(reader: impl Read) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    reader.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if u64::try_from(bytes.len()).is_ok_and(|len| len > MAX_BYTES) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "part is too large",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// True if the name (normalized) is below the pivot cache or pivot table folder.
+fn is_pivot_name(name: &str) -> bool {
+    let name = fold(name);
+    let name = name.trim_start_matches(['/', '.']);
+    name.starts_with("xl/pivotcache/") || name.starts_with("xl/pivottables/")
+}
+
+/// True if the package has a pivot cache or a pivot table part.
+pub fn has_pivot_entries(package: &[u8]) -> bool {
+    ZipArchive::new(Cursor::new(package))
+        .is_ok_and(|archive| archive.file_names().any(is_pivot_name))
+}
+
+fn pivot_type(rel_type: &str) -> bool {
+    let lower = rel_type.to_ascii_lowercase();
+    ["/pivottable", "/pivotcachedefinition", "/pivotcacherecords"]
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
+}
+
+fn pivot_content_type(content_type: &str) -> bool {
+    let lower = content_type.to_ascii_lowercase();
+    ["pivottable+", "pivotcachedefinition+", "pivotcacherecords+"]
+        .iter()
+        .any(|word| lower.contains(word))
+}
+
+/// `umya-spreadsheet` normalization of a path (`.` and `..` resolved).
+fn normalize_path(path: &str) -> String {
+    let mut out = PathBuf::new();
+    for component in Path::new(path).components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                out.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+        }
+    }
+    out.to_str().unwrap_or("").replace('\\', "/")
+}
+
+/// The join of `umya-spreadsheet`: `target` below `base`, or from the root
+/// if it starts with `/`.
+fn join_paths(base: &str, target: &str) -> String {
+    match target.split_once('/') {
+        Some(("", rest)) => normalize_path(rest),
+        _ => normalize_path(&format!("{base}/{target}")),
+    }
+}
+
+/// The folder part and the file part of a part name.
+fn split_part(part: &str) -> (&str, &str) {
+    part.rsplit_once('/').unwrap_or(("", part))
+}
+
+struct Rel {
+    kind: String,
+    target: String,
+    external: bool,
+}
+
+/// The relationships of a `.rels` part. More than `limit` is an error.
+fn rel_entries(xml: &[u8], limit: usize) -> Result<Vec<Rel>, &'static str> {
+    let parse = || -> Result<Vec<Rel>, Failure> {
+        let mut reader = Reader::from_reader(xml);
+        let mut buf = Vec::new();
+        let mut found = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf)? {
+                Event::Start(start) | Event::Empty(start) if is_name(&start, b"Relationship") => {
+                    if found.len() >= limit {
+                        return Err(TOO_LARGE.into());
+                    }
+                    found.push(Rel {
+                        kind: attr(&start, b"Type")?.unwrap_or_default(),
+                        target: attr(&start, b"Target")?.unwrap_or_default(),
+                        external: attr(&start, b"TargetMode")?.as_deref() == Some("External"),
+                    });
+                }
+                Event::Eof => return Ok(found),
+                _ => {}
+            }
+            buf.clear();
+        }
+    };
+    parse().map_err(|error| {
+        if error.to_string() == TOO_LARGE {
+            TOO_LARGE
+        } else {
+            UNREADABLE
+        }
+    })
+}
+
+/// True if a content type of `[Content_Types].xml` is a pivot type.
+fn has_pivot_content_type(xml: &[u8]) -> Result<bool, &'static str> {
+    let scan = || -> Result<bool, Failure> {
+        let mut reader = Reader::from_reader(xml);
+        let mut buf = Vec::new();
+        loop {
+            match reader.read_event_into(&mut buf)? {
+                Event::Start(start) | Event::Empty(start) => {
+                    if let Some(kind) = attr(&start, b"ContentType")?
+                        && pivot_content_type(&kind)
+                    {
+                        return Ok(true);
+                    }
+                }
+                Event::Eof => return Ok(false),
+                _ => {}
+            }
+            buf.clear();
+        }
+    };
+    scan().map_err(|_| UNREADABLE)
+}
+
+/// The package with the part lookup of `umya-spreadsheet`.
+struct Package<'a> {
+    archive: ZipArchive<Cursor<&'a [u8]>>,
+    exact: HashMap<String, usize>,
+    folded: HashMap<String, usize>,
+    sizes: Vec<u64>,
+    /// Entries scanned by lookups that need the slow path of the crate.
+    slow: u64,
+    /// Parts that were counted once.
+    seen: HashSet<usize>,
+    /// Bytes of all parts, plus one more time per repeated reference.
+    total: u64,
+    rels: HashMap<usize, Rc<Vec<Rel>>>,
+    parsed: usize,
+    visited: usize,
+}
+
+impl<'a> Package<'a> {
+    fn open(package: &'a [u8]) -> Result<(Self, Vec<String>), &'static str> {
+        let mut archive = ZipArchive::new(Cursor::new(package)).map_err(|_| UNREADABLE)?;
+        if archive.len() > MAX_ENTRIES {
+            return Err(TOO_LARGE);
+        }
+        if archive.file_names().any(is_pivot_name) {
+            return Err(PIVOT);
+        }
+        let mut exact = HashMap::new();
+        let mut folded = HashMap::new();
+        let mut sizes = Vec::new();
+        let mut names = Vec::new();
+        let mut budget = MAX_BYTES;
+        for index in 0..archive.len() {
+            let file = archive.by_index(index).map_err(|_| UNREADABLE)?;
+            let name = file.name().to_owned();
+            // The real size counts, not the declared one.
+            let used = std::io::copy(&mut file.take(budget + 1), &mut std::io::sink())
+                .map_err(|_| UNREADABLE)?;
+            if used > budget {
+                return Err(TOO_LARGE);
+            }
+            budget -= used;
+            sizes.push(used);
+            folded.entry(fold(&name)).or_insert(index);
+            exact.entry(name.clone()).or_insert(index);
+            names.push(name);
+        }
+        let package = Package {
+            archive,
+            exact,
+            folded,
+            sizes,
+            slow: 0,
+            seen: HashSet::new(),
+            total: MAX_BYTES - budget,
+            rels: HashMap::new(),
+            parsed: 0,
+            visited: 0,
+        };
+        Ok((package, names))
+    }
+
+    /// The entry that `umya-spreadsheet` finds for `name`.
+    fn find(&mut self, name: &str) -> Result<Option<usize>, &'static str> {
+        if let Some(index) = self.exact.get(name) {
+            return Ok(Some(*index));
+        }
+        if let Some(index) = self.exact.get(&name.replace('/', "\\")) {
+            return Ok(Some(*index));
+        }
+        self.slow += u64::try_from(self.sizes.len()).unwrap_or(u64::MAX);
+        if self.slow > MAX_SLOW_LOOKUPS {
+            return Err(TOO_LARGE);
+        }
+        Ok(self.folded.get(&fold(name)).copied())
+    }
+
+    /// Count a reference to the part. A repeated reference adds its size again.
+    fn count(&mut self, index: usize) -> Result<(), &'static str> {
+        if !self.seen.insert(index) {
+            self.total += self.sizes.get(index).copied().unwrap_or(0);
+            if self.total > MAX_BYTES {
+                return Err(TOO_LARGE);
+            }
+        }
+        Ok(())
+    }
+
+    fn read(&mut self, index: usize) -> Result<Vec<u8>, &'static str> {
+        let file = self.archive.by_index(index).map_err(|_| UNREADABLE)?;
+        read_limited(file).map_err(|_| TOO_LARGE)
+    }
+
+    fn rels_of(&mut self, index: usize) -> Result<Rc<Vec<Rel>>, &'static str> {
+        if let Some(list) = self.rels.get(&index) {
+            return Ok(Rc::clone(list));
+        }
+        let xml = self.read(index)?;
+        let list = rel_entries(&xml, MAX_RELATIONSHIPS - self.parsed)?;
+        self.parsed += list.len();
+        let list = Rc::new(list);
+        self.rels.insert(index, Rc::clone(&list));
+        Ok(list)
+    }
+
+    /// Follow the relationships of `part` like the crate does: the rels part
+    /// is `<folder>/_rels/<file>.rels`, a target is joined to the folder of
+    /// `part`. Each reference counts, as the crate has no visited set.
+    fn walk(
+        &mut self,
+        part: &str,
+        depth: usize,
+        on_path: &mut HashSet<String>,
+    ) -> Result<(), &'static str> {
+        let (folder, file) = split_part(part);
+        let rels_name = join_paths(folder, &format!("_rels/{file}.rels"));
+        let Some(rels_index) = self.find(&rels_name)? else {
+            return Ok(());
+        };
+        if depth > MAX_DEPTH {
+            return Err(TOO_DEEP);
+        }
+        self.count(rels_index)?;
+        let list = self.rels_of(rels_index)?;
+        let key = fold(part);
+        on_path.insert(key.clone());
+        for rel in list.iter().filter(|rel| !rel.external) {
+            self.visit(folder, &rel.target, depth + 1, on_path)?;
+        }
+        on_path.remove(&key);
+        Ok(())
+    }
+
+    fn visit(
+        &mut self,
+        folder: &str,
+        target: &str,
+        depth: usize,
+        on_path: &mut HashSet<String>,
+    ) -> Result<(), &'static str> {
+        self.visited += 1;
+        if self.visited > MAX_RELATIONSHIPS {
+            return Err(TOO_LARGE);
+        }
+        let child = join_paths(folder, target);
+        if let Some(index) = self.find(&child)? {
+            self.count(index)?;
+        }
+        if on_path.contains(&fold(&child)) {
+            return Err(CYCLE);
+        }
+        self.walk(&child, depth, on_path)
+    }
+}
+
+fn check(package: &[u8]) -> Result<(), &'static str> {
+    let (mut pkg, names) = Package::open(package)?;
+    // Pivot relationship types and content types, in each rels part.
+    for (index, name) in names.iter().enumerate() {
+        if Path::new(name)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("rels"))
+        {
+            let list = pkg.rels_of(index)?;
+            if list.iter().any(|rel| pivot_type(&rel.kind)) {
+                return Err(PIVOT);
+            }
+        }
+    }
+    if let Some(index) = pkg.find(CONTENT_TYPES)? {
+        let xml = pkg.read(index)?;
+        if has_pivot_content_type(&xml)? {
+            return Err(PIVOT);
+        }
+    }
+    // The relationship graph, from the workbook.
+    let rels_index = pkg.find(WORKBOOK_RELS)?.ok_or(UNREADABLE)?;
+    let list = pkg.rels_of(rels_index)?;
+    let mut on_path = HashSet::new();
+    for rel in list.iter().filter(|rel| !rel.external) {
+        let target = rel.target.strip_prefix("/xl/").unwrap_or(&rel.target);
+        pkg.visit("xl", target, 1, &mut on_path)?;
+    }
+    Ok(())
+}
+
+/// Check the input package before `umya-spreadsheet` reads it: pivot parts
+/// (also under other names), the number of parts, their real sizes, and the
+/// relationship graph (no cycle, depth, count). Error texts name the reason
+/// only, never part contents.
+pub fn check_package(package: &[u8]) -> anyhow::Result<()> {
+    check(package).map_err(|reason| anyhow!(reason))
+}
+
+/// The normalized part names of the sheets that the workbook lists.
+/// Empty if the workbook or its relationships cannot be read.
+fn listed_sheets(archive: &mut ZipArchive<Cursor<&[u8]>>) -> HashSet<String> {
+    let mut workbook = None;
+    let mut rels = None;
+    for index in 0..archive.len() {
+        let Ok(file) = archive.by_index_raw(index) else {
+            continue;
+        };
+        match fold(file.name()).as_str() {
+            "xl/workbook.xml" => workbook = workbook.or(Some(index)),
+            "xl/_rels/workbook.xml.rels" => rels = rels.or(Some(index)),
+            _ => {}
+        }
+    }
+    let mut read = |index: Option<usize>| -> Option<Vec<u8>> {
+        read_limited(archive.by_index(index?).ok()?).ok()
+    };
+    let (Some(workbook), Some(rels)) = (read(workbook), read(rels)) else {
+        return HashSet::new();
+    };
+    let listed = || -> Result<HashSet<String>, Failure> {
+        let targets = rel_map(&rels)?;
+        let mut parts = HashSet::new();
+        for (_, id) in sheet_refs(&workbook)? {
+            if let Some(target) = targets.get(&id) {
+                let target = target.strip_prefix("/xl/").unwrap_or(target);
+                parts.insert(fold(&join_paths("xl", target)));
+            }
+        }
+        Ok(parts)
+    };
+    listed().unwrap_or_default()
+}
+
 /// What `inspect` finds in an input package.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Inspection {
@@ -816,19 +1210,22 @@ struct SheetFlags {
     conditional: bool,
 }
 
-/// Inspect the input package: unsupported layouts and unprocessed parts.
-/// Error texts never contain part contents.
+/// Inspect a package: unsupported layouts and unprocessed parts. Part names
+/// are compared by their normalized form. The checks for data loss run on the
+/// input package, the warnings on the package that `umya-spreadsheet` wrote
+/// (canonical part names). Error texts never contain part contents.
 pub fn inspect(package: &[u8]) -> anyhow::Result<Inspection> {
     let bad = || anyhow!("cannot inspect the workbook package");
     let mut archive = ZipArchive::new(Cursor::new(package)).map_err(|_| bad())?;
+    let listed = listed_sheets(&mut archive);
     let mut comments = false;
     let mut charts = false;
     let mut flags = SheetFlags::default();
     let mut unsupported = false;
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|_| bad())?;
-        let name = file.name().to_owned();
-        if name.starts_with("xl/threadedComments/")
+        let name = fold(file.name());
+        if name.starts_with("xl/threadedcomments/")
             || (name.starts_with("xl/comments") && is_xml(&name))
         {
             comments = true;
@@ -836,15 +1233,13 @@ pub fn inspect(package: &[u8]) -> anyhow::Result<Inspection> {
         if name.starts_with("xl/charts/") {
             charts = true;
         }
-        if name == SHARED_STRINGS {
-            let mut xml = Vec::new();
-            file.read_to_end(&mut xml).map_err(|_| bad())?;
+        if name == SHARED_STRINGS.to_ascii_lowercase() {
+            let xml = read_limited(&mut file).map_err(|_| bad())?;
             if root_has_prefix(&xml).map_err(|_| bad())? {
                 unsupported = true;
             }
-        } else if name.starts_with("xl/worksheets/") && is_xml(&name) {
-            let mut xml = Vec::new();
-            file.read_to_end(&mut xml).map_err(|_| bad())?;
+        } else if (name.starts_with("xl/worksheets/") && is_xml(&name)) || listed.contains(&name) {
+            let xml = read_limited(&mut file).map_err(|_| bad())?;
             unsupported |= scan_sheet(&xml, &mut flags).map_err(|_| bad())?;
         }
     }
@@ -1669,5 +2064,199 @@ mod tests {
         let out = scrub(&input, &output).unwrap();
         assert!(part(&out, WORKBOOK).contains("<externalReferences>"));
         assert!(part(&out, "xl/worksheets/sheet1.xml").contains("<x14:sparkline>"));
+    }
+
+    // ---- Package check (spec 0017) ----
+
+    fn rels(items: &[(&str, &str)]) -> String {
+        use std::fmt::Write as _;
+        let mut text = String::from(r#"<Relationships xmlns="urn:r">"#);
+        for (index, (kind, target)) in items.iter().enumerate() {
+            write!(
+                text,
+                r#"<Relationship Id="rId{}" Type="http://x/relationships/{kind}" Target="{target}"/>"#,
+                index + 1
+            )
+            .unwrap();
+        }
+        text + "</Relationships>"
+    }
+
+    /// A package with a workbook relationship part for `items` and `more` parts.
+    fn graph(items: &[(&str, &str)], more: &[(String, String)]) -> Vec<u8> {
+        let workbook_rels = rels(items);
+        let mut parts: Vec<(&str, &str)> = vec![
+            (CONTENT_TYPES, OUT_TYPES),
+            (WORKBOOK, "<workbook/>"),
+            (WORKBOOK_RELS, &workbook_rels),
+        ];
+        parts.extend(more.iter().map(|(n, b)| (n.as_str(), b.as_str())));
+        plain_package(&parts)
+    }
+
+    fn refused(package: &[u8]) -> String {
+        check_package(package).unwrap_err().to_string()
+    }
+
+    #[test]
+    fn ordinary_package_passes_the_check() {
+        let sheet_rels = rels(&[("drawing", "../drawings/d1.xml"), ("hyperlink", "mailto:x")]);
+        let drawing_rels = rels(&[("chart", "../charts/c1.xml")]);
+        let more = [
+            ("xl/worksheets/sheet1.xml".to_owned(), "<w/>".to_owned()),
+            ("xl/worksheets/_rels/sheet1.xml.rels".to_owned(), sheet_rels),
+            ("xl/drawings/d1.xml".to_owned(), "<d/>".to_owned()),
+            ("xl/drawings/_rels/d1.xml.rels".to_owned(), drawing_rels),
+            ("xl/charts/c1.xml".to_owned(), "<c/>".to_owned()),
+        ];
+        let package = graph(&[("worksheet", "worksheets/sheet1.xml")], &more);
+        check_package(&package).unwrap();
+    }
+
+    #[test]
+    fn pivot_names_are_found_after_normalization() {
+        for name in [
+            "xl/pivotCache/a.xml",
+            "xl/PivotCache/a.xml",
+            "xl\\pivotCache\\a.xml",
+            "XL/PIVOTTABLES/a.xml",
+        ] {
+            let package = graph(&[], &[(name.to_owned(), "<x/>".to_owned())]);
+            assert_eq!(refused(&package), PIVOT, "{name}");
+            assert!(has_pivot_entries(&package), "{name}");
+        }
+        assert!(!has_pivot_entries(&graph(&[], &[])));
+        assert!(!has_pivot_entries(b"not a zip"));
+    }
+
+    #[test]
+    fn pivot_relationship_and_content_types_are_found() {
+        for kind in ["pivotTable", "pivotCacheDefinition", "pivotCacheRecords"] {
+            let package = graph(&[(kind, "data/p.xml")], &[]);
+            assert_eq!(refused(&package), PIVOT, "{kind}");
+        }
+        let types = r#"<Types xmlns="urn:t"><Override PartName="/xl/p.xml" ContentType="application/vnd.x.pivotCacheRecords+xml"/></Types>"#;
+        let package = plain_package(&[
+            (CONTENT_TYPES, types),
+            (WORKBOOK_RELS, &rels(&[("worksheet", "w.xml")])),
+        ]);
+        assert_eq!(refused(&package), PIVOT);
+    }
+
+    #[test]
+    fn cycles_are_found_with_the_lookup_of_the_crate() {
+        let own = rels(&[("worksheet", "sheet1.xml")]);
+        let more = [
+            ("xl/worksheets/sheet1.xml".to_owned(), "<w/>".to_owned()),
+            ("xl/worksheets/_rels/sheet1.xml.rels".to_owned(), own),
+        ];
+        let package = graph(&[("worksheet", "worksheets/sheet1.xml")], &more);
+        assert_eq!(refused(&package), CYCLE);
+
+        // Other case and other folder spelling: the same part for the crate.
+        let own = rels(&[("worksheet", "../Worksheets/./SHEET1.xml")]);
+        let more = [
+            ("xl/worksheets/sheet1.xml".to_owned(), "<w/>".to_owned()),
+            ("xl/worksheets/_rels/sheet1.xml.rels".to_owned(), own),
+        ];
+        let package = graph(&[("worksheet", "worksheets/sheet1.xml")], &more);
+        assert_eq!(refused(&package), CYCLE);
+    }
+
+    /// Parts p0..p{count-1}; each has two relationships to the next one.
+    fn fan_out(count: usize) -> Vec<(String, String)> {
+        let mut parts = Vec::new();
+        for index in 0..count {
+            parts.push((format!("xl/p{index}.xml"), "<x/>".to_owned()));
+            let next = format!("p{}.xml", index + 1);
+            parts.push((
+                format!("xl/_rels/p{index}.xml.rels"),
+                rels(&[("worksheet", &next), ("worksheet", &next)]),
+            ));
+        }
+        parts
+    }
+
+    #[test]
+    fn fan_out_is_limited_by_depth_and_by_count() {
+        let start = std::time::Instant::now();
+        let package = graph(&[("worksheet", "p0.xml")], &fan_out(40));
+        assert_eq!(refused(&package), TOO_DEEP);
+        let package = graph(&[("worksheet", "p0.xml")], &fan_out(14));
+        assert_eq!(refused(&package), TOO_LARGE);
+        let package = graph(&[("worksheet", "p0.xml")], &fan_out(8));
+        check_package(&package).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn too_many_entries_and_relationships_are_refused() {
+        let more: Vec<(String, String)> = (0..MAX_ENTRIES)
+            .map(|index| (format!("xl/m{index}.bin"), String::new()))
+            .collect();
+        assert_eq!(refused(&graph(&[], &more)), TOO_LARGE);
+
+        let many: Vec<(&str, &str)> = (0..=MAX_RELATIONSHIPS)
+            .map(|_| ("image", "a.png"))
+            .collect();
+        assert_eq!(refused(&graph(&many, &[])), TOO_LARGE);
+    }
+
+    #[test]
+    fn each_reference_to_a_part_counts_its_size() {
+        let big = ("xl/big.bin".to_owned(), " ".repeat(1024 * 1024));
+        let many: Vec<(&str, &str)> = (0..600).map(|_| ("image", "big.bin")).collect();
+        let package = graph(&many, std::slice::from_ref(&big));
+        assert!(package.len() < 100_000, "the test package is small");
+        assert_eq!(refused(&package), TOO_LARGE);
+        let few: Vec<(&str, &str)> = (0..3).map(|_| ("image", "big.bin")).collect();
+        check_package(&graph(&few, &[big])).unwrap();
+    }
+
+    #[test]
+    fn errors_name_the_reason_only() {
+        assert_eq!(refused(b"not a zip"), UNREADABLE);
+        // No workbook relationships: the crate cannot read it either.
+        assert_eq!(refused(&plain_package(&[(WORKBOOK, "<w/>")])), UNREADABLE);
+    }
+
+    #[test]
+    fn inspect_compares_normalized_names() {
+        let sheet = "<worksheet><headerFooter><oddHeader>&amp;LInvented</oddHeader></headerFooter></worksheet>";
+        let multi = r#"<worksheet><sheetData><row><c t="inlineStr"><is><r><t>A</t></r><r><t>B</t></r></is></c></row></sheetData></worksheet>"#;
+        for name in ["xl/Worksheets/sheet1.xml", "xl\\worksheets\\sheet1.xml"] {
+            let found = inspect(&plain_package(&[(name, sheet)])).unwrap();
+            assert_eq!(found.kinds, ["headers/footers"], "{name}");
+            let found = inspect(&plain_package(&[(name, multi)])).unwrap();
+            assert!(found.unsupported, "{name}");
+        }
+        let prefixed = r#"<x:sst xmlns:x="urn:x"><x:si><x:t>A</x:t></x:si></x:sst>"#;
+        let found = inspect(&plain_package(&[("xl/SharedStrings.xml", prefixed)])).unwrap();
+        assert!(found.unsupported);
+        let found = inspect(&plain_package(&[("XL/Comments1.xml", "<c/>")])).unwrap();
+        assert_eq!(found.kinds, ["comments"]);
+    }
+
+    #[test]
+    fn inspect_finds_sheets_through_the_workbook_relationships() {
+        let workbook = r#"<workbook xmlns:r="urn:r"><sheets><sheet name="A" sheetId="1" r:id="rId1"/></sheets></workbook>"#;
+        let sheet = "<worksheet><headerFooter><oddFooter>&amp;LInvented</oddFooter></headerFooter></worksheet>";
+        let package = plain_package(&[
+            (WORKBOOK, workbook),
+            (WORKBOOK_RELS, &rels(&[("worksheet", "data/s.xml")])),
+            ("xl/data/s.xml", sheet),
+        ]);
+        let found = inspect(&package).unwrap();
+        assert_eq!(found.kinds, ["headers/footers"]);
+    }
+
+    #[test]
+    fn many_external_references_are_refused() {
+        let references = r#"<externalReference r:id="rId1"/>"#.repeat(MAX_RELATIONSHIPS + 1);
+        let workbook = format!(
+            r#"<workbook xmlns="urn:m" xmlns:r="urn:r"><sheets/><externalReferences>{references}</externalReferences></workbook>"#
+        );
+        let input = plain_package(&[(WORKBOOK, &workbook), (WORKBOOK_RELS, IN_RELS)]);
+        assert!(scrub(&input, &plain_output(OUT_WORKBOOK)).is_err());
     }
 }
