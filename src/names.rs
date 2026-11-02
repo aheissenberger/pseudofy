@@ -61,6 +61,19 @@ mod tests {
     }
 
     #[test]
+    fn names_encode_to_windows_1252_without_loss() {
+        for language in [Language::De, Language::En] {
+            let lists = lists(language);
+            for name in lists.first.iter().chain(lists.last.iter()) {
+                let (bytes, _, unmappable) = encoding_rs::WINDOWS_1252.encode(name);
+                assert!(!unmappable, "entry {name} is not Windows-1252");
+                let (back, _) = encoding_rs::WINDOWS_1252.decode_without_bom_handling(&bytes);
+                assert_eq!(&*back, *name);
+            }
+        }
+    }
+
+    #[test]
     fn parse_skips_comments_and_empty_lines() {
         assert_eq!(parse("# c\n\nAnna\n  Ben \n"), vec!["Anna", "Ben"]);
     }
