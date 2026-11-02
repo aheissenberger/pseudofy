@@ -19,7 +19,7 @@
 
 - `.github/workflows/ci.yml` — on push and pull request, run `./scripts/check` in the devcontainer with `devcontainers/ci`.
 - `.github/workflows/release.yml` — on tag `v*`, run on a macOS arm64 runner. Build `cargo build --release --locked --target aarch64-apple-darwin`.
-- Release asset `pseudofy-<version>-aarch64-apple-darwin.tar.gz` and its `.sha256` file.
+- Release asset `pseudofy-<version>-aarch64-apple-darwin.tar.gz` and its `.sha256` file. The binary `pseudofy` is at the root of the tarball.
 
 ### Modified
 
@@ -33,7 +33,7 @@
 
 - Intel Macs (`x86_64-apple-darwin`), Linux and Windows release binaries.
 - Apple Developer ID signing and notarization.
-- Homebrew formula.
+- Homebrew formula (`docs/specs/0008-homebrew-formula.md`).
 
 ## 3. Architectural Rules & Invariants
 

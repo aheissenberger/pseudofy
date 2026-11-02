@@ -32,6 +32,7 @@ The README must state this limit.
 13. `pseudofy init` writes the system language into the config. If no list exists for that language, `init` uses `en` and warns.
 14. GitHub Actions builds the macOS binary for Apple Silicon (`aarch64-apple-darwin`).
 15. The source is in a public GitHub repository.
+17. Homebrew installs pseudofy on an Apple Silicon Mac from the tap `aheissenberger/tools`.
 
 ## 3. Terms
 
@@ -53,6 +54,7 @@ The README must state this limit.
 | `docs/specs/0003-xlsx-support.md` | XLSX files |
 | `docs/specs/0004-known-names-in-free-text.md` | Known names in text cells outside the name columns |
 | `docs/specs/0005-ci-and-macos-release.md` | GitHub Actions checks and macOS release binary |
+| `docs/specs/0008-homebrew-formula.md` | Homebrew formula in the tap `aheissenberger/homebrew-tools` |
 
 ## 5. Later work (no spec yet)
 
@@ -67,3 +69,4 @@ The README must state this limit.
 - `docs/adr/0003-derive-pseudonyms-with-a-keyed-hash.md`
 - `docs/adr/0004-initial-crate-set.md`
 - `docs/adr/0005-build-releases-in-github-actions.md`
+- `docs/adr/0008-distribute-on-macos-with-the-homebrew-tools-tap.md`

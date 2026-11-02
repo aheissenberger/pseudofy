@@ -47,43 +47,43 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] pseudofy never writes to an input file. If `--out` is inside `--project` and not excluded, `run` fails.
-- [ ] `run` skips `secrets/`, `config/`, and `--out` during the file search.
-- [ ] pseudofy never prints, logs, or writes the project key or a real value.
-- [ ] File and directory names are not real values in this spec. `run` copies them to `--out` unchanged. Messages can show the relative path.
-- [ ] Equal normalized real values give equal pseudonyms in all files.
-- [ ] A pseudonym is never equal to its real value.
-- [ ] If `email_subdomains` is `false`, each fake email is `<first>.<last>@example.com`.
-- [ ] If `email_subdomains` is `true`, each fake email is `<first>.<last>@<label>.example.com`.
-- [ ] Each fake email is ASCII and valid.
-- [ ] `<first>.<last>` comes from the `email` pseudonym of the full address. `<label>` comes from the `domain` pseudonym of the real domain.
-- [ ] `<label>` is a pronounceable DNS label of 6 to 10 lowercase letters. It is made from the HMAC output.
-- [ ] Equal real domains (case-insensitive) give one label. Different real domains give different labels, unless `run` reports a collision.
-- [ ] The email local part transliterates German letters: `ä`→`ae`, `ö`→`oe`, `ü`→`ue`, `ß`→`ss`.
-- [ ] `run` reads the language only from the config. `run` never reads the system language.
-- [ ] `run` replaces emails in each cell of each column, not only in `email` columns.
-- [ ] The output keeps row count, column count, header, delimiter, and line ending.
-- [ ] Tests use only invented data and temporary directories.
+- [x] pseudofy never writes to an input file. If `--out` is inside `--project` and not excluded, `run` fails.
+- [x] `run` skips `secrets/`, `config/`, and `--out` during the file search.
+- [x] pseudofy never prints, logs, or writes the project key or a real value.
+- [x] File and directory names are not real values in this spec. `run` copies them to `--out` unchanged. Messages can show the relative path.
+- [x] Equal normalized real values give equal pseudonyms in all files.
+- [x] A pseudonym is never equal to its real value.
+- [x] If `email_subdomains` is `false`, each fake email is `<first>.<last>@example.com`.
+- [x] If `email_subdomains` is `true`, each fake email is `<first>.<last>@<label>.example.com`.
+- [x] Each fake email is ASCII and valid.
+- [x] `<first>.<last>` comes from the `email` pseudonym of the full address. `<label>` comes from the `domain` pseudonym of the real domain.
+- [x] `<label>` is a pronounceable DNS label of 6 to 10 lowercase letters. It is made from the HMAC output.
+- [x] Equal real domains (case-insensitive) give one label. Different real domains give different labels, unless `run` reports a collision.
+- [x] The email local part transliterates German letters: `ä`→`ae`, `ö`→`oe`, `ü`→`ue`, `ß`→`ss`.
+- [x] `run` reads the language only from the config. `run` never reads the system language.
+- [x] `run` replaces emails in each cell of each column, not only in `email` columns.
+- [x] The output keeps row count, column count, header, delimiter, and line ending.
+- [x] Tests use only invented data and temporary directories.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] A name in two files gets the same pseudonym. `Anna` in `first_name` and `Anna Muster` in `full_name` share the first-name pseudonym.
-- [ ] Two runs with one key give byte-equal output. Two keys give different output.
-- [ ] With `email_subdomains = false`, `a@acme.test` and `c@other.test` both get the domain `example.com`.
-- [ ] Without `email_subdomains`, `a@acme.test` and `b@ACME.test` get one fake subdomain. `c@other.test` gets a different fake subdomain.
-- [ ] `run` without `secrets/pseudofy.key` exits with a non-zero code and tells the user to run `pseudofy init`.
-- [ ] `run` prints the number of files, replaced values, and detected collisions.
-- [ ] `init` on a system with language `fr` writes `language = "en"` and prints a warning.
-- [ ] `init --language de` writes `language = "de"` and ignores the system language.
+- [x] A name in two files gets the same pseudonym. `Anna` in `first_name` and `Anna Muster` in `full_name` share the first-name pseudonym.
+- [x] Two runs with one key give byte-equal output. Two keys give different output.
+- [x] With `email_subdomains = false`, `a@acme.test` and `c@other.test` both get the domain `example.com`.
+- [x] Without `email_subdomains`, `a@acme.test` and `b@ACME.test` get one fake subdomain. `c@other.test` gets a different fake subdomain.
+- [x] `run` without `secrets/pseudofy.key` exits with a non-zero code and tells the user to run `pseudofy init`.
+- [x] `run` prints the number of files, replaced values, and detected collisions.
+- [x] `init` on a system with language `fr` writes `language = "en"` and prints a warning.
+- [x] `init --language de` writes `language = "de"` and ignores the system language.
 
 **Tests to add/update:**
 
-- [ ] `src/pseudonym.rs` unit tests — stability, key dependence, no identity mapping, domain label format.
-- [ ] `src/text.rs` unit tests — token split, case style, transliteration.
-- [ ] `src/locale.rs` unit tests — language mapping and fallback.
-- [ ] `tests/csv.rs` — end-to-end runs on `tests/fixtures/`.
+- [x] `src/pseudonym.rs` unit tests — stability, key dependence, no identity mapping, domain label format.
+- [x] `src/text.rs` unit tests — token split, case style, transliteration.
+- [x] `src/locale.rs` unit tests — language mapping and fallback.
+- [x] `tests/csv.rs` — end-to-end runs on `tests/fixtures/`.
 
 **Commands that must pass:**
 
