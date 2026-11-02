@@ -1,6 +1,6 @@
 {
 	"name": "pseudofy",
-	"image": "mcr.microsoft.com/devcontainers/rust:2.1.5-trixie",
+	"image": "mcr.microsoft.com/devcontainers/rust:2.1.5-trixie@sha256:2bf8d694491c0cd5edb860bd984f45b50a0207df75fdc707c378cf7c1ac83620",
 	"features": {
 		"ghcr.io/devcontainers/features/github-cli:1": {}
 	},
