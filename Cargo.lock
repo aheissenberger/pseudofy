@@ -894,6 +894,7 @@ dependencies = [
  "assert_cmd",
  "clap",
  "csv",
+ "encoding_rs",
  "getrandom",
  "globset",
  "hmac",

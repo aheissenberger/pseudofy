@@ -11,6 +11,7 @@ publish = false
 anyhow = "=1.0.104"
 clap = { version = "=4.6.7", features = ["derive"] }
 csv = "=1.4.0"
+encoding_rs = "=0.8.44"
 getrandom = "=0.4.3"
 globset = "=0.4.21"
 hmac = "=0.13.0"
