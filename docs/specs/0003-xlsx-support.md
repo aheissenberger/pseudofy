@@ -30,6 +30,7 @@
 - `src/main.rs` — install the panic hook from `src/panic_guard.rs`. The hook prints only the code location, never the panic message. A crate can panic on a damaged workbook.
 - `src/config.rs` — a rule gets the optional field `sheets` (list of sheet-name globs, for example `"Kunden*"`). Without `sheets`, the rule applies to each sheet.
 - `Cargo.toml` — add `umya-spreadsheet`, `zip`, and `quick-xml` (ADR-0009).
+- `README.md` — state which XLSX parts pseudofy does not pseudonymize.
 
 ### Removed
 
@@ -39,8 +40,12 @@
 
 - `.xls`, `.xlsm`, `.ods` files.
 - Formulas, comments, document properties (author, last modified by), defined names, charts. pseudofy keeps each formula but clears its cached string result.
+- Data validations, headers and footers, conditional formatting, sheet names. pseudofy copies them unchanged.
+- Text in a column that no rule names, except email addresses.
 - Pivot tables. pseudofy refuses a workbook with a pivot cache and reports it as a failed file.
 - Rich-text runs inside one cell. pseudofy writes the cell as plain text and reports it.
+- Workbooks that the XLSX crate cannot read without data loss: a shared-string table with a namespace prefix, and inline strings with more than one run. pseudofy refuses them and reports a failed file.
+- Hyperlinks with a cell range reference. The XLSX crate fails on them. pseudofy reports a failed file.
 
 ## 3. Architectural Rules & Invariants
 
@@ -50,7 +55,9 @@
 - [ ] A rule column that a sheet does not have is skipped for that sheet, without an error.
 - [ ] One real value gets one pseudonym in all sheets and all files.
 - [ ] pseudofy changes only string cells. Number, date, boolean, and formula cells stay unchanged.
-- [ ] No part of the output package contains a real value that pseudofy replaced. This includes `xl/sharedStrings.xml`, cached formula results, and `mailto:` hyperlinks.
+- [ ] No stale copy of a replaced cell value stays in the output package. This includes `xl/sharedStrings.xml`, cached formula results, and `mailto:` hyperlinks.
+- [ ] pseudofy prints one warning for each workbook with comments, charts, data validations, headers or footers, or conditional formatting. The warning names the kinds, never their content.
+- [ ] pseudofy clears each hyperlink tooltip. In a `mailto:` URL, pseudofy decodes percent escapes, replaces the address, and removes the query part.
 - [ ] The copy keeps sheet names, sheet order, cell styles, column widths, and merged cells.
 - [ ] `src/xlsx_file.rs` and `src/csv_file.rs` use the same replacement function from `src/cells.rs`.
 
