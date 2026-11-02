@@ -8,7 +8,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Read, Write};
 
 use anyhow::anyhow;
-use quick_xml::events::{BytesStart, Event};
+use quick_xml::events::{BytesEnd, BytesStart, Event};
 use quick_xml::{Reader, Writer};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -303,6 +303,25 @@ fn restore_external_links<R: Read + std::io::Seek>(
 
 const SPARKLINE_URI: &str = "{05C60535-1F16-4fd2-B633-F4F36F0B64E0}";
 
+/// Resolve the target of a relationship of `xl/workbook.xml` to a part name.
+/// A leading `/` is the package root; `.` and `..` segments are resolved.
+fn resolve_target(target: &str) -> Result<String, Failure> {
+    let (mut segments, rest) = match target.strip_prefix('/') {
+        Some(absolute) => (Vec::new(), absolute),
+        None => (vec!["xl"], target),
+    };
+    for segment in rest.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop().ok_or("bad target")?;
+            }
+            other => segments.push(other),
+        }
+    }
+    Ok(segments.join("/"))
+}
+
 /// The sheets of a workbook as `(name, part)`, through its relationships.
 fn sheet_parts(workbook: &[u8], rels: &[u8]) -> Result<Vec<(String, String)>, Failure> {
     let rels = relationships(rels)?;
@@ -318,11 +337,7 @@ fn sheet_parts(workbook: &[u8], rels: &[u8]) -> Result<Vec<(String, String)>, Fa
                     .iter()
                     .find(|(candidate, _)| *candidate == id)
                     .ok_or("unknown relationship")?;
-                let part = match target.strip_prefix('/') {
-                    Some(absolute) => absolute.to_owned(),
-                    None => format!("xl/{target}"),
-                };
-                sheets.push((name, part));
+                sheets.push((name, resolve_target(target)?));
             }
             Event::Eof => return Ok(sheets),
             _ => {}
@@ -392,78 +407,190 @@ fn undeclared_prefixes(xml: &[u8]) -> Result<Vec<String>, Failure> {
     }
 }
 
-/// The sparkline `<ext>` elements of a worksheet, each with a declaration
-/// for every namespace prefix that it uses.
-fn sparkline_exts(sheet: &[u8]) -> Result<Vec<String>, Failure> {
+/// Whether `child` may be a child of `parent` in a sparkline `<ext>`
+/// (ECMA-376 and MS-XLSX, local names).
+fn allowed_child(parent: &[u8], child: &[u8]) -> bool {
+    match parent {
+        b"ext" => child == b"sparklineGroups",
+        b"sparklineGroups" => child == b"sparklineGroup",
+        b"sparklineGroup" => matches!(
+            child,
+            b"colorSeries"
+                | b"colorNegative"
+                | b"colorAxis"
+                | b"colorMarkers"
+                | b"colorFirst"
+                | b"colorLast"
+                | b"colorHigh"
+                | b"colorLow"
+                | b"sparklines"
+                | b"f"
+        ),
+        b"sparklines" => child == b"sparkline",
+        b"sparkline" => matches!(child, b"f" | b"sqref"),
+        _ => false,
+    }
+}
+
+/// The sparkline `<ext>` elements of a worksheet, rebuilt from the known
+/// sparkline elements only. `qual` is the prefix of the main namespace of the
+/// copy with a colon, or empty. Each `<ext>` declares every namespace prefix
+/// that it uses. Prefixes come only from the root and the `<extLst>`.
+fn sparkline_exts(sheet: &[u8], qual: &str) -> Result<Vec<String>, Failure> {
     let mut reader = Reader::from_reader(sheet);
     let mut buf = Vec::new();
     let mut known: Vec<(String, String)> = Vec::new();
     let mut depth = 0usize;
     let mut in_list = false;
-    let mut open = false;
-    // Start, end, and name length of each sparkline ext.
-    let mut found: Vec<(usize, usize, usize)> = Vec::new();
+    let mut exts = Vec::new();
     loop {
-        let before = usize::try_from(reader.buffer_position())?;
         let event = reader.read_event_into(&mut buf)?;
-        match &event {
+        match event {
             Event::Start(start) => {
-                depth += 1;
-                if depth <= 2 {
-                    known.extend(declarations(start)?);
-                }
-                if depth == 2 && is_name(start, b"extLst") {
+                if depth == 0 {
+                    if !is_name(&start, b"worksheet") {
+                        return Ok(exts);
+                    }
+                    known.extend(declarations(&start)?);
+                } else if depth == 1 && is_name(&start, b"extLst") {
+                    known.extend(declarations(&start)?);
                     in_list = true;
-                } else if in_list && depth == 3 && !open && is_sparkline_ext(start)? {
-                    open = true;
-                    found.push((before, 0, start.name().as_ref().len()));
+                } else if depth == 2 && in_list && is_sparkline_ext(&start)? {
+                    let rebuilt = rebuild_ext(&mut reader, &start, qual)?;
+                    let mut declared = String::new();
+                    for prefix in undeclared_prefixes(rebuilt.as_bytes())? {
+                        if qual.strip_suffix(':') == Some(prefix.as_str()) {
+                            continue;
+                        }
+                        let (_, uri) = known
+                            .iter()
+                            .rev()
+                            .find(|(candidate, _)| *candidate == prefix)
+                            .ok_or("undeclared prefix")?;
+                        declared.extend([
+                            " xmlns:",
+                            &prefix,
+                            "=\"",
+                            &quick_xml::escape::escape(uri),
+                            "\"",
+                        ]);
+                    }
+                    let split = 1 + qual.len() + "ext".len();
+                    let head = rebuilt.get(..split).ok_or("bad range")?;
+                    let tail = rebuilt.get(split..).ok_or("bad range")?;
+                    exts.push(format!("{head}{declared}{tail}"));
+                    buf.clear();
+                    continue;
+                }
+                depth += 1;
+            }
+            Event::Empty(start) => {
+                if depth == 0 {
+                    if !is_name(&start, b"worksheet") {
+                        return Ok(exts);
+                    }
+                    known.extend(declarations(&start)?);
                 }
             }
             Event::End(_) => {
-                if open && depth == 3 {
-                    let after = usize::try_from(reader.buffer_position())?;
-                    if let Some(last) = found.last_mut() {
-                        last.1 = after;
-                    }
-                    open = false;
-                }
-                if depth == 2 {
+                depth = depth.saturating_sub(1);
+                if depth == 1 {
                     in_list = false;
                 }
-                depth = depth.saturating_sub(1);
             }
-            Event::Eof => break,
+            Event::Eof => return Ok(exts),
             _ => {}
         }
         buf.clear();
     }
-    let mut exts = Vec::new();
-    for (from, to, name_len) in found {
-        let raw = sheet.get(from..to).ok_or("bad range")?;
-        let mut declared: Vec<String> = Vec::new();
-        for prefix in undeclared_prefixes(raw)? {
-            let (_, uri) = known
-                .iter()
-                .rev()
-                .find(|(candidate, _)| *candidate == prefix)
-                .ok_or("undeclared prefix")?;
-            declared.push(format!(
-                r#" xmlns:{prefix}="{}""#,
-                quick_xml::escape::escape(uri)
-            ));
-        }
-        let text = std::str::from_utf8(raw)?;
-        let split = 1 + name_len;
-        let head = text.get(..split).ok_or("bad range")?;
-        let tail = text.get(split..).ok_or("bad range")?;
-        exts.push(format!("{head}{}{tail}", declared.concat()));
+}
+
+/// Rebuild the sparkline `<ext>` whose start tag `ext` was just read: keep the
+/// known elements in their positions with their attributes, and the text of
+/// `f` and `sqref`. Drop all else. The root is named with `qual`.
+fn rebuild_ext(
+    reader: &mut Reader<&[u8]>,
+    ext: &BytesStart<'_>,
+    qual: &str,
+) -> Result<String, Failure> {
+    let root = format!("{qual}ext");
+    let mut start = BytesStart::new(root.clone());
+    for item in ext.attributes() {
+        start.push_attribute(item?);
     }
-    Ok(exts)
+    let mut writer = Writer::new(Vec::new());
+    writer.write_event(Event::Start(start))?;
+    let mut stack: Vec<Vec<u8>> = vec![b"ext".to_vec()];
+    let mut skip = 0usize;
+    let mut buf = Vec::new();
+    loop {
+        let event = reader.read_event_into(&mut buf)?;
+        match event {
+            Event::Start(start) => {
+                let local = start.local_name().as_ref().to_vec();
+                let top = stack.last().ok_or("empty stack")?;
+                if skip == 0 && allowed_child(top, &local) {
+                    writer.write_event(Event::Start(start))?;
+                    stack.push(local);
+                } else {
+                    skip += 1;
+                }
+            }
+            Event::Empty(start) => {
+                let top = stack.last().ok_or("empty stack")?;
+                if skip == 0 && allowed_child(top, start.local_name().as_ref()) {
+                    writer.write_event(Event::Empty(start))?;
+                }
+            }
+            Event::End(end) => {
+                if skip > 0 {
+                    skip -= 1;
+                } else {
+                    stack.pop();
+                    if stack.is_empty() {
+                        writer.write_event(Event::End(BytesEnd::new(root)))?;
+                        break;
+                    }
+                    writer.write_event(Event::End(end))?;
+                }
+            }
+            Event::Text(_) | Event::GeneralRef(_) => {
+                let top = stack.last().ok_or("empty stack")?;
+                if skip == 0 && (top == b"f" || top == b"sqref") {
+                    writer.write_event(event)?;
+                }
+            }
+            Event::Eof => return Err("unclosed ext".into()),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(String::from_utf8(writer.into_inner())?)
+}
+
+/// The prefix of the root element of `xml` with a colon, or an empty string.
+fn root_qualifier(xml: &[u8]) -> Result<String, Failure> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(start) | Event::Empty(start) => {
+                return Ok(match start.name().prefix() {
+                    Some(prefix) => format!("{}:", std::str::from_utf8(prefix.as_ref())?),
+                    None => String::new(),
+                });
+            }
+            Event::Eof => return Err("no root".into()),
+            _ => {}
+        }
+        buf.clear();
+    }
 }
 
 /// Add `snippet` to the `<extLst>` of a worksheet, or add an `<extLst>` as the
 /// last child of the root. Returns `None` if the sheet has a sparkline `<ext>`.
-fn add_to_ext_list(sheet: &[u8], snippet: &str) -> Result<Option<Vec<u8>>, Failure> {
+/// `qual` is the prefix of the main namespace with a colon, or empty.
+fn add_to_ext_list(sheet: &[u8], snippet: &str, qual: &str) -> Result<Option<Vec<u8>>, Failure> {
     let mut reader = Reader::from_reader(sheet);
     let mut writer = Writer::new(Vec::new());
     let mut buf = Vec::new();
@@ -488,9 +615,8 @@ fn add_to_ext_list(sheet: &[u8], snippet: &str) -> Result<Option<Vec<u8>>, Failu
                 done = true;
             }
             Event::End(_) if !done && depth == 1 => {
-                writer.get_mut().extend_from_slice(b"<extLst>");
-                writer.get_mut().extend_from_slice(snippet.as_bytes());
-                writer.get_mut().extend_from_slice(b"</extLst>");
+                let list = format!("<{qual}extLst>{snippet}</{qual}extLst>");
+                writer.get_mut().extend_from_slice(list.as_bytes());
                 done = true;
             }
             _ => {}
@@ -512,6 +638,12 @@ fn add_to_ext_list(sheet: &[u8], snippet: &str) -> Result<Option<Vec<u8>>, Failu
     }
 }
 
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 /// Build the worksheet parts of `output` that get the sparklines of the
 /// sheet of `input` with the same name. Empty if `input` has no sparkline.
 fn restore_sparklines<R: Read + std::io::Seek>(
@@ -520,33 +652,43 @@ fn restore_sparklines<R: Read + std::io::Seek>(
 ) -> Result<HashMap<String, Vec<u8>>, Failure> {
     let mut parts = HashMap::new();
     let mut source = ZipArchive::new(Cursor::new(input))?;
-    let (Some(in_workbook), Some(in_rels)) = (
-        read_part(&mut source, WORKBOOK)?,
-        read_part(&mut source, WORKBOOK_RELS)?,
-    ) else {
+    // Input parts that have a sparkline `<ext>`.
+    let mut found: Vec<(String, Vec<u8>)> = Vec::new();
+    for index in 0..source.len() {
+        let mut file = source.by_index(index)?;
+        let name = file.name().to_owned();
+        if file.is_dir() || !is_xml(&name) {
+            continue;
+        }
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if contains(&bytes, SPARKLINE_URI.as_bytes()) && !sparkline_exts(&bytes, "")?.is_empty() {
+            found.push((name, bytes));
+        }
+    }
+    if found.is_empty() {
         return Ok(parts);
-    };
-    let mut targets: Option<Vec<(String, String)>> = None;
+    }
+    let in_workbook = read_part(&mut source, WORKBOOK)?.ok_or("no workbook part")?;
+    let in_rels = read_part(&mut source, WORKBOOK_RELS)?.ok_or("no relationships")?;
+    let out_workbook = read_part(output, WORKBOOK)?.ok_or("no workbook part")?;
+    let out_rels = read_part(output, WORKBOOK_RELS)?.ok_or("no relationships")?;
+    let targets = sheet_parts(&out_workbook, &out_rels)?;
     for (name, part) in sheet_parts(&in_workbook, &in_rels)? {
-        let Some(sheet) = read_part(&mut source, &part)? else {
+        let Some((_, sheet)) = found.iter().find(|(candidate, _)| *candidate == part) else {
+            if read_part(&mut source, &part)?.is_none() {
+                return Err("missing sheet part".into());
+            }
             continue;
         };
-        let exts = sparkline_exts(&sheet)?;
-        if exts.is_empty() {
-            continue;
-        }
-        if targets.is_none() {
-            let workbook = read_part(output, WORKBOOK)?.ok_or("no workbook part")?;
-            let rels = read_part(output, WORKBOOK_RELS)?.ok_or("no relationships")?;
-            targets = Some(sheet_parts(&workbook, &rels)?);
-        }
         let (_, out_part) = targets
             .iter()
-            .flatten()
             .find(|(candidate, _)| *candidate == name)
             .ok_or("no sheet in the copy")?;
         let out_sheet = read_part(output, out_part)?.ok_or("missing sheet part")?;
-        if let Some(changed) = add_to_ext_list(&out_sheet, &exts.concat())? {
+        let qual = root_qualifier(&out_sheet)?;
+        let exts = sparkline_exts(sheet, &qual)?;
+        if let Some(changed) = add_to_ext_list(&out_sheet, &exts.concat(), &qual)? {
             parts.insert(out_part.clone(), changed);
         }
     }
@@ -1334,6 +1476,149 @@ mod tests {
         assert_eq!(names(&out), names(&output));
         assert_eq!(part(&out, "xl/worksheets/sheet1.xml"), plain);
         assert_eq!(part(&out, WORKBOOK), part(&output, WORKBOOK));
+    }
+
+    const PLAIN_SHEET: &str = r#"<worksheet xmlns="urn:m"><sheetData/></worksheet>"#;
+
+    #[test]
+    fn only_known_elements_and_their_text_are_copied() {
+        let ext = format!(
+            r#"<ext uri="{SPARK_URI}" xmlns:x14="urn:x14"><!-- Max Mustermann --><foo>Erika Musterfrau</foo><![CDATA[secret]]><?pi Hans?><x14:sparklineGroups xmlns:xm="urn:xm"><x14:sparklineGroup><!-- Max Mustermann --><foo><x14:sparklines/></foo><x14:colorSeries rgb="FF000000"/><x14:sparklines><x14:sparkline><![CDATA[secret]]><xm:f>Data!A1:C1</xm:f><xm:sqref>D1</xm:sqref><bar>Erika Musterfrau</bar></x14:sparkline></x14:sparklines></x14:sparklineGroup><x14:sparklineGroup/></x14:sparklineGroups><xm:f>stray</xm:f></ext>"#
+        );
+        let input = book_package(&[("A", "worksheets/sheet1.xml", &spark_sheet(&ext))]);
+        let output = book_package(&[("A", "worksheets/sheet1.xml", PLAIN_SHEET)]);
+        let out = scrub(&input, &output).unwrap();
+        let sheet = part(&out, "xl/worksheets/sheet1.xml");
+        for dropped in [
+            "Max", "Erika", "secret", "Hans", "foo", "bar", "stray", "CDATA", "<?pi", "<!--",
+        ] {
+            assert!(!sheet.contains(dropped), "{dropped}");
+        }
+        assert!(!sheet.contains("<x14:sparklines/>"));
+        assert!(sheet.contains(r#"<x14:colorSeries rgb="FF000000"/>"#));
+        assert_eq!(sheet.matches("<x14:sparkline>").count(), 1);
+        assert!(sheet.contains("<xm:f>Data!A1:C1</xm:f><xm:sqref>D1</xm:sqref>"));
+    }
+
+    #[test]
+    fn byte_order_mark_does_not_shift_the_copy() {
+        let bom_sheet = format!("\u{feff}{}", spark_sheet(&spark_ext("")));
+        let input = book_package(&[("A", "worksheets/sheet1.xml", &bom_sheet)]);
+        let bom_plain = format!("\u{feff}{PLAIN_SHEET}");
+        for plain in [PLAIN_SHEET, bom_plain.as_str()] {
+            let output = book_package(&[("A", "worksheets/sheet1.xml", plain)]);
+            let out = scrub(&input, &output).unwrap();
+            let sheet = part(&out, "xl/worksheets/sheet1.xml");
+            assert_eq!(sheet.matches("<x14:sparkline>").count(), 1);
+            assert!(sheet.contains(&format!(r#"<ext uri="{SPARK_URI}" xmlns:x14="urn:x14">"#)));
+            assert!(sheet.contains("<xm:f>Data!A1:C1</xm:f><xm:sqref>D1</xm:sqref>"));
+            assert!(sheet.ends_with("</ext></extLst></worksheet>"));
+        }
+    }
+
+    #[test]
+    fn targets_are_normalized() {
+        assert_eq!(
+            resolve_target("../xl/worksheets/sheet1.xml").unwrap(),
+            "xl/worksheets/sheet1.xml"
+        );
+        assert_eq!(
+            resolve_target("./worksheets//sheet1.xml").unwrap(),
+            "xl/worksheets/sheet1.xml"
+        );
+        assert_eq!(
+            resolve_target("/xl/worksheets/sheet1.xml").unwrap(),
+            "xl/worksheets/sheet1.xml"
+        );
+        assert!(resolve_target("../../x.xml").is_err());
+
+        let mut parts = book(&[("A", "worksheets/sheet1.xml", &spark_sheet(&spark_ext("")))]);
+        parts[1].1 = parts[1]
+            .1
+            .replace("worksheets/sheet1.xml", "../xl/worksheets/sheet1.xml");
+        let refs: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_str()))
+            .collect();
+        let input = plain_package(&refs);
+        let output = book_package(&[("A", "worksheets/sheet1.xml", PLAIN_SHEET)]);
+        let out = scrub(&input, &output).unwrap();
+        assert!(part(&out, "xl/worksheets/sheet1.xml").contains("<x14:sparkline>"));
+    }
+
+    #[test]
+    fn prefixes_come_only_from_root_and_ext_list() {
+        let ext = spark_ext("").replace(r#" xmlns:x14="urn:x14""#, "");
+        let sheet = format!(
+            r#"<worksheet xmlns="urn:m" xmlns:x14="urn:x14"><sheetData xmlns:x14="urn:WRONG"/><extLst>{ext}</extLst></worksheet>"#
+        );
+        let input = book_package(&[("A", "worksheets/sheet1.xml", &sheet)]);
+        let output = book_package(&[("A", "worksheets/sheet1.xml", PLAIN_SHEET)]);
+        let out = scrub(&input, &output).unwrap();
+        let sheet = part(&out, "xl/worksheets/sheet1.xml");
+        assert!(sheet.contains(r#"xmlns:x14="urn:x14""#));
+        assert!(!sheet.contains("WRONG"));
+
+        let only_wrong = format!(
+            r#"<worksheet xmlns="urn:m"><sheetData xmlns:x14="urn:x14"/><extLst>{ext}</extLst></worksheet>"#
+        );
+        let input = book_package(&[("A", "worksheets/sheet1.xml", &only_wrong)]);
+        assert!(scrub(&input, &output).is_err());
+    }
+
+    #[test]
+    fn workbook_faults_are_ignored_without_sparklines() {
+        let workbook = r#"<workbook xmlns:r="urn:r"><sheets><sheet name="A" sheetId="1" r:id="rId9"/></sheets></workbook>"#;
+        let input = plain_package(&[
+            (WORKBOOK, workbook),
+            (WORKBOOK_RELS, "<Relationships/>"),
+            ("xl/worksheets/sheet1.xml", PLAIN_SHEET),
+        ]);
+        let output = book_package(&[("A", "worksheets/sheet1.xml", PLAIN_SHEET)]);
+        let out = scrub(&input, &output).unwrap();
+        assert_eq!(names(&out), names(&output));
+        assert_eq!(part(&out, "xl/worksheets/sheet1.xml"), PLAIN_SHEET);
+
+        // With sparklines, the same faults are errors.
+        let input = plain_package(&[
+            (WORKBOOK, workbook),
+            (WORKBOOK_RELS, "<Relationships/>"),
+            ("xl/worksheets/sheet1.xml", &spark_sheet(&spark_ext(""))),
+        ]);
+        assert!(scrub(&input, &output).is_err());
+    }
+
+    #[test]
+    fn listed_sheet_missing_from_the_input_is_an_error() {
+        let mut parts = book(&[
+            ("A", "worksheets/sheet1.xml", PLAIN_SHEET),
+            ("B", "worksheets/sheet2.xml", &spark_sheet(&spark_ext(""))),
+        ]);
+        parts.remove(2);
+        let refs: Vec<(&str, &str)> = parts
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_str()))
+            .collect();
+        let input = plain_package(&refs);
+        let output = book_package(&[
+            ("A", "worksheets/sheet1.xml", PLAIN_SHEET),
+            ("B", "worksheets/sheet2.xml", PLAIN_SHEET),
+        ]);
+        assert!(scrub(&input, &output).is_err());
+    }
+
+    #[test]
+    fn prefixed_main_namespace_gets_prefixed_elements() {
+        let input = book_package(&[("A", "worksheets/sheet1.xml", &spark_sheet(&spark_ext("")))]);
+        let prefixed = r#"<x:worksheet xmlns:x="urn:m"><x:sheetData/></x:worksheet>"#;
+        let output = book_package(&[("A", "worksheets/sheet1.xml", prefixed)]);
+        let out = scrub(&input, &output).unwrap();
+        let sheet = part(&out, "xl/worksheets/sheet1.xml");
+        assert!(sheet.contains("<x:sheetData/><x:extLst><x:ext uri="));
+        assert!(sheet.ends_with("</x:ext></x:extLst></x:worksheet>"));
+        assert!(!sheet.contains("<ext"));
+        assert!(!sheet.contains("<extLst"));
+        assert_eq!(sheet.matches("<x14:sparkline>").count(), 1);
     }
 
     #[test]
