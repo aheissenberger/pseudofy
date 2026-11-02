@@ -1,0 +1,12 @@
+{
+	"name": "pseudofy",
+	"image": "mcr.microsoft.com/devcontainers/rust:2.1.5-trixie",
+	"customizations": {
+		"vscode": {
+			"extensions": [
+				"rust-lang.rust-analyzer",
+				"tamasfe.even-better-toml"
+			]
+		}
+	}
+}
