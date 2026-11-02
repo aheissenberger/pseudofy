@@ -27,18 +27,19 @@
 ### Added
 
 - `src/run.rs` — the output check:
-  - If `--out` is inside the project, it must not exist, or it must be empty, or it must contain the marker file `.pseudofy-out`. pseudofy writes the marker when it creates the output directory.
+  - If `--out` is inside the project, it must not exist, or it must be empty, or it must contain the marker file `.pseudofy-out`. pseudofy writes the marker when it creates the output directory. Only a regular file with the marker text counts.
+  - pseudofy creates a new output directory with mode 0700 (unix).
   - Before each write, pseudofy refuses an output path that is the same file (device and inode) as a walked input file.
   - pseudofy refuses an output directory that is, or is inside, the canonical `secrets/` or `config/` of the project. It compares canonical paths and the device and inode of each ancestor, so a symlink and another letter case do not get past the check. It checks again after it creates the directory.
-  - pseudofy warns if the output directory is writable by other users (`mode & 0o022`).
+  - pseudofy warns if an existing output directory is writable by other users (`mode & 0o022`).
 - `src/run.rs` — the walk skips each path with a component that starts with `.` (also for CSV and XLSX files).
 
 ### Modified
 
-- `src/key.rs` — write the key to a temp file in `secrets/`, call `sync_all`, then link it to `pseudofy.key` with `fs::hard_link` (fails if the key exists), then remove the temp file. If a step fails, remove the files that this call made. Read the key only from a regular file, at most 1 KiB.
+- `src/key.rs` — write the key to a temp file with a random name in `secrets/`, call `sync_all`, then link it to `pseudofy.key` with `fs::hard_link` (fails if the key exists), then remove the temp file. If the file system has no hard links, write `pseudofy.key` with `create_new`. If a step fails, remove the files that this call made. Read the key only from a regular file, at most 1 KiB.
 - `src/config.rs` — read the config only from a regular file, at most 1 MiB.
 - `src/cells.rs` — `write_output`: use a short fixed temp name `.pseudofy-out.tmp`, and set the permission bits of the input file on the copy.
-- `tests/cli.rs` — the tests of section 4.
+- `tests/cli.rs` — the tests of section 4. `tests/csv.rs` counts the marker file in an output directory inside the project.
 - `README.md` — the rules for `--out`, hidden files, and the output permissions.
 
 ### Removed

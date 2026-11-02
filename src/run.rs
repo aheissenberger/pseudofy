@@ -33,6 +33,9 @@ pub struct Summary {
 
 /// Name of the marker file in an output directory inside the project.
 const OUT_MARKER: &str = ".pseudofy-out";
+/// The exact content of the marker file. Another entry with the marker name
+/// (a directory, a symlink, an empty file) does not mark the directory.
+const OUT_MARKER_TEXT: &[u8] = b"pseudofy output directory\n";
 
 /// Identity of a file: device and inode on unix, the canonical path elsewhere.
 #[cfg(unix)]
@@ -312,7 +315,8 @@ fn resolve_dirs(project: &Path, out: &Path) -> anyhow::Result<(PathBuf, PathBuf)
     let future = resolve_future(out)?;
     check_not_protected(&project, &protected, &future)?;
     let needs_marker = future.starts_with(&project) && future != project && marker_needed(&future)?;
-    fs::create_dir_all(out).context("cannot create the output directory")?;
+    let existed = out.exists();
+    create_private_dir(out)?;
     let out = out
         .canonicalize()
         .context("cannot open the output directory")?;
@@ -324,11 +328,28 @@ fn resolve_dirs(project: &Path, out: &Path) -> anyhow::Result<(PathBuf, PathBuf)
         bail!("the project directory must not be inside --out");
     }
     if needs_marker {
-        fs::write(out.join(OUT_MARKER), b"pseudofy output directory\n")
+        fs::write(out.join(OUT_MARKER), OUT_MARKER_TEXT)
             .context("cannot write the marker file in the output directory")?;
     }
-    warn_if_writable_by_others(&out);
+    // A directory that pseudofy made is private (0700); warn only for an old one.
+    if existed {
+        warn_if_writable_by_others(&out);
+    }
     Ok((project, out))
+}
+
+/// Create `out` and its missing parents. A new directory gets mode 0700 (unix).
+fn create_private_dir(out: &Path) -> anyhow::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(out)
+        .context("cannot create the output directory")
 }
 
 /// Fail if `path` is, or lies in, `secrets/` or `config/` of the project.
@@ -361,7 +382,7 @@ fn marker_needed(dir: &Path) -> anyhow::Result<bool> {
     match fs::metadata(dir) {
         Err(error) if is_not_found(&error) => Ok(true),
         Ok(meta) if meta.is_dir() => {
-            if fs::symlink_metadata(dir.join(OUT_MARKER)).is_ok() {
+            if is_marker(&dir.join(OUT_MARKER)) {
                 return Ok(false);
             }
             let mut entries = fs::read_dir(dir).context("cannot read the output directory")?;
@@ -377,6 +398,12 @@ fn marker_needed(dir: &Path) -> anyhow::Result<bool> {
         Ok(_) => bail!("--out is not a directory"),
         Err(_) => bail!("cannot check the output directory"),
     }
+}
+
+/// True if `path` is a regular file (not a symlink) with the marker text.
+fn is_marker(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file())
+        && fs::read(path).is_ok_and(|bytes| bytes == OUT_MARKER_TEXT)
 }
 
 /// Warn if other users can write to the output directory (unix).
@@ -577,6 +604,19 @@ mod tests {
         assert!(resolve_dirs(dir.path(), &out).is_ok());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn new_out_is_private_and_gets_no_warning() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("p");
+        fs::create_dir(&project).unwrap();
+        let out = dir.path().join("o/new");
+        resolve_dirs(&project, &out).unwrap();
+        let mode = fs::metadata(&out).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+    }
+
     #[test]
     fn out_inside_project_needs_new_empty_or_marked_dir() {
         let dir = tempfile::tempdir().unwrap();
@@ -585,7 +625,14 @@ mod tests {
         fs::write(used.join("a.csv"), "x").unwrap();
         assert!(resolve_dirs(dir.path(), &used).is_err());
         assert!(!used.join(OUT_MARKER).exists());
+        // Only a regular file with the marker text marks the directory.
         fs::write(used.join(OUT_MARKER), "").unwrap();
+        assert!(resolve_dirs(dir.path(), &used).is_err());
+        fs::remove_file(used.join(OUT_MARKER)).unwrap();
+        fs::create_dir(used.join(OUT_MARKER)).unwrap();
+        assert!(resolve_dirs(dir.path(), &used).is_err());
+        fs::remove_dir(used.join(OUT_MARKER)).unwrap();
+        fs::write(used.join(OUT_MARKER), OUT_MARKER_TEXT).unwrap();
         assert!(resolve_dirs(dir.path(), &used).is_ok());
         let empty = dir.path().join("empty");
         fs::create_dir(&empty).unwrap();
