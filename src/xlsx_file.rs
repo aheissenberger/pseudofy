@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
@@ -16,8 +15,10 @@ use crate::cells::{
     rules_without_headers, transform_cell, write_output,
 };
 use crate::config::Rule;
+use crate::panic_guard;
 use crate::pseudonym::Pseudonymizer;
 use crate::text;
+use crate::xlsx_scrub;
 
 /// Counts for one processed workbook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,12 +48,13 @@ pub fn process(
 ) -> anyhow::Result<XlsxStats> {
     let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
     let unreadable = || anyhow!("{rel}: cannot read the workbook");
+    if has_pivot_parts(&bytes) {
+        return Err(anyhow!("{rel}: workbook has pivot tables; not supported"));
+    }
     // The crate can panic on a damaged workbook; its error texts are not used.
-    let mut book = catch_unwind(AssertUnwindSafe(|| {
-        reader::xlsx::read_reader(Cursor::new(bytes), true)
-    }))
-    .map_err(|_| unreadable())?
-    .map_err(|_| unreadable())?;
+    let mut book = panic_guard::catch(|| reader::xlsx::read_reader(Cursor::new(bytes), true))
+        .ok_or_else(unreadable)?
+        .map_err(|_| unreadable())?;
 
     let mut replace = |kind: Kind, value: &str| match kind {
         Kind::First => pseudonymizer.first_name(value),
@@ -67,19 +69,76 @@ pub fn process(
         text::replace_emails,
         &mut replace,
     )?;
+    for glob in &result.no_sheet {
+        eprintln!("warning: rule \"{glob}\" matches {rel}, but no sheet matches its sheets globs");
+    }
     for glob in rules_without_headers(rules, &result.missing) {
-        eprintln!("warning: rule \"{glob}\" matches {rel}, but the file has none of its headers");
+        if !result.no_sheet.iter().any(|g| g == glob) {
+            eprintln!(
+                "warning: rule \"{glob}\" matches {rel}, but the file has none of its headers"
+            );
+        }
     }
 
     let mut out: Vec<u8> = Vec::new();
     let unwritable = || anyhow!("{rel}: cannot write the workbook");
-    catch_unwind(AssertUnwindSafe(|| {
-        writer::xlsx::write_writer(&book, &mut out)
-    }))
-    .map_err(|_| unwritable())?
-    .map_err(|_| unwritable())?;
+    panic_guard::catch(|| writer::xlsx::write_writer(&book, &mut out))
+        .ok_or_else(unwritable)?
+        .map_err(|_| unwritable())?;
+    let out = xlsx_scrub::scrub(&out).map_err(|_| unwritable())?;
     write_output(out_root, output, &out, rel)?;
     Ok(result.stats)
+}
+
+/// True if the package has a pivot cache or a pivot table part.
+fn has_pivot_parts(bytes: &[u8]) -> bool {
+    zip::ZipArchive::new(Cursor::new(bytes)).is_ok_and(|archive| {
+        archive
+            .file_names()
+            .any(|name| name.starts_with("xl/pivotCache/") || name.starts_with("xl/pivotTables/"))
+    })
+}
+
+/// Replace each email in `value` through the email pseudonym.
+fn replace_in_text(
+    value: &str,
+    email_regex: &Regex,
+    emails: EmailFn,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+) -> String {
+    emails(value, email_regex, &mut |address| {
+        replace(Kind::Email, address)
+    })
+}
+
+/// Replace the emails in the url and tooltip of the hyperlink of `cell`.
+fn scrub_hyperlink(
+    cell: &mut umya_spreadsheet::Cell,
+    email_regex: &Regex,
+    emails: EmailFn,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+) {
+    let Some(link) = cell.hyperlink() else {
+        return;
+    };
+    let url = replace_in_text(link.url(), email_regex, emails, replace);
+    let tooltip = replace_in_text(link.tooltip(), email_regex, emails, replace);
+    if url != link.url() || tooltip != link.tooltip() {
+        let link = cell.hyperlink_mut();
+        link.set_url(url);
+        link.set_tooltip(tooltip);
+    }
+}
+
+/// The cached string result of a formula can hold a real value; the formula
+/// stays.
+fn clear_cached_text(cell: &mut umya_spreadsheet::Cell) {
+    if matches!(
+        cell.raw_value(),
+        CellRawValue::String(_) | CellRawValue::RichText(_) | CellRawValue::Lazy(_)
+    ) {
+        cell.set_formula_result_blank();
+    }
 }
 
 /// Result of the transformation of one workbook.
@@ -87,6 +146,8 @@ struct Transformed {
     stats: XlsxStats,
     /// (rule glob, header text) pairs that no applicable sheet has.
     missing: Vec<(String, String)>,
+    /// Globs of rules with `sheets` that match no sheet of the workbook.
+    no_sheet: Vec<String>,
 }
 
 fn sheet_rules<'a>(rules: &[&'a Rule]) -> anyhow::Result<Vec<SheetRule<'a>>> {
@@ -124,14 +185,17 @@ fn transform(
     let all_pairs = missing_headers(&[], &collect_columns(rules));
     let mut found: Vec<(String, String)> = Vec::new();
     let mut stats = XlsxStats::default();
+    let mut sheet_matched = vec![false; matchers.len()];
 
     for sheet in book.sheet_collection_mut() {
         let name = sheet.name().to_owned();
-        let applicable: Vec<&Rule> = matchers
-            .iter()
-            .filter(|(set, _)| set.as_ref().is_none_or(|set| set.is_match(&name)))
-            .map(|(_, rule)| *rule)
-            .collect();
+        let mut applicable: Vec<&Rule> = Vec::new();
+        for (i, (set, rule)) in matchers.iter().enumerate() {
+            if set.as_ref().is_none_or(|set| set.is_match(&name)) {
+                sheet_matched[i] = true;
+                applicable.push(rule);
+            }
+        }
         let columns = collect_columns(&applicable);
         let mut cells = sheet.cells_mut();
         cells.sort_by_key(|cell| {
@@ -167,11 +231,15 @@ fn transform(
         for cell in &mut cells {
             let at = cell.coordinate();
             let (row, col) = (at.row_num(), at.col_num());
-            if row <= header_row {
+            scrub_hyperlink(cell, email_regex, emails, replace);
+            if cell.is_formula() {
+                if row > header_row {
+                    stats.formulas += 1;
+                }
+                clear_cached_text(cell);
                 continue;
             }
-            if cell.is_formula() {
-                stats.formulas += 1;
+            if row <= header_row {
                 continue;
             }
             let (old, rich) = match cell.raw_value() {
@@ -202,7 +270,17 @@ fn transform(
         .into_iter()
         .filter(|pair| !found.contains(pair))
         .collect();
-    Ok(Transformed { stats, missing })
+    let no_sheet = matchers
+        .iter()
+        .zip(&sheet_matched)
+        .filter(|((set, _), matched)| set.is_some() && !**matched)
+        .map(|((_, rule), _)| rule.files.clone())
+        .collect();
+    Ok(Transformed {
+        stats,
+        missing,
+        no_sheet,
+    })
 }
 
 #[cfg(test)]
@@ -360,5 +438,90 @@ mod tests {
             .map(umya_spreadsheet::Worksheet::name)
             .collect();
         assert_eq!(names, ["Kunden 2025", "Notizen", "Hidden"]);
+    }
+
+    #[test]
+    fn rich_text_cell_becomes_plain_and_is_counted() {
+        let mut book = book();
+        let mut rich = umya_spreadsheet::RichText::default();
+        rich.set_text("Dora Muster");
+        book.sheet_by_name_mut("Kunden 2025")
+            .unwrap()
+            .cell_mut("A5")
+            .set_rich_text(rich);
+        let rule = rule(&[]);
+        let result = run(&mut book, &[&rule]);
+        assert_eq!(result.stats.rich_text, 1);
+        assert!(text_of(&book, "Kunden 2025", "A5").starts_with("F-"));
+        let cell = book
+            .sheet_by_name("Kunden 2025")
+            .unwrap()
+            .cell("A5")
+            .unwrap();
+        assert!(matches!(cell.raw_value(), CellRawValue::String(_)));
+    }
+
+    #[test]
+    fn hyperlink_email_gets_the_same_fake_as_the_cell() {
+        let mut book = book();
+        let sheet = book.sheet_by_name_mut("Kunden 2025").unwrap();
+        let cell = sheet.cell_mut("B4");
+        cell.set_value_string("zorbina@acme.test");
+        let link = cell.hyperlink_mut();
+        link.set_url("mailto:zorbina@acme.test");
+        link.set_tooltip("Write to zorbina@acme.test");
+        let rule = rule(&[]);
+        run(&mut book, &[&rule]);
+        let sheet = book.sheet_by_name("Kunden 2025").unwrap();
+        let cell = sheet.cell("B4").unwrap();
+        let fake = cell.value().to_string();
+        assert!(fake.starts_with("E-"));
+        let link = cell.hyperlink().unwrap();
+        assert_eq!(link.url(), format!("mailto:{fake}"));
+        assert_eq!(link.tooltip(), format!("Write to {fake}"));
+    }
+
+    #[test]
+    fn cached_string_result_of_a_formula_is_cleared() {
+        let mut book = book();
+        let cell = book
+            .sheet_by_name_mut("Kunden 2025")
+            .unwrap()
+            .cell_mut("D3");
+        cell.set_formula("A3");
+        cell.set_formula_result_string("Anna Beispiel");
+        let rule = rule(&[]);
+        let result = run(&mut book, &[&rule]);
+        let cell = book
+            .sheet_by_name("Kunden 2025")
+            .unwrap()
+            .cell("D3")
+            .unwrap();
+        assert_eq!(cell.formula(), "A3");
+        assert!(matches!(cell.raw_value(), CellRawValue::Empty));
+        assert_eq!(result.stats.formulas, 2);
+    }
+
+    #[test]
+    fn rule_with_sheets_that_match_no_sheet_is_reported() {
+        let mut book = book();
+        let rule = rule(&["nothing*"]);
+        let result = run(&mut book, &[&rule]);
+        assert_eq!(result.no_sheet, ["*.xlsx"]);
+        assert_eq!(text_of(&book, "Kunden 2025", "A3"), "Anna Beispiel");
+    }
+
+    #[test]
+    fn pivot_parts_are_detected() {
+        use std::io::Write;
+        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        writer
+            .start_file("xl/pivotCache/pivotCacheDefinition1.xml", options)
+            .unwrap();
+        writer.write_all(b"<x/>").unwrap();
+        let bytes = writer.finish().unwrap().into_inner();
+        assert!(has_pivot_parts(&bytes));
+        assert!(!has_pivot_parts(b"not a zip"));
     }
 }

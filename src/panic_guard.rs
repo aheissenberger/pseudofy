@@ -28,13 +28,6 @@ pub fn install_hook() {
 }
 
 /// Run `f`. Return `None` if it panics. The hook stays silent for that panic.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "spec 0003 preparation; xlsx_file calls it, the task removes this"
-    )
-)]
 pub fn catch<R>(f: impl FnOnce() -> R) -> Option<R> {
     let before = CATCHING.with(|flag| flag.replace(true));
     let result = panic::catch_unwind(AssertUnwindSafe(f));
