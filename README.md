@@ -5,6 +5,8 @@ One real value gets the same fake value in all files of one project and in each 
 
 pseudofy pseudonymizes direct identifiers. It does not anonymize the data.
 The output can still be personal data (GDPR Art. 4(5)).
+Other columns can identify a person, and the holder of the project key can test real names.
+pseudofy does not change file and directory names. Rename a file before you share it if its name contains a real name.
 
 ## Development
 

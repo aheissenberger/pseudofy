@@ -33,6 +33,7 @@
 - `init` writes `config/pseudofy.toml` with the language, `email_subdomains = true`, and one example rule. `init` fails if the file exists.
 - `Cargo.toml` — add the crates from ADR-0004 except `umya-spreadsheet`.
 - `tests/cli.rs` — remove the test for the "not implemented" output.
+- `README.md` — state that pseudofy does not pseudonymize file and directory names.
 
 ### Removed
 
@@ -49,6 +50,7 @@
 - [ ] pseudofy never writes to an input file. If `--out` is inside `--project` and not excluded, `run` fails.
 - [ ] `run` skips `secrets/`, `config/`, and `--out` during the file search.
 - [ ] pseudofy never prints, logs, or writes the project key or a real value.
+- [ ] File and directory names are not real values in this spec. `run` copies them to `--out` unchanged. Messages can show the relative path.
 - [ ] Equal normalized real values give equal pseudonyms in all files.
 - [ ] A pseudonym is never equal to its real value.
 - [ ] If `email_subdomains` is `false`, each fake email is `<first>.<last>@example.com`.
