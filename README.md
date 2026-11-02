@@ -48,6 +48,28 @@ xattr -d com.apple.quarantine pseudofy
 
 Move `pseudofy` to a directory in your `PATH`, for example `/usr/local/bin`.
 
+## Usage
+
+1. Create the project key and the config:
+
+   ```sh
+   pseudofy init --project ./project
+   ```
+
+2. Edit `project/config/pseudofy.toml`. A comment explains each setting. A setting with `#` in front shows its default value.
+3. Write the pseudonymized copies:
+
+   ```sh
+   pseudofy run --project ./project --out ./out
+   ```
+
+Keep `project/secrets/pseudofy.key` secret. The same key gives the same fake values in each later run.
+
+By default, `run` writes only the copies of the CSV and XLSX files.
+With `copy_other_files = true` in the config, `run` also copies each other file unchanged, for example a PDF or a text file.
+pseudofy does not check these files. They can contain real names. Check each copied file before you share it.
+pseudofy never copies hidden files and directories (names that start with `.`).
+
 ## Development
 
 Development runs in a devcontainer. The host needs Docker and an editor.
