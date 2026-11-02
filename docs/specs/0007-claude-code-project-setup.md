@@ -60,7 +60,7 @@
 
 - [x] `.claude/hooks/stop-check` exits 0 on a clean working tree.
 - [x] `.claude/hooks/stop-check` exits 2 if `src/main.rs` contains `unwrap()`.
-- [ ] `/agents` in Claude Code lists the five project agents.
+- [x] Each file in `.claude/agents/` has frontmatter with a `name` equal to the file name, a `description`, and a valid `model` and `effort`.
 - [ ] A `Read` of `secrets/x` is denied.
 - [x] `rg`, `fd`, `shellcheck`, and `gh` exist in the devcontainer.
 - [ ] A `gh` login stays after a container rebuild.
@@ -82,7 +82,7 @@ devcontainer exec --workspace-folder . shellcheck .claude/hooks/stop-check .devc
 
 **Manual verification (only if unavoidable):**
 
-- Run `/agents` in Claude Code in the devcontainer — the list shows the five agents with their models.
+- Ask Claude Code in the devcontainer "Which project subagents can you use?" — the answer names the five agents.
 - Ask Claude to read `secrets/x` — Claude Code denies the read.
 
 ## 5. Rollback / Notes (optional)
