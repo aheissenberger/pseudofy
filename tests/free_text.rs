@@ -462,7 +462,8 @@ fn a_note_without_a_known_name_is_byte_equal() {
 #[test]
 fn a_file_that_fails_in_pass_one_adds_no_names() {
     let dir = project(None);
-    let mut bad = format!("{HEADER}Zorbina,Quenzel,x").into_bytes();
+    // UTF-8 `ü` next to a lone 0xff byte: mixed encoding, rejected (spec 0009).
+    let mut bad = format!("{HEADER}Zorbina,Quenzel,Grüße").into_bytes();
     bad.extend_from_slice(&[0xff, b'\n']);
     fs::write(dir.path().join("bad.csv"), bad).unwrap();
     write_file(

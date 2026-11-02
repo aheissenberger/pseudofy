@@ -55,6 +55,10 @@ pub struct KnownNames {
     /// Last-name tokens that were not all lowercase in some cell.
     cased_last: HashSet<String>,
     persons: HashSet<(Vec<String>, Vec<String>)>,
+    /// Folded token → the first spelling seen in a name column. The
+    /// pseudonym comes from this spelling, so `STRAUSS` in free text gets the
+    /// pseudonym of `Strauß` in the column.
+    canon: HashMap<String, String>,
 }
 
 fn is_token_char(c: char) -> bool {
@@ -160,8 +164,8 @@ fn initial_gap(gap: &str) -> bool {
 }
 
 /// Folded tokens of `value` without initials, each with the flag whether it
-/// is all lowercase in the value.
-fn name_tokens(value: &str) -> Vec<(String, bool)> {
+/// is all lowercase in the value and its spelling in the value.
+fn name_tokens(value: &str) -> Vec<(String, bool, String)> {
     let nfc: String = value.nfc().collect();
     lex(&nfc)
         .iter()
@@ -172,7 +176,7 @@ fn name_tokens(value: &str) -> Vec<(String, bool)> {
                 .chars()
                 .filter(|c| c.is_alphabetic())
                 .all(char::is_lowercase);
-            (fold(raw), lower)
+            (fold(raw), lower, raw.to_string())
         })
         .collect()
 }
@@ -199,17 +203,19 @@ impl KnownNames {
     /// Add the tokens of a first-name cell value. Returns the folded tokens.
     pub fn add_first(&mut self, value: &str) -> Vec<String> {
         let tokens = name_tokens(value);
-        for (t, _) in &tokens {
+        for (t, _, raw) in &tokens {
             *self.first_count.entry(t.clone()).or_insert(0) += 1;
+            self.canon.entry(t.clone()).or_insert_with(|| raw.clone());
         }
-        tokens.into_iter().map(|(t, _)| t).collect()
+        tokens.into_iter().map(|(t, _, _)| t).collect()
     }
 
     /// Add the tokens of a last-name cell value. Returns the folded tokens.
     pub fn add_last(&mut self, value: &str) -> Vec<String> {
         let tokens = name_tokens(value);
-        for (t, lower) in &tokens {
+        for (t, lower, raw) in &tokens {
             *self.last_count.entry(t.clone()).or_insert(0) += 1;
+            self.canon.entry(t.clone()).or_insert_with(|| raw.clone());
             let set = if *lower {
                 &mut self.lower_last
             } else {
@@ -217,7 +223,7 @@ impl KnownNames {
             };
             set.insert(t.clone());
         }
-        tokens.into_iter().map(|(t, _)| t).collect()
+        tokens.into_iter().map(|(t, _, _)| t).collect()
     }
 
     /// Add one person from one row: the first-name and last-name cell values
@@ -260,6 +266,7 @@ impl KnownNames {
         if mode == FreeText::Off {
             return Ok(m);
         }
+        m.canon.clone_from(&self.canon);
         for (f, l) in &self.persons {
             let seq: Vec<&String> = f.iter().chain(l).collect();
             insert_split(&mut m.persons, &seq, Split::At(f.len()));
@@ -345,6 +352,7 @@ pub struct Matcher {
     heads: HashSet<String>,
     singles: HashMap<String, Part>,
     max_words: usize,
+    canon: HashMap<String, String>,
 }
 
 fn role(part: Part) -> NameRole {
@@ -513,7 +521,15 @@ impl Matcher {
             let Some(t) = toks.get(idx) else { continue };
             out.push_str(text.get(pos..t.start).unwrap_or(""));
             let token = text.get(t.start..t.end).unwrap_or("");
-            out.push_str(&replace_name(token, role(part), replace));
+            // The pseudonym comes from the column spelling; the case style
+            // comes from the text.
+            let real = folded
+                .get(idx)
+                .and_then(|f| self.canon.get(f))
+                .map_or(token, String::as_str);
+            out.push_str(&replace_name(token, role(part), &mut |p, _| {
+                replace(p, real)
+            }));
             pos = t.end;
         }
         out.push_str(text.get(pos..).unwrap_or(""));
@@ -588,7 +604,22 @@ mod tests {
         });
         assert_eq!(out, "BERTA KUNZ and berta");
         assert_eq!(n, 2);
-        assert_eq!(seen[0], (Part::First, "ANNA".to_string()));
+        // The callback gets the column spelling; the case comes from the text.
+        assert_eq!(seen[0], (Part::First, "Anna".to_string()));
+    }
+
+    #[test]
+    fn folded_match_uses_the_column_spelling() {
+        let mut k = KnownNames::default();
+        k.add_person("Ilse", "Strauß");
+        let m = k.matcher(FreeText::Tokens).unwrap();
+        let mut seen = Vec::new();
+        let (out, n) = m.replace("STRAUSS", &mut |p, t| {
+            seen.push((p, t.to_string()));
+            "Kunz".to_string()
+        });
+        assert_eq!((out.as_str(), n), ("KUNZ", 1));
+        assert_eq!(seen, [(Part::Last, "Strauß".to_string())]);
     }
 
     #[test]
