@@ -4,6 +4,7 @@
 use std::fs;
 use std::io::Write;
 use std::path::Path;
+use std::sync::OnceLock;
 
 use anyhow::{Context, bail};
 use regex::Regex;
@@ -194,14 +195,35 @@ pub(crate) struct CellFns<'a> {
     pub(crate) matcher: Option<&'a Matcher>,
 }
 
+/// `full_name` value without email addresses (they are no name).
+fn without_emails(value: &str) -> String {
+    static REGEX: OnceLock<Option<Regex>> = OnceLock::new();
+    let Some(regex) = REGEX.get_or_init(|| text::email_regex().ok()).as_ref() else {
+        return value.to_owned();
+    };
+    let mut out = String::with_capacity(value.len());
+    let mut pos = 0;
+    for span in text::email_spans(value, regex) {
+        out.push_str(value.get(pos..span.start).unwrap_or(""));
+        out.push(' ');
+        pos = span.end;
+    }
+    out.push_str(value.get(pos..).unwrap_or(""));
+    out
+}
+
 /// Known names found in the name columns of one file (pass 1). They reach
 /// `KnownNames` only through `apply`, after the whole file was read.
+///
+/// A row can have several first-name and last-name cells. All of them give
+/// tokens. If a row has as many first-name as last-name cells, the i-th first
+/// value and the i-th last value form one person; otherwise there is no person.
 #[derive(Default)]
 pub(crate) struct Collector {
-    persons: Vec<(String, String)>,
+    rows: Vec<(Vec<String>, Vec<String>)>,
     fulls: Vec<String>,
-    first: String,
-    last: String,
+    firsts: Vec<String>,
+    lasts: Vec<String>,
 }
 
 impl Collector {
@@ -212,31 +234,38 @@ impl Collector {
             return;
         }
         match role {
-            Some(ColRole::Name(NameRole::First)) if self.first.is_empty() => {
-                value.clone_into(&mut self.first);
-            }
-            Some(ColRole::Name(NameRole::Last)) if self.last.is_empty() => {
-                value.clone_into(&mut self.last);
-            }
-            Some(ColRole::Name(NameRole::Full)) => self.fulls.push(value.to_owned()),
+            Some(ColRole::Name(NameRole::First)) => self.firsts.push(value.to_owned()),
+            Some(ColRole::Name(NameRole::Last)) => self.lasts.push(value.to_owned()),
+            Some(ColRole::Name(NameRole::Full)) => self.fulls.push(without_emails(value)),
             _ => {}
         }
     }
 
-    /// End of a data row: the first-name and last-name cells form one person.
+    /// End of a data row: the first-name and last-name cells form persons.
     pub(crate) fn end_row(&mut self) {
-        if !self.first.is_empty() || !self.last.is_empty() {
-            self.persons.push((
-                std::mem::take(&mut self.first),
-                std::mem::take(&mut self.last),
+        if !self.firsts.is_empty() || !self.lasts.is_empty() {
+            self.rows.push((
+                std::mem::take(&mut self.firsts),
+                std::mem::take(&mut self.lasts),
             ));
         }
     }
 
     pub(crate) fn apply(mut self, known: &mut KnownNames) {
         self.end_row();
-        for (first, last) in &self.persons {
-            known.add_person(first, last);
+        for (firsts, lasts) in &self.rows {
+            if firsts.len() == lasts.len() {
+                for (first, last) in firsts.iter().zip(lasts) {
+                    known.add_person(first, last);
+                }
+            } else {
+                for first in firsts {
+                    known.add_first(first);
+                }
+                for last in lasts {
+                    known.add_last(last);
+                }
+            }
         }
         for value in &self.fulls {
             known.add_full(value);
@@ -355,4 +384,68 @@ pub(crate) fn missing_headers(headers: &[String], columns: &Columns) -> Vec<(Str
         .filter(|(_, text)| !headers.contains(text))
         .cloned()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::FreeText;
+
+    fn count(known: &KnownNames, mode: FreeText, text: &str) -> usize {
+        let matcher = known.matcher(mode).unwrap();
+        matcher.replace(text, &mut |_, _| "X".to_owned()).1
+    }
+
+    fn first() -> ColRole {
+        ColRole::Name(NameRole::First)
+    }
+
+    fn last() -> ColRole {
+        ColRole::Name(NameRole::Last)
+    }
+
+    #[test]
+    fn several_name_columns_pair_by_position() {
+        let mut c = Collector::default();
+        c.cell(Some(first()), "Zorbina");
+        c.cell(Some(first()), "Tamsorin");
+        c.cell(Some(last()), "Quenzel");
+        c.cell(Some(last()), "Velgrad");
+        c.end_row();
+        // Unequal counts: tokens only, no person.
+        c.cell(Some(first()), "Mirwen");
+        c.cell(Some(first()), "Ostrel");
+        c.cell(Some(last()), "Dunhaldt");
+        c.end_row();
+        let mut known = KnownNames::default();
+        c.apply(&mut known);
+        assert_eq!(count(&known, FreeText::Full, "Zorbina Quenzel"), 1);
+        assert_eq!(count(&known, FreeText::Full, "Tamsorin Velgrad"), 1);
+        assert_eq!(count(&known, FreeText::Full, "Zorbina Velgrad"), 0);
+        assert_eq!(count(&known, FreeText::Full, "Mirwen Dunhaldt"), 0);
+        for name in ["Tamsorin", "Velgrad", "Mirwen", "Ostrel", "Dunhaldt"] {
+            assert_eq!(count(&known, FreeText::Tokens, name), 1, "{name}");
+        }
+    }
+
+    #[test]
+    fn full_name_without_email() {
+        let mut c = Collector::default();
+        c.cell(
+            Some(ColRole::Name(NameRole::Full)),
+            "Ottilie Wenzhart <ottilie.wenzhart@firma.test>",
+        );
+        c.cell(
+            Some(ColRole::Name(NameRole::Full)),
+            "Berta Kunzl ottilie.x@firma.test",
+        );
+        c.end_row();
+        let mut known = KnownNames::default();
+        c.apply(&mut known);
+        assert_eq!(count(&known, FreeText::Full, "Ottilie Wenzhart"), 1);
+        assert_eq!(count(&known, FreeText::Full, "Berta Kunzl"), 1);
+        for word in ["firma", "test", "x"] {
+            assert_eq!(count(&known, FreeText::Tokens, word), 0, "{word}");
+        }
+    }
 }
