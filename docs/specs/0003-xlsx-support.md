@@ -49,39 +49,39 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] All rules and invariants of spec 0002, section 3, apply to XLSX files.
-- [ ] pseudofy processes each sheet, also hidden sheets.
-- [ ] Each sheet has its own header row: the first non-empty row of that sheet.
-- [ ] A rule column that a sheet does not have is skipped for that sheet, without an error.
-- [ ] One real value gets one pseudonym in all sheets and all files.
-- [ ] pseudofy changes only string cells. Number, date, boolean, and formula cells stay unchanged.
-- [ ] No stale copy of a replaced cell value stays in the output package. This includes `xl/sharedStrings.xml`, cached formula results, and `mailto:` hyperlinks.
-- [ ] pseudofy prints one warning for each workbook with comments, charts, data validations, headers or footers, or conditional formatting. The warning names the kinds, never their content.
-- [ ] pseudofy clears each hyperlink tooltip. In a `mailto:` URL, pseudofy decodes percent escapes, replaces the address, and removes the query part.
-- [ ] The copy keeps sheet names, sheet order, cell styles, column widths, and merged cells.
-- [ ] `src/xlsx_file.rs` and `src/csv_file.rs` use the same replacement function from `src/cells.rs`.
+- [x] All rules and invariants of spec 0002, section 3, apply to XLSX files.
+- [x] pseudofy processes each sheet, also hidden sheets.
+- [x] Each sheet has its own header row: the first non-empty row of that sheet.
+- [x] A rule column that a sheet does not have is skipped for that sheet, without an error.
+- [x] One real value gets one pseudonym in all sheets and all files.
+- [x] pseudofy changes only string cells. Number, date, boolean, and formula cells stay unchanged.
+- [x] No stale copy of a replaced cell value stays in the output package. This includes `xl/sharedStrings.xml`, cached formula results, and `mailto:` hyperlinks.
+- [x] pseudofy prints one warning for each workbook with comments, charts, data validations, headers or footers, or conditional formatting. The warning names the kinds, never their content.
+- [x] pseudofy clears each hyperlink tooltip. In a `mailto:` URL, pseudofy decodes percent escapes, replaces the address, and removes the query part.
+- [x] The copy keeps sheet names, sheet order, cell styles, column widths, and merged cells.
+- [x] `src/xlsx_file.rs` and `src/csv_file.rs` use the same replacement function from `src/cells.rs`.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] A name in a CSV file and in an XLSX file of one project gets the same pseudonym.
-- [ ] A workbook with three sheets gives a copy with three sheets in the same order and with the same names.
-- [ ] Two sheets with different header rows get their names replaced in the correct columns.
-- [ ] A name in sheet 1 and in sheet 2 gets the same pseudonym.
-- [ ] A rule with `sheets = ["Kunden*"]` changes the sheet `Kunden 2025` and does not change the sheet `Notizen`.
-- [ ] A hidden sheet is processed and stays hidden.
-- [ ] A bold cell stays bold after the replacement.
-- [ ] A formula cell keeps its formula. `run` reports the formula cell count for each file.
-- [ ] A damaged `.xlsx` file makes `run` report the file and continue with the other files. The exit code is non-zero.
-- [ ] A `.xlsx` file that makes the XLSX crate panic gives one error line without a real value.
-- [ ] A workbook with a pivot cache is reported as a failed file. pseudofy writes no copy of it.
-- [ ] A `mailto:` hyperlink of a replaced email cell gets the fake address.
-- [ ] Column widths, merged cells, and rich-text cells survive a run. `run` reports the rich-text cell count.
+- [x] A name in a CSV file and in an XLSX file of one project gets the same pseudonym.
+- [x] A workbook with three sheets gives a copy with three sheets in the same order and with the same names.
+- [x] Two sheets with different header rows get their names replaced in the correct columns.
+- [x] A name in sheet 1 and in sheet 2 gets the same pseudonym.
+- [x] A rule with `sheets = ["Kunden*"]` changes the sheet `Kunden 2025` and does not change the sheet `Notizen`.
+- [x] A hidden sheet is processed and stays hidden.
+- [x] A bold cell stays bold after the replacement.
+- [x] A formula cell keeps its formula. `run` reports the formula cell count for each file.
+- [x] A damaged `.xlsx` file makes `run` report the file and continue with the other files. The exit code is non-zero.
+- [x] A `.xlsx` file that makes the XLSX crate panic gives one error line without a real value.
+- [x] A workbook with a pivot cache is reported as a failed file. pseudofy writes no copy of it.
+- [x] A `mailto:` hyperlink of a replaced email cell gets the fake address.
+- [x] Column widths, merged cells, and rich-text cells survive a run. `run` reports the rich-text cell count.
 
 **Tests to add/update:**
 
-- [ ] `tests/xlsx.rs` — all behaviors above.
+- [x] `tests/xlsx.rs` — all behaviors above.
 
 **Commands that must pass:**
 
