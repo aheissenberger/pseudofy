@@ -1,8 +1,3 @@
-#![expect(
-    dead_code,
-    reason = "spec 0002 skeleton; the orchestrator removes this after the last task merge"
-)]
-
 mod config;
 mod csv_file;
 mod key;
