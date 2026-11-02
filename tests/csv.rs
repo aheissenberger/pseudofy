@@ -1320,3 +1320,89 @@ fn empty_csv_with_a_matching_rule_gets_a_copy() {
     let out = run_clean(dir.path());
     assert!(out.path().join("empty.csv").exists());
 }
+
+#[test]
+fn escaped_quote_does_not_hide_an_unclosed_quote() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "id,name,email\n\"1\"\"a,Zorbina Quenzel,zorbina@acme.test\n2,Tamsorin Velgrad,tamsorin@acme.test\n",
+    );
+    let (out, stderr) = run_failing(dir.path());
+    assert_error_line(&stderr, "data.csv: unclosed quote");
+    assert!(!out.path().join("data.csv").exists());
+}
+
+#[test]
+fn valid_field_with_an_escaped_quote_and_a_delimiter_is_kept() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "name,email,note\nZorbina Quenzel,zorbina@acme.test,\"x\"\" y,\"\n",
+    );
+    let (out, _) = run_ok(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_real_value(&text, "copy");
+    assert!(text.ends_with(",\"x\"\" y,\"\n"), "{text}");
+}
+
+#[test]
+fn title_with_one_header_text_does_not_hide_the_real_header() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "Export der Felder Name, Email\nname,email\nZorbina Quenzel,zorbina@acme.test\n",
+    );
+    let (out, _) = run_ok(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_real_value(&text, "copy");
+    assert!(text.starts_with("Export der Felder Name, Email\nname,email\n"));
+}
+
+#[test]
+fn two_rows_with_the_same_highest_header_count_fail_the_file() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "name,x\nemail,y\nZorbina Quenzel,zorbina@acme.test\n",
+    );
+    let (out, stderr) = run_failing(dir.path());
+    assert_error_line(&stderr, "data.csv: header row is ambiguous");
+    assert!(!out.path().join("data.csv").exists());
+}
+
+#[test]
+fn semicolon_file_with_a_comma_title_uses_the_semicolon() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "Liste: Name, Email\nname;email\nZorbina Quenzel;zorbina@acme.test\n",
+    );
+    let (out, _) = run_ok(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_real_value(&text, "copy");
+    let data = text.lines().nth(2).unwrap();
+    assert_eq!(data.matches(';').count(), 1, "{text}");
+    assert!(text.contains("\nname;email\n"), "{text}");
+}
+
+#[test]
+fn changed_header_line_keeps_the_quotes_of_unchanged_fields() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "data.csv",
+        "\"name\",\"Kontakt zorbina@acme.test\"\nZorbina Quenzel,x\n",
+    );
+    let (out, _) = run_ok(dir.path());
+    let text = read(out.path(), "data.csv");
+    assert_no_real_value(&text, "copy");
+    let header = text.lines().next().unwrap();
+    assert!(header.starts_with("\"name\",\"Kontakt "), "{header}");
+    assert!(header.ends_with('"'), "{header}");
+}

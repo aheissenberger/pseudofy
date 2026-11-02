@@ -8,8 +8,9 @@ use csv::{ByteRecord, ReaderBuilder, Terminator, WriterBuilder};
 use encoding_rs::WINDOWS_1252;
 
 use crate::cells::{
-    CellFns, ColRole, Collector, Columns, HEADER_SEARCH_ROWS, Kind, collect_columns, failing_rule,
-    role_of, row_has_header, transform_cell, transform_text_cell, write_output,
+    CellFns, ColRole, Collector, Columns, HEADER_SEARCH_ROWS, HeaderPick, Kind, collect_columns,
+    failing_rule, header_count, pick_header, role_of, transform_cell, transform_text_cell,
+    write_output,
 };
 use crate::config::Rule;
 use crate::known_names::KnownNames;
@@ -190,59 +191,111 @@ fn first_record(body: &[u8]) -> (&[u8], &'static [u8]) {
     (body, b"\n")
 }
 
-/// The delimiter of the file. It is the first of `,`, `;` and tab (the one of
-/// the first record comes first) for which one of the first 20 non-empty
-/// records has a configured header text. Else it is the one of the first record.
-fn find_delimiter(body: &[u8], columns: &Columns) -> u8 {
+/// Header counts of the first 20 non-empty records under `delimiter`.
+fn header_counts(body: &[u8], delimiter: u8, columns: &Columns) -> Vec<usize> {
+    let mut reader = ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .delimiter(delimiter)
+        .from_reader(body);
+    let mut record = ByteRecord::new();
+    let mut counts = Vec::new();
+    while counts.len() < HEADER_SEARCH_ROWS
+        && matches!(reader.read_byte_record(&mut record), Ok(true))
+    {
+        let Some(texts) = record_texts(&record) else {
+            continue;
+        };
+        if texts.iter().all(String::is_empty) {
+            continue;
+        }
+        counts.push(header_count(&texts, columns));
+    }
+    counts
+}
+
+/// Delimiter and header row of a file.
+struct Layout {
+    delimiter: u8,
+    pick: HeaderPick,
+    /// Non-empty records among the first 20.
+    searched: usize,
+}
+
+/// The delimiter is the one of `,`, `;` and tab whose best header row has the
+/// most header texts. Ties go to the guess from the first record, then to the
+/// order `,` `;` tab.
+fn find_layout(body: &[u8], columns: &Columns) -> Layout {
     let fallback = detect_delimiter(first_record(body).0);
     let mut candidates = vec![fallback];
     candidates.extend(b",;\t".iter().copied().filter(|&d| d != fallback));
+    let mut best: Option<(usize, Layout)> = None;
     for delimiter in candidates {
-        let mut reader = ReaderBuilder::new()
-            .has_headers(false)
-            .flexible(true)
-            .delimiter(delimiter)
-            .from_reader(body);
-        let mut record = ByteRecord::new();
-        let mut seen = 0_usize;
-        while seen < HEADER_SEARCH_ROWS && matches!(reader.read_byte_record(&mut record), Ok(true))
-        {
-            let Some(texts) = record_texts(&record) else {
-                continue;
+        let counts = header_counts(body, delimiter, columns);
+        let score = counts.iter().copied().max().unwrap_or(0);
+        if best.as_ref().is_none_or(|(top, _)| score > *top) {
+            let layout = Layout {
+                delimiter,
+                pick: pick_header(&counts),
+                searched: counts.len(),
             };
-            if texts.iter().all(String::is_empty) {
-                continue;
-            }
-            seen += 1;
-            if row_has_header(&texts, columns) {
-                return delimiter;
-            }
+            best = Some((score, layout));
         }
     }
-    fallback
+    best.map_or(
+        Layout {
+            delimiter: fallback,
+            pick: HeaderPick::None,
+            searched: 0,
+        },
+        |(_, layout)| layout,
+    )
+}
+
+/// State of the quote scanner (the states of csv-core).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Scan {
+    FieldStart,
+    Plain,
+    Quoted,
+    /// A quote inside a quoted field: closes it, or starts `""`.
+    QuoteInQuoted,
+}
+
+fn scan_step(state: Scan, byte: u8, delimiter: u8) -> Scan {
+    let boundary = byte == delimiter || byte == b'\n' || byte == b'\r';
+    match state {
+        Scan::Quoted if byte == b'"' => Scan::QuoteInQuoted,
+        Scan::Quoted => Scan::Quoted,
+        Scan::QuoteInQuoted | Scan::FieldStart if byte == b'"' => Scan::Quoted,
+        _ if boundary => Scan::FieldStart,
+        _ => Scan::Plain,
+    }
 }
 
 /// `true` if a quoted field is still open at the end of `body`. A quote opens
 /// a field only at the start of a field; `""` in a quoted field is a quote.
 fn has_unclosed_quote(body: &[u8], delimiter: u8) -> bool {
-    let mut quoted = false;
-    let mut field_start = true;
-    for &byte in body {
-        if quoted {
-            if byte == b'"' {
-                quoted = false;
-                field_start = false;
-            }
-            continue;
+    body.iter().fold(Scan::FieldStart, |state, &byte| {
+        scan_step(state, byte, delimiter)
+    }) == Scan::Quoted
+}
+
+/// Split one record (without its terminator) into the raw bytes of its fields.
+fn raw_fields(record: &[u8], delimiter: u8) -> Vec<&[u8]> {
+    let mut fields = Vec::new();
+    let mut state = Scan::FieldStart;
+    let mut begin = 0;
+    for (index, &byte) in record.iter().enumerate() {
+        let quoted = matches!(state, Scan::Quoted);
+        if byte == delimiter && !quoted {
+            fields.push(record.get(begin..index).unwrap_or(&[]));
+            begin = index + 1;
         }
-        match byte {
-            b'"' if field_start => quoted = true,
-            b'\n' | b'\r' => field_start = true,
-            _ if byte == delimiter => field_start = true,
-            _ => field_start = false,
-        }
+        state = scan_step(state, byte, delimiter);
     }
-    quoted
+    fields.push(record.get(begin..).unwrap_or(&[]));
+    fields
 }
 
 /// Trimmed lowercase text of each field. `None` if a field is not valid UTF-8.
@@ -257,42 +310,116 @@ fn record_texts(record: &ByteRecord) -> Option<Vec<String>> {
         .collect()
 }
 
-/// The header search: the first of the first 20 non-empty records with a
-/// configured header text is the header. Records before it are title rows.
-#[derive(Default)]
+/// The place of a record relative to the header row.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Title,
+    Header,
+    Data,
+}
+
+/// Walks the records and tells where each is relative to the header row
+/// that `find_layout` picked.
 struct HeaderSearch {
-    /// Normalized texts of the header record, once found.
+    /// Index of the header among the non-empty records.
+    header_at: Option<usize>,
+    /// Non-empty records seen.
+    seen: usize,
+    passed: bool,
+    /// Normalized texts of the header record, once reached.
     header: Option<Vec<String>>,
     /// Column roles from the header.
     roles: Vec<Option<ColRole>>,
-    /// Non-empty records seen while searching.
-    searched: usize,
 }
 
 impl HeaderSearch {
-    fn found(&self) -> bool {
-        self.header.is_some()
+    fn new(pick: HeaderPick) -> Self {
+        Self {
+            header_at: match pick {
+                HeaderPick::At(index) => Some(index),
+                _ => None,
+            },
+            seen: 0,
+            passed: false,
+            header: None,
+            roles: Vec::new(),
+        }
     }
 
-    /// Look at the next record. `true` if it is the header.
-    fn check(&mut self, record: &ByteRecord, columns: &Columns) -> bool {
-        if self.found() || self.searched >= HEADER_SEARCH_ROWS {
-            return false;
+    fn place(&mut self, record: &ByteRecord, columns: &Columns) -> Place {
+        if self.passed {
+            return Place::Data;
         }
         let Some(texts) = record_texts(record) else {
-            return false;
+            return Place::Title;
         };
         if texts.iter().all(String::is_empty) {
-            return false;
+            return Place::Title;
         }
-        self.searched += 1;
-        if !row_has_header(&texts, columns) {
-            return false;
+        let index = self.seen;
+        self.seen += 1;
+        if self.header_at != Some(index) {
+            return Place::Title;
         }
         self.roles = texts.iter().map(|h| role_of(h, columns)).collect();
         self.header = Some(texts);
-        true
+        self.passed = true;
+        Place::Header
     }
+}
+
+/// Bytes of a changed record. Unchanged fields keep their original bytes
+/// (also their quotes). A changed field is quoted if the original was quoted
+/// or if the CSV writer needs quotes. `None` on a write error.
+fn render_changed(
+    raw: &[u8],
+    original: &ByteRecord,
+    out: &ByteRecord,
+    delimiter: u8,
+    builder: &WriterBuilder,
+    line_end: &[u8],
+) -> Option<Vec<u8>> {
+    let raws = raw_fields(raw, delimiter);
+    if raws.len() != original.len() {
+        let mut bytes = Vec::new();
+        render(builder, out, &mut bytes)?;
+        return Some(bytes);
+    }
+    let mut bytes = Vec::with_capacity(raw.len() + line_end.len());
+    for (index, (field, new)) in raws.iter().zip(out.iter()).enumerate() {
+        if index > 0 {
+            bytes.push(delimiter);
+        }
+        if original.get(index) == Some(new) {
+            bytes.extend_from_slice(field);
+        } else if field.first() == Some(&b'"') {
+            bytes.push(b'"');
+            for &byte in new {
+                if byte == b'"' {
+                    bytes.push(b'"');
+                }
+                bytes.push(byte);
+            }
+            bytes.push(b'"');
+        } else if new.is_empty() {
+            // Nothing to write; a lone empty field needs no quotes here.
+        } else {
+            let mut one = ByteRecord::new();
+            one.push_field(new);
+            let mut rendered = Vec::new();
+            render(builder, &one, &mut rendered)?;
+            rendered.truncate(rendered.len().saturating_sub(line_end.len()));
+            bytes.extend_from_slice(&rendered);
+        }
+    }
+    bytes.extend_from_slice(line_end);
+    Some(bytes)
+}
+
+/// The record bytes without the terminator.
+fn without_terminator(bytes: &[u8]) -> &[u8] {
+    let bytes = bytes.strip_suffix(b"\n").unwrap_or(bytes);
+    bytes.strip_suffix(b"\r").unwrap_or(bytes)
 }
 
 /// Parse the file and transform each row. Rows above the header and the header
@@ -313,9 +440,13 @@ fn transform(
         None => (false, input),
     };
     let (_, line_end) = first_record(body);
-    let delimiter = find_delimiter(body, columns);
+    let layout = find_layout(body, columns);
+    let delimiter = layout.delimiter;
     if has_unclosed_quote(body, delimiter) {
         return Err(anyhow!("{rel}: unclosed quote"));
+    }
+    if layout.pick == HeaderPick::Ambiguous {
+        return Err(anyhow!("{rel}: header row is ambiguous"));
     }
     let ends_with_newline = body.ends_with(b"\n") || body.ends_with(b"\r");
 
@@ -331,7 +462,7 @@ fn transform(
         .flexible(true);
     let mut out_bytes: Vec<u8> = Vec::new();
 
-    let mut search = HeaderSearch::default();
+    let mut search = HeaderSearch::new(layout.pick);
     let mut replaced = 0_usize;
     let mut free_text = 0_usize;
     let mut record = ByteRecord::new();
@@ -362,8 +493,7 @@ fn transform(
         let verbatim = body.get(prev_end..end).unwrap_or(&[]);
         prev_end = end;
 
-        let is_header = search.check(&record, columns);
-        let data = search.found() && !is_header;
+        let data = search.place(&record, columns) == Place::Data;
         if let Some(collector) = collect.as_deref_mut() {
             if data {
                 collect_record(&record, &search.roles, collector)
@@ -387,13 +517,15 @@ fn transform(
             continue;
         }
         out_bytes.extend(line_end.repeat(usize::try_from(blanks).unwrap_or(0)));
-        render(&writer_builder, &out, &mut out_bytes)
+        let raw = without_terminator(body.get(start..end).unwrap_or(&[]));
+        let bytes = render_changed(raw, &record, &out, delimiter, &writer_builder, line_end)
             .ok_or_else(|| anyhow!("{rel}: cannot write line {line}"))?;
+        out_bytes.extend_from_slice(&bytes);
     }
     // Fail closed: a rule that finds none of its headers in the header row.
     // A file without a non-empty record (`searched == 0`) has nothing to leak.
     let failing = failing_rule(rules, search.header.as_deref(), columns);
-    if let Some(glob) = failing.filter(|_| search.searched > 0) {
+    if let Some(glob) = failing.filter(|_| layout.searched > 0) {
         return Err(anyhow!(
             "{rel}: no header of rule \"{glob}\" in the first {HEADER_SEARCH_ROWS} rows"
         ));
@@ -403,19 +535,24 @@ fn transform(
         out_bytes.extend(line_end.repeat(usize::try_from(count_breaks(rest)).unwrap_or(0)));
     }
 
+    Ok(Transformed {
+        bytes: assemble(&out_bytes, bom, ends_with_newline, line_end),
+        replaced,
+        free_text,
+    })
+}
+
+/// Add the BOM and drop a final terminator that the input did not have.
+fn assemble(out_bytes: &[u8], bom: bool, ends_with_newline: bool, line_end: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(out_bytes.len() + BOM.len());
     if bom {
         bytes.extend_from_slice(BOM);
     }
-    bytes.extend_from_slice(&out_bytes);
+    bytes.extend_from_slice(out_bytes);
     if !ends_with_newline && bytes.ends_with(line_end) {
         bytes.truncate(bytes.len() - line_end.len());
     }
-    Ok(Transformed {
-        bytes,
-        replaced,
-        free_text,
-    })
+    bytes
 }
 
 /// Transform each field of a title row or header record. `None` if a field is
@@ -920,7 +1057,7 @@ mod tests {
     fn email_in_the_header_line_is_replaced_and_header_texts_stay() {
         let input = b"\xEF\xBB\xBFemail,\"a@b.test\"\r\nx@y.test,1\r\n";
         let out = strict(input).unwrap();
-        assert_eq!(out, "\u{feff}email,f8@x.test\r\nf8@x.test,1\r\n");
+        assert_eq!(out, "\u{feff}email,\"f8@x.test\"\r\nf8@x.test,1\r\n");
     }
 
     #[test]
@@ -955,5 +1092,56 @@ mod tests {
             out,
             "\"Titel\" ,x\r\n\r\n\"email\",\"y\"\r\nf8@x.test,1\r\n"
         );
+    }
+
+    #[test]
+    fn escaped_quote_keeps_the_field_open() {
+        let open = b"id,name\n\"1\"\"a,Z\nnext,row\n";
+        assert!(has_unclosed_quote(open, b','));
+        assert_eq!(
+            strict(b"email,x\n\"1\"\"a,Z\n2,Y\n")
+                .unwrap_err()
+                .to_string(),
+            "t.csv: unclosed quote"
+        );
+        assert!(!has_unclosed_quote(b"a,\"x\"\" y,\"\n", b','));
+        assert!(!has_unclosed_quote(b"a;\"x\"\" y;\"\n", b';'));
+        assert!(strict(b"email,note\na@b.test,\"x\"\" y,\"\n").is_ok());
+    }
+
+    #[test]
+    fn raw_fields_split_at_unquoted_delimiters_only() {
+        let fields = raw_fields(b"\"a,b\",\"x\"\"y\",,z", b',');
+        assert_eq!(
+            fields,
+            [&b"\"a,b\""[..], &b"\"x\"\"y\""[..], &b""[..], &b"z"[..]]
+        );
+    }
+
+    #[test]
+    fn header_with_most_texts_wins_and_ties_fail() {
+        let out = strict(b"Felder Name, email\nx,email\nq,a@b.test\n").unwrap_err();
+        assert_eq!(out.to_string(), "t.csv: header row is ambiguous");
+        let out = strict(b"Felder x, email\nemail,\"y\"\nq,a@b.test\n");
+        assert!(out.is_err());
+    }
+
+    #[test]
+    fn delimiter_with_the_best_header_row_wins() {
+        let cols = columns();
+        let layout = find_layout(b"Liste: Name, Email\nname;email\nZ;a@b.test\n", &cols);
+        assert_eq!(layout.delimiter, b';');
+        assert_eq!(layout.pick, HeaderPick::At(1));
+        let layout = find_layout(b"name\temail\nZ\ta@b.test\n", &cols);
+        assert_eq!(layout.delimiter, b'\t');
+    }
+
+    #[test]
+    fn changed_record_keeps_the_original_bytes_of_unchanged_fields() {
+        let out = strict(b"\"email\",\"x a@b.test\"\n\"a@b.test\",\"keep\"\n").unwrap();
+        assert_eq!(out, "\"email\",\"x f8@x.test\"\n\"f8@x.test\",\"keep\"\n");
+        // A changed unquoted field is quoted only if it needs quotes.
+        let out = strict(b"email,x\na@b.test,1\n").unwrap();
+        assert_eq!(out, "email,x\nf8@x.test,1\n");
     }
 }

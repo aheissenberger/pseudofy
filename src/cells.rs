@@ -377,9 +377,42 @@ pub(crate) fn role_of(header: &str, columns: &Columns) -> Option<ColRole> {
 /// Number of non-empty rows (CSV records, sheet rows) in which the header is searched.
 pub(crate) const HEADER_SEARCH_ROWS: usize = 20;
 
-/// `true` if one of the normalized `texts` is a configured header text.
-pub(crate) fn row_has_header(texts: &[String], columns: &Columns) -> bool {
-    texts.iter().any(|text| role_of(text, columns).is_some())
+/// Number of the normalized `texts` that are exactly a configured header text.
+pub(crate) fn header_count(texts: &[String], columns: &Columns) -> usize {
+    texts
+        .iter()
+        .filter(|text| role_of(text, columns).is_some())
+        .count()
+}
+
+/// Result of the header search over the header counts of the first rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeaderPick {
+    /// No row has a header text.
+    None,
+    /// Index (among the searched rows) of the row with the most header texts.
+    At(usize),
+    /// Two rows share the highest count.
+    Ambiguous,
+}
+
+/// The header is the row with the most header texts. `counts` has one entry per
+/// non-empty row; only the first `HEADER_SEARCH_ROWS` count.
+pub(crate) fn pick_header(counts: &[usize]) -> HeaderPick {
+    let window = counts.get(..HEADER_SEARCH_ROWS).unwrap_or(counts);
+    let max = window.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return HeaderPick::None;
+    }
+    let mut best = window
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count == max)
+        .map(|(index, _)| index);
+    match (best.next(), best.next()) {
+        (Some(index), None) => HeaderPick::At(index),
+        _ => HeaderPick::Ambiguous,
+    }
 }
 
 /// Replace emails and known names in a title row or header cell. A cell whose
@@ -482,12 +515,26 @@ mod tests {
     }
 
     #[test]
-    fn header_row_needs_a_configured_text() {
-        let yes = vec!["titel".to_owned(), "email".to_owned()];
+    fn header_count_counts_exact_header_texts() {
+        let yes = vec!["name".to_owned(), "email".to_owned(), "x".to_owned()];
         let no = vec!["titel".to_owned(), "datum".to_owned()];
-        assert!(row_has_header(&yes, &columns()));
-        assert!(!row_has_header(&no, &columns()));
-        assert!(!row_has_header(&[], &columns()));
+        assert_eq!(header_count(&yes, &columns()), 2);
+        assert_eq!(header_count(&no, &columns()), 0);
+        assert_eq!(header_count(&[], &columns()), 0);
+    }
+
+    #[test]
+    fn pick_header_takes_the_highest_count_and_detects_ties() {
+        assert_eq!(pick_header(&[]), HeaderPick::None);
+        assert_eq!(pick_header(&[0, 0]), HeaderPick::None);
+        assert_eq!(pick_header(&[1, 2, 1]), HeaderPick::At(1));
+        assert_eq!(pick_header(&[2, 1, 2]), HeaderPick::Ambiguous);
+        assert_eq!(pick_header(&[1, 1]), HeaderPick::Ambiguous);
+        // A tie after the first 20 rows does not count.
+        let mut late = vec![0; 25];
+        late[3] = 1;
+        late[22] = 1;
+        assert_eq!(pick_header(&late), HeaderPick::At(3));
     }
 
     #[test]
