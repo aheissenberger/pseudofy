@@ -45,8 +45,11 @@ fn project(free_text: Option<&str>) -> TempDir {
     }
     text.push_str("\n[[rule]]\nfiles = \"**/*.csv\"\n");
     text.push_str(fields);
-    text.push_str("\n[[rule]]\nfiles = \"**/*.xlsx\"\n");
+    text.push_str("\n[[rule]]\nfiles = \"**/people*.xlsx\"\n");
     text.push_str(fields);
+    // Notes workbooks have no person columns: a rule without header texts
+    // never fails (spec 0015) and still gets the free-text replacement.
+    text.push_str("\n[[rule]]\nfiles = \"**/notes*.xlsx\"\n");
     write_file(dir.path(), "config/pseudofy.toml", &text);
     dir
 }
@@ -287,7 +290,9 @@ fn uppercase_name_in_a_text_cell_gets_uppercase_pseudonyms() {
 }
 
 #[test]
-fn header_text_equal_to_a_known_name_stays_unchanged() {
+fn header_text_equal_to_a_known_name_is_replaced() {
+    // Spec 0015: the header line gets known-name replacement, except for the
+    // configured header texts.
     let dir = project(None);
     write_file(
         dir.path(),
@@ -296,8 +301,9 @@ fn header_text_equal_to_a_known_name_stays_unchanged() {
     );
     let (out, _, _) = run_ok(dir.path());
     let t = table(out.path(), "people.csv");
-    assert_eq!(t[0][2], "Zorbina");
     let (first, _) = fakes(&t, 1);
+    assert_eq!(t[0][0], "first_name");
+    assert_eq!(t[0][2], first);
     assert_eq!(t[1][2], first);
 }
 
@@ -486,7 +492,7 @@ fn a_file_that_fails_in_pass_one_adds_no_names() {
 }
 
 #[test]
-fn xlsx_header_equal_to_a_known_name_stays_unchanged() {
+fn xlsx_text_equal_to_a_known_name_is_replaced_in_each_row() {
     let dir = project(None);
     write_file(
         dir.path(),
@@ -502,7 +508,8 @@ fn xlsx_header_equal_to_a_known_name_stays_unchanged() {
     let t = table(out.path(), "people.csv");
     let book = umya_spreadsheet::reader::xlsx::read(out.path().join("notes.xlsx")).unwrap();
     let sheet = book.sheet_by_name("Daten").unwrap();
-    assert_eq!(sheet.value("A1"), "Zorbina");
+    // The notes sheet has no header row: each row is a text row (spec 0015).
+    assert_eq!(sheet.value("A1"), t[1][0]);
     assert_eq!(sheet.value("A2"), t[1][0]);
 }
 

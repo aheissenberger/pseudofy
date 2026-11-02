@@ -11,8 +11,9 @@ use regex::Regex;
 use umya_spreadsheet::{CellRawValue, Workbook, reader, writer};
 
 use crate::cells::{
-    CellFns, ColRole, Collector, EmailFn, Kind, collect_columns, missing_headers, role_of,
-    rules_without_headers, transform_cell, write_output,
+    CellFns, ColRole, Collector, Columns, EmailFn, HEADER_SEARCH_ROWS, HeaderPick, Kind,
+    collect_columns, failing_rule, header_count, pick_header, role_of, transform_cell,
+    transform_text_cell, write_output,
 };
 use crate::config::Rule;
 use crate::known_names::KnownNames;
@@ -79,6 +80,7 @@ pub fn collect(
         cells,
         &mut |_, _| String::new(),
         Some(&mut collector),
+        rel,
     )?;
     collector.apply(known);
     Ok(())
@@ -104,17 +106,7 @@ pub fn process(
         Kind::Last => pseudonymizer.last_name(value),
         Kind::Email => pseudonymizer.email(value),
     };
-    let result = transform(&mut book, rules, cells, &mut replace, None)?;
-    for glob in &result.no_sheet {
-        eprintln!("warning: rule \"{glob}\" matches {rel}, but no sheet matches its sheets globs");
-    }
-    for glob in rules_without_headers(rules, &result.missing) {
-        if !result.no_sheet.iter().any(|g| g == glob) {
-            eprintln!(
-                "warning: rule \"{glob}\" matches {rel}, but the file has none of its headers"
-            );
-        }
-    }
+    let result = transform(&mut book, rules, cells, &mut replace, None, rel)?;
 
     let mut out: Vec<u8> = Vec::new();
     let unwritable = || anyhow!("{rel}: cannot write the workbook");
@@ -230,10 +222,6 @@ fn clear_cached_text(cell: &mut umya_spreadsheet::Cell) {
 /// Result of the transformation of one workbook.
 struct Transformed {
     stats: XlsxStats,
-    /// (rule glob, header text) pairs that no applicable sheet has.
-    missing: Vec<(String, String)>,
-    /// Globs of rules with `sheets` that match no sheet of the workbook.
-    no_sheet: Vec<String>,
 }
 
 fn sheet_rules<'a>(rules: &[&'a Rule]) -> anyhow::Result<Vec<SheetRule<'a>>> {
@@ -276,20 +264,25 @@ fn transform(
     fns: &CellFns,
     replace: &mut dyn FnMut(Kind, &str) -> String,
     mut collect: Option<&mut Collector>,
+    rel: &str,
 ) -> anyhow::Result<Transformed> {
     let (email_regex, emails) = (fns.email_regex, fns.emails);
     let matchers = sheet_rules(rules)?;
-    let all_pairs = missing_headers(&[], &collect_columns(rules));
-    let mut found: Vec<(String, String)> = Vec::new();
     let mut stats = XlsxStats::default();
-    let mut sheet_matched = vec![false; matchers.len()];
+    let names: Vec<String> = book
+        .sheet_collection()
+        .iter()
+        .map(|sheet| sheet.name().to_owned())
+        .collect();
+    if let Some(glob) = unmatched_sheet_rule(&matchers, &names) {
+        return Err(anyhow!("{rel}: rule \"{glob}\" matches no sheet"));
+    }
 
-    for sheet in book.sheet_collection_mut() {
+    for (position, sheet) in book.sheet_collection_mut().iter_mut().enumerate() {
         let name = sheet.name().to_owned();
         let mut applicable: Vec<&Rule> = Vec::new();
-        for (i, (set, rule)) in matchers.iter().enumerate() {
+        for (set, rule) in &matchers {
             if set.as_ref().is_none_or(|set| set.is_match(&name)) {
-                sheet_matched[i] = true;
                 applicable.push(rule);
             }
         }
@@ -299,27 +292,23 @@ fn transform(
             let at = cell.coordinate();
             (at.row_num(), at.col_num())
         });
-        let Some(header_row) = cells
+        let Some(first_row) = cells
             .iter()
             .find(|cell| !cell.value().trim().is_empty())
             .map(|cell| cell.coordinate().row_num())
         else {
             continue;
         };
-        let header_texts = header_texts(&cells, header_row);
-        let texts: Vec<String> = header_texts.values().cloned().collect();
-        let sheet_missing = missing_headers(&texts, &columns);
-        for pair in missing_headers(&[], &columns) {
-            if !sheet_missing.contains(&pair) {
-                found.push(pair);
-            }
-        }
+        let (header_row, header_texts) =
+            sheet_header(&cells, &columns, &applicable, position + 1, rel)?;
         let by_col: HashMap<u32, ColRole> = header_texts
             .iter()
             .filter_map(|(col, text)| role_of(text, &columns).map(|role| (*col, role)))
             .collect();
+        // Rows up to the header (all rows without a header) are text rows.
+        let is_data = |row: u32| header_row.is_some_and(|header| row > header);
 
-        let mut current_row = header_row;
+        let mut current_row = first_row;
         for cell in &mut cells {
             let at = cell.coordinate();
             let (row, col) = (at.row_num(), at.col_num());
@@ -328,35 +317,37 @@ fn transform(
                     collector.end_row();
                     current_row = row;
                 }
-                if row > header_row && !cell.is_formula() {
+                if is_data(row) && !cell.is_formula() {
                     collect_cell(collector, cell, by_col.get(&col).copied());
                 }
                 continue;
             }
             scrub_hyperlink(cell, email_regex, emails, replace);
             if cell.is_formula() {
-                if row > header_row {
+                if header_row.is_none_or(|header| row > header) {
                     stats.formulas += 1;
                 }
                 clear_cached_text(cell);
                 continue;
             }
-            if row <= header_row {
-                continue;
-            }
             let Some((old, rich)) = string_value(cell) else {
                 continue;
             };
-            let new = transform_cell(
-                &old,
-                by_col.get(&col).copied(),
-                fns,
-                &mut |kind, value| {
-                    stats.replaced += 1;
-                    replace(kind, value)
-                },
-                &mut stats.free_text,
-            );
+            let mut count = |kind: Kind, value: &str| {
+                stats.replaced += 1;
+                replace(kind, value)
+            };
+            let new = if is_data(row) {
+                transform_cell(
+                    &old,
+                    by_col.get(&col).copied(),
+                    fns,
+                    &mut count,
+                    &mut stats.free_text,
+                )
+            } else {
+                transform_text_cell(&old, &columns, fns, &mut count, &mut stats.free_text)
+            };
             if new != old {
                 cell.set_value_string(new);
                 if rich {
@@ -368,23 +359,62 @@ fn transform(
     if let Some(collector) = collect {
         collector.end_row();
     }
-    let missing = all_pairs
-        .into_iter()
-        .filter(|pair| !found.contains(pair))
-        .collect();
-    let no_sheet = unmatched_sheet_rules(&matchers, &sheet_matched);
-    Ok(Transformed {
-        stats,
-        missing,
-        no_sheet,
-    })
+    Ok(Transformed { stats })
 }
 
-/// Header texts (trimmed, lowercase) of the header row by column number.
-fn header_texts(cells: &[&mut umya_spreadsheet::Cell], header_row: u32) -> HashMap<u32, String> {
+/// Header search: the row with the most header texts among the first 20
+/// non-empty rows. Returns its row number and its texts; rows above it are
+/// title rows. Fails if the row is ambiguous or if a rule finds none of its
+/// headers. `cells` are sorted by row. `position` is the 1-based sheet position.
+fn sheet_header(
+    cells: &[&mut umya_spreadsheet::Cell],
+    columns: &Columns,
+    applicable: &[&Rule],
+    position: usize,
+    rel: &str,
+) -> anyhow::Result<(Option<u32>, HashMap<u32, String>)> {
+    let rows: Vec<u32> = non_empty_rows(cells)
+        .into_iter()
+        .take(HEADER_SEARCH_ROWS)
+        .collect();
+    let texts: Vec<HashMap<u32, String>> = rows.iter().map(|&row| row_texts(cells, row)).collect();
+    let counts: Vec<usize> = texts
+        .iter()
+        .map(|row| header_count(&row.values().cloned().collect::<Vec<_>>(), columns))
+        .collect();
+    let (row, header) = match pick_header(&counts) {
+        HeaderPick::Ambiguous => {
+            return Err(anyhow!("{rel}: sheet {position}: header row is ambiguous"));
+        }
+        HeaderPick::At(index) => (rows.get(index).copied(), texts.into_iter().nth(index)),
+        HeaderPick::None => (None, None),
+    };
+    let header = header.unwrap_or_default();
+    let values: Vec<String> = header.values().cloned().collect();
+    if let Some(glob) = failing_rule(applicable, row.map(|_| values.as_slice()), columns) {
+        return Err(anyhow!(
+            "{rel}: sheet {position}: no header of rule \"{glob}\" in the first {HEADER_SEARCH_ROWS} rows"
+        ));
+    }
+    Ok((row, header))
+}
+
+/// Row numbers (ascending) of the rows with a non-blank cell value.
+fn non_empty_rows(cells: &[&mut umya_spreadsheet::Cell]) -> Vec<u32> {
+    let mut rows: Vec<u32> = cells
+        .iter()
+        .filter(|cell| !cell.value().trim().is_empty())
+        .map(|cell| cell.coordinate().row_num())
+        .collect();
+    rows.dedup();
+    rows
+}
+
+/// Texts (trimmed, lowercase) of the cells of one row by column number.
+fn row_texts(cells: &[&mut umya_spreadsheet::Cell], row: u32) -> HashMap<u32, String> {
     cells
         .iter()
-        .filter(|cell| cell.coordinate().row_num() == header_row)
+        .filter(|cell| cell.coordinate().row_num() == row)
         .map(|cell| {
             (
                 cell.coordinate().col_num(),
@@ -403,14 +433,15 @@ fn string_value(cell: &umya_spreadsheet::Cell) -> Option<(String, bool)> {
     }
 }
 
-/// Globs of the rules with `sheets` that matched no sheet.
-fn unmatched_sheet_rules(matchers: &[SheetRule], sheet_matched: &[bool]) -> Vec<String> {
+/// Glob of the first rule with `sheets` that matches none of the sheet `names`.
+fn unmatched_sheet_rule<'a>(matchers: &[SheetRule<'a>], names: &[String]) -> Option<&'a str> {
     matchers
         .iter()
-        .zip(sheet_matched)
-        .filter(|((set, _), matched)| set.is_some() && !**matched)
-        .map(|((_, rule), _)| rule.files.clone())
-        .collect()
+        .find(|(set, _)| {
+            set.as_ref()
+                .is_some_and(|set| !names.iter().any(|name| set.is_match(name)))
+        })
+        .map(|(_, rule)| rule.files.as_str())
 }
 
 #[cfg(test)]
@@ -439,6 +470,10 @@ mod tests {
     }
 
     fn run(book: &mut Workbook, rules: &[&Rule]) -> Transformed {
+        try_run(book, rules).unwrap()
+    }
+
+    fn try_run(book: &mut Workbook, rules: &[&Rule]) -> anyhow::Result<Transformed> {
         let regex = text::email_regex().unwrap();
         let fns = CellFns {
             email_regex: &regex,
@@ -446,7 +481,7 @@ mod tests {
             emails: text::replace_emails,
             matcher: None,
         };
-        transform(book, rules, &fns, &mut fake, None).unwrap()
+        transform(book, rules, &fns, &mut fake, None, "t.xlsx")
     }
 
     fn book() -> Workbook {
@@ -494,7 +529,6 @@ mod tests {
         assert!(text_of(&book, "Notizen", "B2").starts_with("F-"));
         assert_eq!(text_of(&book, "Notizen", "A2"), "Berta Muster");
         assert_eq!(result.stats.formulas, 1);
-        assert_eq!(result.missing.len(), 0);
     }
 
     #[test]
@@ -510,10 +544,9 @@ mod tests {
     fn sheets_filter_limits_the_rule() {
         let mut book = book();
         let rule = rule(&["kunden*"]);
-        let result = run(&mut book, &[&rule]);
+        run(&mut book, &[&rule]);
         assert!(text_of(&book, "Kunden 2025", "A3").starts_with("F-"));
         assert_eq!(text_of(&book, "Notizen", "B2"), "Berta Muster");
-        assert_eq!(result.missing.len(), 0);
     }
 
     #[test]
@@ -546,13 +579,87 @@ mod tests {
     }
 
     #[test]
-    fn rule_without_matching_header_is_reported_as_missing() {
+    fn rule_without_matching_header_fails_with_the_sheet_position() {
         let mut book = book();
         let mut rule = rule(&[]);
         rule.full_name = vec!["Nope".to_owned()];
         rule.email = vec![];
-        let result = run(&mut book, &[&rule]);
-        assert_eq!(rules_without_headers(&[&rule], &result.missing).len(), 1);
+        let error = try_run(&mut book, &[&rule]).err().map(|e| e.to_string());
+        assert_eq!(
+            error.as_deref(),
+            Some("t.xlsx: sheet 1: no header of rule \"*.xlsx\" in the first 20 rows")
+        );
+    }
+
+    #[test]
+    fn second_sheet_without_header_fails_and_sheets_glob_avoids_it() {
+        let mut book = umya_spreadsheet::new_file_empty_worksheet();
+        let one = book.new_sheet("Daten").unwrap();
+        one.cell_mut("A1").set_value_string("Name");
+        one.cell_mut("A2").set_value_string("Anna Beispiel");
+        let two = book.new_sheet("Info").unwrap();
+        two.cell_mut("A1").set_value_string("Anna Beispiel");
+        let rule_all = rule(&[]);
+        let error = try_run(&mut book, &[&rule_all])
+            .err()
+            .map(|e| e.to_string());
+        assert_eq!(
+            error.as_deref(),
+            Some("t.xlsx: sheet 2: no header of rule \"*.xlsx\" in the first 20 rows")
+        );
+        let rule_daten = rule(&["Daten"]);
+        run(&mut book, &[&rule_daten]);
+        assert!(text_of(&book, "Daten", "A2").starts_with("F-"));
+        assert_eq!(text_of(&book, "Info", "A1"), "Anna Beispiel");
+    }
+
+    #[test]
+    fn title_row_above_the_header_is_searched_past_and_scrubbed() {
+        let mut book = umya_spreadsheet::new_file_empty_worksheet();
+        let sheet = book.new_sheet("Daten").unwrap();
+        sheet
+            .cell_mut("A1")
+            .set_value_string("Liste von anna@example.org");
+        sheet.cell_mut("A2").set_value_string("Name");
+        sheet.cell_mut("B2").set_value_string("zorbina@example.org");
+        sheet.cell_mut("A3").set_value_string("Anna Beispiel");
+        let rule = rule(&[]);
+        run(&mut book, &[&rule]);
+        assert!(text_of(&book, "Daten", "A1").starts_with("Liste von E-"));
+        assert_eq!(text_of(&book, "Daten", "A2"), "Name");
+        assert!(text_of(&book, "Daten", "B2").starts_with("E-"));
+        assert!(text_of(&book, "Daten", "A3").starts_with("F-"));
+    }
+
+    #[test]
+    fn header_is_searched_only_in_the_first_20_rows() {
+        let mut book = umya_spreadsheet::new_file_empty_worksheet();
+        let sheet = book.new_sheet("Daten").unwrap();
+        for row in 1..=20 {
+            sheet.cell_mut(format!("A{row}")).set_value_string("Titel");
+        }
+        sheet.cell_mut("A21").set_value_string("Name");
+        let rule = rule(&[]);
+        assert!(try_run(&mut book, &[&rule]).is_err());
+        sheet_cell_fix(&mut book);
+        assert!(try_run(&mut book, &[&rule]).is_ok());
+    }
+
+    fn sheet_cell_fix(book: &mut Workbook) {
+        if let Ok(sheet) = book.sheet_by_name_mut("Daten") {
+            sheet.cell_mut("A20").set_value_string("Name");
+        }
+    }
+
+    #[test]
+    fn sheet_without_rules_scrubs_each_row_including_the_first() {
+        let mut book = umya_spreadsheet::new_file_empty_worksheet();
+        let sheet = book.new_sheet("Daten").unwrap();
+        sheet.cell_mut("A1").set_value_string("anna@example.org");
+        sheet.cell_mut("A2").set_value_string("berta@example.org");
+        run(&mut book, &[]);
+        assert!(text_of(&book, "Daten", "A1").starts_with("E-"));
+        assert!(text_of(&book, "Daten", "A2").starts_with("E-"));
     }
 
     #[test]
@@ -681,12 +788,45 @@ mod tests {
     }
 
     #[test]
-    fn rule_with_sheets_that_match_no_sheet_is_reported() {
+    fn rule_with_sheets_that_match_no_sheet_fails() {
         let mut book = book();
         let rule = rule(&["nothing*"]);
-        let result = run(&mut book, &[&rule]);
-        assert_eq!(result.no_sheet, ["*.xlsx"]);
+        let error = try_run(&mut book, &[&rule]).err().map(|e| e.to_string());
+        assert_eq!(
+            error.as_deref(),
+            Some("t.xlsx: rule \"*.xlsx\" matches no sheet")
+        );
         assert_eq!(text_of(&book, "Kunden 2025", "A3"), "Anna Beispiel");
+    }
+
+    #[test]
+    fn header_row_with_most_header_texts_wins() {
+        let mut book = umya_spreadsheet::new_file_empty_worksheet();
+        let sheet = book.new_sheet("Daten").unwrap();
+        sheet.cell_mut("A1").set_value_string("Bericht");
+        sheet.cell_mut("C1").set_value_string("Mail");
+        sheet.cell_mut("A2").set_value_string("Name");
+        sheet.cell_mut("B2").set_value_string("Mail");
+        sheet.cell_mut("A3").set_value_string("Zorbina Quenzel");
+        let rule = rule(&[]);
+        run(&mut book, &[&rule]);
+        assert!(text_of(&book, "Daten", "A3").starts_with("F-"));
+    }
+
+    #[test]
+    fn key_value_layout_with_equal_counts_is_ambiguous() {
+        let mut book = umya_spreadsheet::new_file_empty_worksheet();
+        let sheet = book.new_sheet("Daten").unwrap();
+        sheet.cell_mut("A1").set_value_string("Name");
+        sheet.cell_mut("B1").set_value_string("Zorbina Quenzel");
+        sheet.cell_mut("A2").set_value_string("Mail");
+        sheet.cell_mut("B2").set_value_string("Tamsorin Velgrad");
+        let rule = rule(&[]);
+        let error = try_run(&mut book, &[&rule]).err().map(|e| e.to_string());
+        assert_eq!(
+            error.as_deref(),
+            Some("t.xlsx: sheet 1: header row is ambiguous")
+        );
     }
 
     #[test]

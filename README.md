@@ -72,6 +72,12 @@ Move `pseudofy` to a directory in your `PATH`, for example `/usr/local/bin`.
 
 Keep `project/secrets/pseudofy.key` secret. The same key gives the same fake values in each later run.
 
+pseudofy finds the header row of a CSV file or a sheet in the first 20 non-empty rows. It is the first row with a header text of a rule.
+In the rows above the header (for example a title) and in the header itself, pseudofy replaces emails and known names.
+If a rule matches a file and pseudofy finds none of the header texts of that rule, the file fails and pseudofy writes no copy.
+In a workbook, this check runs for each sheet. Use `sheets` in the rule to skip a sheet without person data.
+A CSV file with an unclosed quote also fails.
+
 By default, `run` writes only the copies of the CSV and XLSX files.
 With `copy_other_files = true` in the config, `run` also copies each other file unchanged, for example a PDF or a text file.
 pseudofy does not check these files. They can contain real names. Check each copied file before you share it.

@@ -374,6 +374,73 @@ pub(crate) fn role_of(header: &str, columns: &Columns) -> Option<ColRole> {
     }
 }
 
+/// Number of non-empty rows (CSV records, sheet rows) in which the header is searched.
+pub(crate) const HEADER_SEARCH_ROWS: usize = 20;
+
+/// Number of the normalized `texts` that are exactly a configured header text.
+pub(crate) fn header_count(texts: &[String], columns: &Columns) -> usize {
+    texts
+        .iter()
+        .filter(|text| role_of(text, columns).is_some())
+        .count()
+}
+
+/// Result of the header search over the header counts of the first rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeaderPick {
+    /// No row has a header text.
+    None,
+    /// Index (among the searched rows) of the row with the most header texts.
+    At(usize),
+    /// Two rows share the highest count.
+    Ambiguous,
+}
+
+/// The header is the row with the most header texts. `counts` has one entry per
+/// non-empty row; only the first `HEADER_SEARCH_ROWS` count.
+pub(crate) fn pick_header(counts: &[usize]) -> HeaderPick {
+    let window = counts.get(..HEADER_SEARCH_ROWS).unwrap_or(counts);
+    let max = window.iter().copied().max().unwrap_or(0);
+    if max == 0 {
+        return HeaderPick::None;
+    }
+    let mut best = window
+        .iter()
+        .enumerate()
+        .filter(|&(_, &count)| count == max)
+        .map(|(index, _)| index);
+    match (best.next(), best.next()) {
+        (Some(index), None) => HeaderPick::At(index),
+        _ => HeaderPick::Ambiguous,
+    }
+}
+
+/// Replace emails and known names in a title row or header cell. A cell whose
+/// text is a configured header text stays unchanged.
+pub(crate) fn transform_text_cell(
+    cell: &str,
+    columns: &Columns,
+    fns: &CellFns,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+    free: &mut usize,
+) -> String {
+    if role_of(&cell.trim().to_lowercase(), columns).is_some() {
+        return cell.to_owned();
+    }
+    transform_cell(cell, None, fns, replace, free)
+}
+
+/// Glob of the first rule that names headers and has none of them in the
+/// header row. `header` is `None` if the search found no header row.
+pub(crate) fn failing_rule<'a>(
+    rules: &[&'a Rule],
+    header: Option<&[String]>,
+    columns: &Columns,
+) -> Option<&'a str> {
+    let missing = missing_headers(header.unwrap_or(&[]), columns);
+    rules_without_headers(rules, &missing).into_iter().next()
+}
+
 pub(crate) fn missing_headers(headers: &[String], columns: &Columns) -> Vec<(String, String)> {
     columns
         .first
@@ -426,6 +493,84 @@ mod tests {
         for name in ["Tamsorin", "Velgrad", "Mirwen", "Ostrel", "Dunhaldt"] {
             assert_eq!(count(&known, FreeText::Tokens, name), 1, "{name}");
         }
+    }
+
+    fn columns() -> Columns {
+        Columns {
+            full: vec![("*.csv".into(), "name".into())],
+            email: vec![("*.csv".into(), "email".into())],
+            ..Columns::default()
+        }
+    }
+
+    fn rule() -> Rule {
+        Rule {
+            files: "*.csv".to_owned(),
+            first_name: vec![],
+            last_name: vec![],
+            full_name: vec!["Name".to_owned()],
+            email: vec!["Email".to_owned()],
+            sheets: vec![],
+        }
+    }
+
+    #[test]
+    fn header_count_counts_exact_header_texts() {
+        let yes = vec!["name".to_owned(), "email".to_owned(), "x".to_owned()];
+        let no = vec!["titel".to_owned(), "datum".to_owned()];
+        assert_eq!(header_count(&yes, &columns()), 2);
+        assert_eq!(header_count(&no, &columns()), 0);
+        assert_eq!(header_count(&[], &columns()), 0);
+    }
+
+    #[test]
+    fn pick_header_takes_the_highest_count_and_detects_ties() {
+        assert_eq!(pick_header(&[]), HeaderPick::None);
+        assert_eq!(pick_header(&[0, 0]), HeaderPick::None);
+        assert_eq!(pick_header(&[1, 2, 1]), HeaderPick::At(1));
+        assert_eq!(pick_header(&[2, 1, 2]), HeaderPick::Ambiguous);
+        assert_eq!(pick_header(&[1, 1]), HeaderPick::Ambiguous);
+        // A tie after the first 20 rows does not count.
+        let mut late = vec![0; 25];
+        late[3] = 1;
+        late[22] = 1;
+        assert_eq!(pick_header(&late), HeaderPick::At(3));
+    }
+
+    #[test]
+    fn failing_rule_names_the_glob_only() {
+        let rule = rule();
+        let rules = [&rule];
+        let columns = collect_columns(&rules);
+        let none = vec!["x".to_owned()];
+        assert_eq!(failing_rule(&rules, Some(&none), &columns), Some("*.csv"));
+        assert_eq!(failing_rule(&rules, None, &columns), Some("*.csv"));
+        let some = vec!["x".to_owned(), "name".to_owned()];
+        assert_eq!(failing_rule(&rules, Some(&some), &columns), None);
+        let empty = Columns::default();
+        assert_eq!(failing_rule(&[], None, &empty), None);
+    }
+
+    #[test]
+    fn header_text_cell_stays_and_others_get_emails_replaced() {
+        let regex = text::email_regex().unwrap();
+        let fns = CellFns {
+            email_regex: &regex,
+            names: text::replace_name,
+            emails: text::replace_emails,
+            matcher: None,
+        };
+        let mut free = 0;
+        let mut replace = |_: Kind, _: &str| "x@y.test".to_owned();
+        let cols = columns();
+        assert_eq!(
+            transform_text_cell(" Email ", &cols, &fns, &mut replace, &mut free),
+            " Email "
+        );
+        assert_eq!(
+            transform_text_cell("Liste von a.b@c.test", &cols, &fns, &mut replace, &mut free),
+            "Liste von x@y.test"
+        );
     }
 
     #[test]

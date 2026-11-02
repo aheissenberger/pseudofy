@@ -200,3 +200,62 @@ fn copy_keeps_the_sparkline_count_of_each_sheet() {
     }
     assert!(total >= 10, "the fixtures must contain sparklines");
 }
+
+// ---- No first name in the copy (spec 0015) ----
+
+/// The first names of the contacts in `fidelity.xlsx` (invented sample data).
+const FIRST_NAMES: [&str; 10] = [
+    "Anna", "Lukas", "Sophie", "Jonas", "Marie", "Felix", "Laura", "Tobias", "Emma", "David",
+];
+
+/// Every part of the package as lossy text.
+fn all_parts_text(path: &Path) -> Vec<(String, String)> {
+    let file = fs::File::open(path).unwrap();
+    let mut archive = zip::ZipArchive::new(file).unwrap();
+    let mut parts = Vec::new();
+    for index in 0..archive.len() {
+        let mut entry = archive.by_index(index).unwrap();
+        let mut data = Vec::new();
+        entry.read_to_end(&mut data).unwrap();
+        parts.push((
+            entry.name().to_owned(),
+            String::from_utf8_lossy(&data).into_owned(),
+        ));
+    }
+    parts
+}
+
+#[test]
+fn copy_has_no_first_name_of_the_input() {
+    let project = project();
+    let out = TempDir::new().unwrap();
+    Command::cargo_bin("pseudofy")
+        .unwrap()
+        .args(["run", "--project"])
+        .arg(project.path())
+        .arg("--out")
+        .arg(out.path())
+        .assert()
+        .success();
+
+    let input = all_parts_text(&project.path().join("fidelity.xlsx"));
+    let strings = &input
+        .iter()
+        .find(|(name, _)| name == "xl/sharedStrings.xml")
+        .unwrap()
+        .1;
+    for name in FIRST_NAMES {
+        assert!(
+            strings.contains(&format!("<t>{name}</t>")),
+            "the input has no first name {name}"
+        );
+    }
+    for (part, text) in all_parts_text(&out.path().join("fidelity.xlsx")) {
+        for name in FIRST_NAMES {
+            assert!(
+                !text.contains(name),
+                "{part} contains the first name {name}"
+            );
+        }
+    }
+}
