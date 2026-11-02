@@ -5,6 +5,7 @@ use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use csv::{ByteRecord, ReaderBuilder, Terminator, WriterBuilder};
+use encoding_rs::WINDOWS_1252;
 use regex::Regex;
 
 use crate::cells::{
@@ -45,7 +46,7 @@ pub fn process(
         Kind::Last => pseudonymizer.last_name(value),
         Kind::Email => pseudonymizer.email(value),
     };
-    let result = transform(
+    let result = transform_encoded(
         &bytes,
         &columns,
         email_regex,
@@ -59,6 +60,40 @@ pub fn process(
     }
     write_output(out_root, output, &result.bytes, rel)?;
     Ok(result.replaced)
+}
+
+/// Transform a UTF-8 or Windows-1252 file. The copy has the encoding of the input.
+fn transform_encoded(
+    input: &[u8],
+    columns: &Columns,
+    email_regex: &Regex,
+    names: NameFn,
+    emails: EmailFn,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+    rel: &str,
+) -> anyhow::Result<Transformed> {
+    let rest = input.strip_prefix(BOM).unwrap_or(input);
+    if std::str::from_utf8(rest).is_ok() {
+        return transform(input, columns, email_regex, names, emails, replace, rel);
+    }
+    let (decoded, _) = WINDOWS_1252.decode_without_bom_handling(input);
+    let mut result = transform(
+        decoded.as_bytes(),
+        columns,
+        email_regex,
+        names,
+        emails,
+        replace,
+        rel,
+    )?;
+    let text = std::str::from_utf8(&result.bytes)
+        .map_err(|_| anyhow!("{rel}: cannot encode the copy in Windows-1252"))?;
+    let (encoded, _, unmappable) = WINDOWS_1252.encode(text);
+    if unmappable {
+        return Err(anyhow!("{rel}: cannot encode the copy in Windows-1252"));
+    }
+    result.bytes = encoded.into_owned();
+    Ok(result)
 }
 
 fn detect_delimiter(header_line: &[u8]) -> u8 {
@@ -357,6 +392,83 @@ mod tests {
 
     fn text(out: Transformed) -> String {
         String::from_utf8(out.bytes).unwrap()
+    }
+
+    fn run_enc(input: &[u8], columns: &Columns) -> anyhow::Result<Transformed> {
+        let regex = text::email_regex().unwrap();
+        transform_encoded(
+            input,
+            columns,
+            &regex,
+            text::replace_name,
+            text::replace_emails,
+            &mut |kind, _| match kind {
+                Kind::First => "Berta".to_owned(),
+                Kind::Last => "Muster".to_owned(),
+                Kind::Email => "f@x.test".to_owned(),
+            },
+            "t.csv",
+        )
+    }
+
+    #[test]
+    fn windows_1252_round_trips_all_bytes() {
+        let all: Vec<u8> = (0..=255).collect();
+        let (decoded, _) = WINDOWS_1252.decode_without_bom_handling(&all);
+        let (encoded, _, unmappable) = WINDOWS_1252.encode(&decoded);
+        assert!(!unmappable);
+        assert_eq!(&*encoded, all.as_slice());
+    }
+
+    #[test]
+    fn windows_1252_file_gets_windows_1252_copy() {
+        let input = b"name;note\r\nJ\xf6rg M\xfcller;caf\xe9 \x80\r\n";
+        let out = run_enc(input, &columns()).unwrap();
+        assert_eq!(out.replaced, 2);
+        assert_eq!(out.bytes, b"name;note\r\nBerta Muster;caf\xe9 \x80\r\n");
+    }
+
+    #[test]
+    fn windows_1252_file_without_values_is_byte_equal() {
+        let input = b"id;ort\r\n1;M\xfcnchen \x81\x8d\x8f\x90\x9d\r\n2;Stra\xdfe";
+        let out = run_enc(input, &columns()).unwrap();
+        assert_eq!(out.replaced, 0);
+        assert_eq!(out.bytes, input);
+    }
+
+    #[test]
+    fn windows_1252_blank_lines_stay() {
+        let input = b"id;m\r\n\r\n1;\xf6\r\n";
+        let out = run_enc(input, &Columns::default()).unwrap();
+        assert_eq!(out.bytes, input);
+    }
+
+    #[test]
+    fn unencodable_copy_is_reported_without_values() {
+        let regex = text::email_regex().unwrap();
+        let error = transform_encoded(
+            b"name\nJ\xf6rg\n",
+            &columns(),
+            &regex,
+            text::replace_name,
+            text::replace_emails,
+            &mut |_, _| "\u{141}".to_owned(),
+            "t.csv",
+        )
+        .err()
+        .map(|e| e.to_string())
+        .unwrap();
+        assert_eq!(error, "t.csv: cannot encode the copy in Windows-1252");
+    }
+
+    #[test]
+    fn utf8_file_is_unchanged_in_behavior() {
+        let input = "name\nJ\u{f6}rg\n".as_bytes();
+        let out = run_enc(input, &columns()).unwrap();
+        assert_eq!(out.bytes, b"name\nMuster\n");
+        let bom = b"\xEF\xBB\xBFname\nAb\n";
+        let out = run_enc(bom, &columns()).unwrap();
+        assert_eq!(out.bytes, b"\xEF\xBB\xBFname\nMuster\n");
     }
 
     #[test]
