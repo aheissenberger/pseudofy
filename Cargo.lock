@@ -898,6 +898,7 @@ dependencies = [
  "globset",
  "hmac",
  "predicates",
+ "quick-xml",
  "regex",
  "serde",
  "sha2",
@@ -907,6 +908,7 @@ dependencies = [
  "umya-spreadsheet",
  "unicode-normalization",
  "walkdir",
+ "zip",
 ]
 
 [[package]]

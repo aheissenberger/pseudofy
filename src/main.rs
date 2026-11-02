@@ -4,10 +4,12 @@ mod csv_file;
 mod key;
 mod locale;
 mod names;
+mod panic_guard;
 mod pseudonym;
 mod run;
 mod text;
 mod xlsx_file;
+mod xlsx_scrub;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -50,15 +52,7 @@ enum Command {
 }
 
 fn main() -> ExitCode {
-    // A panic message can contain a real value. Print only the location.
-    std::panic::set_hook(Box::new(|info| match info.location() {
-        Some(location) => eprintln!(
-            "error: internal error at {}:{}",
-            location.file(),
-            location.line()
-        ),
-        None => eprintln!("error: internal error"),
-    }));
+    panic_guard::install_hook();
     let result = match Cli::parse().command {
         Command::Init { project, language } => init(&project, language),
         Command::Run { project, out } => run(&project, &out),
