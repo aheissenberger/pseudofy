@@ -30,6 +30,9 @@ pub struct Config {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum FreeText {
+    /// No known-name replacement outside the name columns. Emails are still
+    /// replaced in each cell.
+    Off,
     /// Replace only complete full names ("Anna Muster", "Muster, Anna").
     Full,
     /// Also replace each single first-name and last-name token.
@@ -79,7 +82,7 @@ language = "{}"
 # false: each fake email uses example.com. true: each real domain gets one fake subdomain.
 email_subdomains = true
 # Known names in other text cells: "tokens" (default) also replaces single first
-# and last names, "full" only complete full names.
+# and last names, "full" only complete full names, "off" none.
 # free_text = "tokens"
 
 # Each rule selects files with a glob (relative to the project) and names the

@@ -23,7 +23,7 @@
 ### Modified
 
 - `src/run.rs` — two passes. Pass 1 collects the known names from all files. Pass 2 writes the copies.
-- `src/config.rs` — the optional key `free_text` with the values `full` and `tokens`. The default is `tokens`.
+- `src/config.rs` — the optional key `free_text` with the values `off`, `full`, and `tokens`. The default is `tokens`.
 - `src/csv_file.rs`, `src/xlsx_file.rs` — pass 1 reads the name columns of each file. Pass 2 gives the matcher to the cell replacement.
 - `src/cells.rs` — replace known names in each text cell outside the name and email columns, after the emails.
 - `src/config.rs` template from `pseudofy init` — a commented `free_text` line.
@@ -46,6 +46,7 @@
 - [ ] The match is whole-word and case-insensitive. The replacement keeps the case style of the matched text.
 - [ ] `full` replaces only complete full names ("Anna Muster", "Muster, Anna").
 - [ ] `tokens` also replaces each single first-name and last-name token.
+- [ ] `off` replaces no known name outside the name columns. Pass 1 does not run. Emails are still replaced in each cell.
 - [ ] A longer match has priority over a shorter match.
 - [ ] Known names stay in memory only. pseudofy never writes them to a file or a log.
 - [ ] Header rows are not changed.
@@ -58,6 +59,7 @@
 - [ ] "Call Anna Muster" becomes "Call `<fake first> <fake last>`". The fake names are equal to those in the name column.
 - [ ] A known name from a CSV file is replaced in a text cell of an XLSX file in the same project.
 - [ ] With `free_text = "full"`, "Anna said" stays unchanged. With `tokens`, "Anna" is replaced.
+- [ ] With `free_text = "off"`, "Anna Muster said hi" in a text cell stays unchanged. An email in that cell is replaced.
 - [ ] "Annabelle" stays unchanged if only "Anna" is known.
 - [ ] `run` prints `<rel>: <N> free-text replacements` to stdout for each file with N > 0.
 

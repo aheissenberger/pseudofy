@@ -94,7 +94,8 @@ impl KnownNames {
     pub fn matcher(&self, mode: FreeText) -> anyhow::Result<Matcher> {
         // (sort length, pattern)
         let mut alts: BTreeSet<(usize, String)> = BTreeSet::new();
-        for (f, l) in &self.persons {
+        let persons = self.persons.iter().filter(|_| mode != FreeText::Off);
+        for (f, l) in persons {
             let total = size_of(f) + size_of(l);
             let (fp, lp) = (join_pattern(f), join_pattern(l));
             alts.insert((total, format!(r"{fp}\s+{lp}")));
@@ -339,5 +340,9 @@ mod tests {
         }
         k.add_person("Anna", "Muster");
         assert_eq!(run(&k, FreeText::Tokens, "Call Anna Muster").1, 1);
+        assert_eq!(
+            run(&k, FreeText::Off, "Call Anna Muster"),
+            ("Call Anna Muster".to_string(), 0)
+        );
     }
 }

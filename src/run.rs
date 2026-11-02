@@ -8,7 +8,7 @@ use globset::{GlobBuilder, GlobMatcher};
 use walkdir::WalkDir;
 
 use crate::cells::CellFns;
-use crate::config::{self, Rule};
+use crate::config::{self, FreeText, Rule};
 use crate::csv_file;
 use crate::key;
 use crate::known_names::KnownNames;
@@ -110,6 +110,7 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
 
     // Pass 1: collect the known names. A file that fails here is skipped; pass 2
     // reports it.
+    // With `free_text = "off"`, pass 1 does not run.
     let mut known = KnownNames::default();
     let pass1 = CellFns {
         email_regex: &email_regex,
@@ -117,10 +118,13 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
         emails: text::replace_emails,
         matcher: None,
     };
-    collect_known(&items, &pass1, &mut known);
+    let free_text = config.free_text != FreeText::Off;
+    if free_text {
+        collect_known(&items, &pass1, &mut known);
+    }
     let matcher = known.matcher(config.free_text)?;
     let pass2 = CellFns {
-        matcher: Some(&matcher),
+        matcher: free_text.then_some(&matcher),
         ..pass1
     };
 

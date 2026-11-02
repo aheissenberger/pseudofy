@@ -183,6 +183,24 @@ fn mode_full_replaces_only_complete_full_names() {
 }
 
 #[test]
+fn mode_off_replaces_no_known_name_outside_the_name_columns() {
+    let dir = project(Some("off"));
+    write_file(
+        dir.path(),
+        "people.csv",
+        &format!("{HEADER}Zorbina,Quenzel,Zorbina Quenzel said hi to zq@acme.test\n"),
+    );
+    let (out, stdout, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    assert_ne!(t[1][0], "Zorbina");
+    assert_ne!(t[1][1], "Quenzel");
+    let note = &t[1][2];
+    assert!(note.starts_with("Zorbina Quenzel said hi to "), "{note}");
+    assert!(!note.contains("acme.test"), "{note}");
+    assert!(!stdout.contains("free-text"), "{stdout}");
+}
+
+#[test]
 fn mode_tokens_is_the_default_and_replaces_a_single_first_name() {
     for mode in [None, Some("tokens")] {
         let dir = project(mode);
