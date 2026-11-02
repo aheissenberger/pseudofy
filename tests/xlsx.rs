@@ -654,16 +654,24 @@ fn rich_text_cell_in_a_name_column_is_replaced_and_reported() {
 }
 
 #[test]
-fn sheets_glob_without_a_matching_sheet_warns_about_the_sheet_name() {
+fn sheets_glob_without_a_matching_sheet_fails_the_file() {
     let dir = project(Some("[\"Kunden*\"]"));
     save(
         &simple_book("Zorbina Quenzel", "zorbina@acme.test"),
         dir.path(),
         "mappe.xlsx",
     );
-    let (_out, _, stderr) = run_ok(dir.path());
-    assert!(stderr.contains("no sheet"), "stderr: {stderr}");
-    assert!(!stderr.contains("none of its headers"), "stderr: {stderr}");
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    let expected = "error: mappe.xlsx: rule \"**/*.xlsx\" matches no sheet";
+    assert!(
+        stderr.lines().any(|line| line.trim_end() == expected),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("Kunden"), "stderr names a sheet: {stderr}");
+    assert!(!stderr.contains("Daten"), "stderr names a sheet: {stderr}");
+    assert!(!out.path().join("mappe.xlsx").exists());
 }
 
 #[test]
@@ -1446,4 +1454,38 @@ fn failed_workbook_keeps_a_stale_copy_and_the_other_files_are_written() {
     );
     let copy = open(out.path(), "b_good.xlsx");
     assert_ne!(value(&copy, "Daten", "A2"), "Tamsorin Velgrad");
+}
+
+#[test]
+fn header_row_with_the_most_header_texts_wins_over_a_title_row() {
+    let dir = project(None);
+    let mut book = umya_spreadsheet::new_file_empty_worksheet();
+    let sheet = book.new_sheet("Daten").unwrap();
+    set(sheet, "A1", "Bericht");
+    set(sheet, "C1", "email");
+    set(sheet, "A2", "name");
+    set(sheet, "B2", "email");
+    set(sheet, "A3", "Zorbina Quenzel");
+    set(sheet, "B3", "zorbina@acme.test");
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    let copy = open(out.path(), "mappe.xlsx");
+    assert_ne!(value(&copy, "Daten", "A3"), "Zorbina Quenzel");
+    assert_ne!(value(&copy, "Daten", "B3"), "zorbina@acme.test");
+    assert_eq!(value(&copy, "Daten", "A2"), "name");
+}
+
+#[test]
+fn key_value_layout_has_two_equal_header_rows_and_fails() {
+    let dir = project(None);
+    let mut book = umya_spreadsheet::new_file_empty_worksheet();
+    let sheet = book.new_sheet("Daten").unwrap();
+    set(sheet, "A1", "name");
+    set(sheet, "B1", "Zorbina Quenzel");
+    set(sheet, "A2", "email");
+    set(sheet, "B2", "Tamsorin Velgrad");
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, stderr) = run_failing(dir.path());
+    assert_error_line(&stderr, "mappe.xlsx: sheet 1: header row is ambiguous");
+    assert!(!out.path().join("mappe.xlsx").exists());
 }
