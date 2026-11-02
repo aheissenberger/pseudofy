@@ -191,6 +191,28 @@ fn detect_delimiter(header_line: &[u8]) -> u8 {
     }
 }
 
+/// The first record without its terminator, and the terminator style
+/// (`\r\n`, lone `\r`, or `\n` as default). Line breaks inside quotes do not end it.
+fn first_record(body: &[u8]) -> (&[u8], &'static [u8]) {
+    let mut quoted = false;
+    for (index, &byte) in body.iter().enumerate() {
+        match byte {
+            b'"' => quoted = !quoted,
+            b'\n' if !quoted => return (body.get(..index).unwrap_or(body), b"\n"),
+            b'\r' if !quoted => {
+                let head = body.get(..index).unwrap_or(body);
+                return if body.get(index + 1) == Some(&b'\n') {
+                    (head, b"\r\n")
+                } else {
+                    (head, b"\r")
+                };
+            }
+            _ => {}
+        }
+    }
+    (body, b"\n")
+}
+
 fn transform(
     input: &[u8],
     columns: &Columns,
@@ -204,10 +226,9 @@ fn transform(
         Some(rest) => (true, rest),
         None => (false, input),
     };
-    let header_line = body.split(|&b| b == b'\n').next().unwrap_or(&[]);
-    let crlf = body.contains(&b'\n') && header_line.ends_with(b"\r");
+    let (header_line, line_end) = first_record(body);
     let delimiter = detect_delimiter(header_line);
-    let line_end: &[u8] = if crlf { b"\r\n" } else { b"\n" };
+    let crlf = line_end == b"\r\n";
     let ends_with_newline = body.ends_with(b"\n") || body.ends_with(b"\r");
 
     let mut reader = ReaderBuilder::new()
@@ -217,6 +238,8 @@ fn transform(
         .from_reader(body);
     let terminator = if crlf {
         Terminator::CRLF
+    } else if line_end == b"\r" {
+        Terminator::Any(b'\r')
     } else {
         Terminator::Any(b'\n')
     };
@@ -379,6 +402,31 @@ fn name_kind(part: Part) -> Kind {
     }
 }
 
+/// Replace the addresses at `spans`; run the text outside them through `names`.
+fn replace_spans(
+    cell: &str,
+    spans: &[std::ops::Range<usize>],
+    names: NameFn,
+    name_role: NameRole,
+    replace: &mut dyn FnMut(Kind, &str) -> String,
+) -> String {
+    let mut out = String::with_capacity(cell.len());
+    let mut pos = 0;
+    for span in spans {
+        let before = cell.get(pos..span.start).unwrap_or("");
+        out.push_str(&names(before, name_role, &mut |part, token| {
+            replace(name_kind(part), token)
+        }));
+        out.push_str(&replace(Kind::Email, cell.get(span.clone()).unwrap_or("")));
+        pos = span.end;
+    }
+    let rest = cell.get(pos..).unwrap_or("");
+    out.push_str(&names(rest, name_role, &mut |part, token| {
+        replace(name_kind(part), token)
+    }));
+    out
+}
+
 /// Replace names and emails in one cell, depending on the column role.
 fn transform_cell(
     cell: &str,
@@ -395,30 +443,18 @@ fn transform_cell(
     match role {
         Some(ColRole::Name(name_role)) => {
             // Emails first; names only in the text outside the matches.
-            let mut out = String::with_capacity(cell.len());
-            let mut pos = 0;
-            for found in email_regex.find_iter(cell) {
-                let before = cell.get(pos..found.start()).unwrap_or("");
-                out.push_str(&names(before, name_role, &mut |part, token| {
-                    replace(name_kind(part), token)
-                }));
-                out.push_str(&replace(Kind::Email, found.as_str()));
-                pos = found.end();
-            }
-            let rest = cell.get(pos..).unwrap_or("");
-            out.push_str(&names(rest, name_role, &mut |part, token| {
-                replace(name_kind(part), token)
-            }));
-            out
+            replace_spans(
+                cell,
+                &text::email_spans(cell, email_regex),
+                names,
+                name_role,
+                replace,
+            )
         }
         Some(ColRole::Email) => {
-            let mut matched = false;
-            let result = emails(cell, email_regex, &mut |address| {
-                matched = true;
-                replace(Kind::Email, address)
-            });
-            if matched {
-                return result;
+            let spans = text::email_spans(cell, email_regex);
+            if !spans.is_empty() {
+                return replace_spans(cell, &spans, names, NameRole::Full, replace);
             }
             // No address found: the whole trimmed cell is the address.
             let lead = cell.len() - cell.trim_start().len();
@@ -568,10 +604,10 @@ mod tests {
     fn email_column_replaces_matches_or_whole_cell() {
         let input = b"email,x\n a@b.test ,1\n  not an address ,2\nsee a@b.test ok,3\n";
         let out = run(input, &columns());
-        assert_eq!(out.replaced, 3);
+        assert_eq!(out.replaced, 5);
         assert_eq!(
             text(out),
-            "email,x\n x@example.com ,1\n  x@example.com ,2\nsee x@example.com ok,3\n"
+            "email,x\n x@example.com ,1\n  x@example.com ,2\nN x@example.com N,3\n"
         );
     }
 
@@ -622,6 +658,54 @@ mod tests {
         .map(|e| e.to_string())
         .unwrap();
         assert_eq!(error, "t.csv: line 4 is not valid UTF-8");
+    }
+
+    fn run_real(input: &[u8], columns: &Columns) -> String {
+        let regex = text::email_regex().unwrap();
+        let out = transform(
+            input,
+            columns,
+            &regex,
+            text::replace_name,
+            text::replace_emails,
+            &mut |kind, value| match kind {
+                Kind::First => "Berta".to_owned(),
+                Kind::Last => "Muster".to_owned(),
+                Kind::Email => format!("f{}@x.test", value.len()),
+            },
+            "t.csv",
+        )
+        .unwrap();
+        String::from_utf8(out.bytes).unwrap()
+    }
+
+    #[test]
+    fn trailing_dot_address_is_same_in_name_and_email_cells() {
+        let input = b"name,email\nzorbel@acme.test.,zorbel@acme.test\n";
+        let out = run_real(input, &columns());
+        assert_eq!(out, "name,email\nf16@x.test.,f16@x.test\n");
+    }
+
+    #[test]
+    fn display_name_in_email_column_is_replaced() {
+        let input = b"email\n\"\"\"Zorbel Quenzel\"\" <zorbel@acme.test>\"\n";
+        let out = run_real(input, &columns());
+        assert_eq!(out, "email\n\"\"\"Berta Muster\"\" <f16@x.test>\"\n");
+    }
+
+    #[test]
+    fn cr_only_line_endings_are_kept() {
+        let input = b"name,note\rZorbel Quenzel,a\r\rTamsorin Velgrad,b\r";
+        let out = run_real(input, &columns());
+        assert_eq!(out, "name,note\rBerta Muster,a\r\rBerta Muster,b\r");
+    }
+
+    #[test]
+    fn delimiter_comes_from_the_first_record() {
+        assert_eq!(first_record(b"\"a\nb\";c\n1;2\n").0, b"\"a\nb\";c");
+        let input = "\"Kunden\nNr\";name\n1;Zorbel Quenzel\n";
+        let out = run_real(input.as_bytes(), &columns());
+        assert_eq!(out, "\"Kunden\nNr\";name\n1;Berta Muster\n");
     }
 
     #[test]

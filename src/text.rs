@@ -149,8 +149,29 @@ fn apply_case(token: &str, pseudonym: &str) -> String {
 /// Regex that finds email addresses in a cell.
 pub fn email_regex() -> anyhow::Result<Regex> {
     Ok(Regex::new(
-        r#"[^\s@<>(),;:"'\[\]]+@[^\s@<>(),;:"'\[\]]+\.[^\s@<>(),;:"'\[\]]+"#,
+        r#"[^\s@<>(),;:"\[\]]+@[^\s@<>(),;:"'\[\]]+\.[^\s@<>(),;:"'\[\]]+"#,
     )?)
+}
+
+/// Byte ranges of the email addresses in `value`.
+///
+/// A match loses leading and trailing `'` and trailing `.`; they stay plain
+/// text outside the range. A match without a domain with a dot is skipped.
+pub fn email_spans(value: &str, regex: &Regex) -> Vec<std::ops::Range<usize>> {
+    let mut spans = Vec::new();
+    for m in regex.find_iter(value) {
+        let no_tail = m.as_str().trim_end_matches(['.', '\'']);
+        let trimmed = no_tail.trim_start_matches('\'');
+        let lead = no_tail.len() - trimmed.len();
+        let has_domain = trimmed.split_once('@').is_some_and(|(local, domain)| {
+            !local.is_empty() && domain.contains('.') && !domain.starts_with('.')
+        });
+        if has_domain {
+            let start = m.start() + lead;
+            spans.push(start..start + trimmed.len());
+        }
+    }
+    spans
 }
 
 /// Replace each email address in `value` with `replace(address)`.
@@ -161,20 +182,10 @@ pub fn replace_emails(
 ) -> String {
     let mut out = String::with_capacity(value.len());
     let mut pos = 0;
-    for m in regex.find_iter(value) {
-        out.push_str(value.get(pos..m.start()).unwrap_or(""));
-        let matched = m.as_str();
-        let trimmed = matched.trim_end_matches('.');
-        let has_domain = trimmed
-            .split_once('@')
-            .is_some_and(|(_, d)| d.contains('.') && !d.starts_with('.'));
-        if has_domain {
-            out.push_str(&replace(trimmed));
-            out.push_str(matched.get(trimmed.len()..).unwrap_or(""));
-        } else {
-            out.push_str(matched);
-        }
-        pos = m.end();
+    for span in email_spans(value, regex) {
+        out.push_str(value.get(pos..span.start).unwrap_or(""));
+        out.push_str(&replace(value.get(span.clone()).unwrap_or("")));
+        pos = span.end;
     }
     out.push_str(value.get(pos..).unwrap_or(""));
     out
@@ -331,6 +342,25 @@ mod tests {
             replace_emails("no mail @ here", &re, &mut |_| "!".into()),
             "no mail @ here"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn apostrophe_in_local_part() -> anyhow::Result<()> {
+        let re = email_regex()?;
+        let mut rep = |_: &str| "x@y.test".to_string();
+        assert_eq!(
+            replace_emails("mary.o'neil@acme.test", &re, &mut rep),
+            "x@y.test"
+        );
+        assert_eq!(
+            replace_emails("'mary@acme.test'.", &re, &mut rep),
+            "'x@y.test'."
+        );
+        let value = "see 'a@b.test'.";
+        let spans = email_spans(value, &re);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(value.get(spans[0].clone()), Some("a@b.test"));
         Ok(())
     }
 }
