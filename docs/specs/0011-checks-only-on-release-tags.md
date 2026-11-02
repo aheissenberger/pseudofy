@@ -35,22 +35,22 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] No workflow runs on a branch push or a pull request.
+- [x] No workflow runs on a branch push or a pull request.
 - [ ] A tag `v*` runs the checks before the release build. A failed check stops the release.
-- [ ] All rules of spec 0005 §3 apply: actions pinned to a full commit SHA, minimum `permissions:`, only the release job gets `contents: write`, no repository secret.
+- [x] All rules of spec 0005 §3 apply: actions pinned to a full commit SHA, minimum `permissions:`, only the release job gets `contents: write`, no repository secret.
 - [ ] Developers run `./scripts/check` in the devcontainer before a merge (ADR-0002).
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] A push to `main` starts no workflow run.
+- [x] A push to `main` starts no workflow run.
 - [ ] A tag `v*` shows the job `check` before the job `release` in one workflow run.
 - [ ] If the job `check` fails, the job `release` does not run.
 
 **Tests to add/update:**
 
-- [ ] No Rust tests. The workflow runs the existing tests.
+- [x] No Rust tests. The workflow runs the existing tests.
 
 **Commands that must pass:**
 
