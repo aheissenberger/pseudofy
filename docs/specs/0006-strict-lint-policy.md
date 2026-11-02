@@ -1,7 +1,7 @@
 # Feature Delta Spec: Strict lint policy
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/adr/0006-strict-lint-policy-in-cargo-toml.md` · `docs/specs/0001-rust-cli-scaffold-and-devcontainer.md` · `docs/specs/0002-pseudonym-engine-and-csv.md` §3
 
@@ -40,24 +40,24 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] This change adds no crate.
-- [ ] Lint levels are only in `Cargo.toml` and `clippy.toml`. `scripts/check` adds only `-D warnings`.
-- [ ] No `#[allow]` or `#[expect]` attribute is added to pass the check.
-- [ ] The CLI behavior from spec 0001 does not change.
+- [x] This change adds no crate.
+- [x] Lint levels are only in `Cargo.toml` and `clippy.toml`. `scripts/check` adds only `-D warnings`.
+- [x] No `#[allow]` or `#[expect]` attribute is added to pass the check.
+- [x] The CLI behavior from spec 0001 does not change.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] `./scripts/check` passes on the current code.
-- [ ] An `unwrap()` call in `src/` makes `./scripts/check` fail.
-- [ ] An `unsafe` block in `src/` makes `./scripts/check` fail.
-- [ ] If `Cargo.lock` does not match `Cargo.toml`, `./scripts/check` fails.
-- [ ] An `#[allow]` attribute, or an `#[expect]` attribute without `reason`, in `src/` makes `./scripts/check` fail.
+- [x] `./scripts/check` passes on the current code.
+- [x] An `unwrap()` call in `src/` makes `./scripts/check` fail.
+- [x] An `unsafe` block in `src/` makes `./scripts/check` fail.
+- [x] If `Cargo.lock` does not match `Cargo.toml`, `./scripts/check` fails.
+- [x] An `#[allow]` attribute, or an `#[expect]` attribute without `reason`, in `src/` makes `./scripts/check` fail.
 
 **Tests to add/update:**
 
-- [ ] `tests/cli.rs` — the four tests from spec 0001 pass without `unwrap()`.
+- [x] `tests/cli.rs` — the four tests from spec 0001 pass without `unwrap()`.
 
 **Commands that must pass:**
 

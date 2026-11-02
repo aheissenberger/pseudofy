@@ -3,7 +3,7 @@ use predicates::prelude::*;
 use predicates::str::contains;
 
 fn pseudofy() -> Command {
-    Command::cargo_bin("pseudofy").unwrap()
+    assert_cmd::cargo::cargo_bin_cmd!("pseudofy")
 }
 
 #[test]
