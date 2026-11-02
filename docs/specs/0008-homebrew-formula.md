@@ -1,7 +1,7 @@
 # Feature Delta Spec: Homebrew formula
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** active
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 (17) · `docs/adr/0008-distribute-on-macos-with-the-homebrew-tools-tap.md` · `docs/specs/0005-ci-and-macos-release.md`
 
