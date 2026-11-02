@@ -1,7 +1,7 @@
 # Feature Delta Spec: XLSX round-trip fidelity
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** active
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0003-xlsx-support.md` · `docs/adr/0004-initial-crate-set.md` · `docs/adr/0010-scrub-the-written-xlsx-package.md`
 
@@ -17,7 +17,8 @@
 
 ### Added
 
-- `tests/fixtures/fidelity.xlsx` — the user makes this workbook in Excel with invented data only. It has one table, conditional formatting, data validation, a sparkline, a comment, a hidden sheet, a merged cell, and a link to a second workbook.
+- `tests/fixtures/fidelity.xlsx` — the user makes this workbook in Excel with invented data only. It has tables, conditional formatting, data validation, a sparkline, a comment, a hidden sheet, a merged cell, and a link to a second workbook.
+- `tests/fixtures/fidelity_reference.xlsx` — the second workbook that `fidelity.xlsx` links to. The user makes it in Excel with invented data only.
 - `tests/xlsx_fidelity.rs` — run `pseudofy run` on the fixture. Compare the ZIP part names of the input and the copy.
 
 ### Modified
