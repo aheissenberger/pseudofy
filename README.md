@@ -39,6 +39,12 @@ shasum -a 256 -c "${asset}.sha256"
 tar -xzf "${asset}"
 ```
 
+The checksum shows that the download is complete. From release 0.2.0 on, a provenance attestation also shows that GitHub Actions built the file from this repository:
+
+```sh
+gh attestation verify "${asset}" -R aheissenberger/pseudofy
+```
+
 The binary has no Apple Developer ID signature. macOS blocks a downloaded binary until you remove the quarantine attribute:
 
 ```sh
