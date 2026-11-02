@@ -1,7 +1,7 @@
 # Feature Delta Spec: XLSX round-trip fidelity
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0003-xlsx-support.md` · `docs/adr/0004-initial-crate-set.md` · `docs/adr/0010-scrub-the-written-xlsx-package.md`
 
@@ -37,22 +37,22 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] The fixture contains only invented data.
-- [ ] `tests/xlsx_fidelity.rs` has a constant list of the part names that the copy may lose. Each entry has a comment with the reason.
-- [ ] The test never compares cell values of name columns. It compares only part names.
-- [ ] The test adds no crate. It uses `zip`, a runtime crate since ADR-0010.
+- [x] The fixture contains only invented data.
+- [x] `tests/xlsx_fidelity.rs` has a constant list of the part names that the copy may lose. Each entry has a comment with the reason.
+- [x] The test never compares cell values of name columns. It compares only part names.
+- [x] The test adds no crate. It uses `zip`, a runtime crate since ADR-0010.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] Each ZIP part of the fixture exists in the copy, or is on the list of lost parts.
-- [ ] The test fails with the name of each part that is lost and not on the list.
-- [ ] ADR-0004 lists the same lost parts as the test.
+- [x] Each ZIP part of the fixture exists in the copy, or is on the list of lost parts.
+- [x] The test fails with the name of each part that is lost and not on the list.
+- [x] ADR-0004 lists the same lost parts as the test.
 
 **Tests to add/update:**
 
-- [ ] `tests/xlsx_fidelity.rs` — the behaviors above.
+- [x] `tests/xlsx_fidelity.rs` — the behaviors above.
 
 **Commands that must pass:**
 
@@ -64,6 +64,8 @@ devcontainer exec --workspace-folder . ./scripts/check
 **Manual verification (only if unavoidable):**
 
 - Open the copy of `tests/fixtures/fidelity.xlsx` in Excel — the file opens without a repair message.
+  Result (2026-11-02): Excel shows a repair message. The copy of `tests/fixtures/fidelity_reference.xlsx` opens without one.
+  The cause is the lost external link. ADR-0011 and spec 0012 restore it.
 
 ## 5. Rollback / Notes (optional)
 
