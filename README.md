@@ -81,7 +81,14 @@ A CSV file with an unclosed quote also fails.
 By default, `run` writes only the copies of the CSV and XLSX files.
 With `copy_other_files = true` in the config, `run` also copies each other file unchanged, for example a PDF or a text file.
 pseudofy does not check these files. They can contain real names. Check each copied file before you share it.
-pseudofy never copies hidden files and directories (names that start with `.`).
+pseudofy skips hidden files and directories (names that start with `.`). It does not process or copy them.
+
+Rules for `--out`:
+
+- `--out` must not be inside `secrets/` or `config/` of the project.
+- If `--out` is inside the project, it must be new or empty. pseudofy then writes the marker file `.pseudofy-out` into it, so later runs can use it again.
+- pseudofy never overwrites an input file.
+- Each copy keeps the permission bits of its input file. pseudofy warns if other users can write to `--out`. Use an output directory that only you can write to.
 
 ## Development
 
