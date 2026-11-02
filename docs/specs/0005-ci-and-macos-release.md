@@ -1,7 +1,7 @@
 # Feature Delta Spec: CI and macOS release
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 (14, 15) · `docs/adr/0002-develop-in-a-devcontainer.md` · `docs/adr/0005-build-releases-in-github-actions.md`
 
@@ -37,24 +37,24 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] Each third-party action is pinned to a full commit SHA.
-- [ ] Each workflow has `permissions:` with the minimum rights. Only `release.yml` gets `contents: write`.
-- [ ] The release job reads the Rust version from `rust-toolchain.toml`.
-- [ ] The tag version must be equal to the version in `Cargo.toml`. If not, the release job fails.
-- [ ] No workflow uses a repository secret.
+- [x] Each third-party action is pinned to a full commit SHA.
+- [x] Each workflow has `permissions:` with the minimum rights. Only `release.yml` gets `contents: write`.
+- [x] The release job reads the Rust version from `rust-toolchain.toml`.
+- [x] The tag version must be equal to the version in `Cargo.toml`. If not, the release job fails.
+- [x] No workflow uses a repository secret.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] A push to `main` runs `ci.yml`. The run is green.
-- [ ] The tag `v0.1.0` creates a release with the `.tar.gz` file and the `.sha256` file.
-- [ ] `file pseudofy` on the extracted binary prints `Mach-O 64-bit executable arm64`.
-- [ ] A tag that is not equal to the `Cargo.toml` version makes the release job fail.
+- [x] A push to `main` runs `ci.yml`. The run is green.
+- [x] The tag `v0.1.0` creates a release with the `.tar.gz` file and the `.sha256` file.
+- [x] `file pseudofy` on the extracted binary prints `Mach-O 64-bit executable arm64`.
+- [x] A tag that is not equal to the `Cargo.toml` version makes the release job fail.
 
 **Tests to add/update:**
 
-- [ ] No new Rust tests. The workflows run the existing tests.
+- [x] No new Rust tests. The workflows run the existing tests.
 
 **Commands that must pass:**
 
