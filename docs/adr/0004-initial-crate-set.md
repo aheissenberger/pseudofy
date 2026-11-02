@@ -46,7 +46,7 @@ ADR-0010 adds `zip` and `quick-xml` as runtime crates. Spec 0010 also uses `zip`
 - `umya-spreadsheet` 3.1.1 has no model for external links, `customXml`, sparklines, timelines, query tables, and `richData`. The copy can lose these parts.
 - Spec 0010 ran pseudofy on an Excel-made workbook. The copy loses these parts (`tests/xlsx_fidelity.rs` has the same list):
   - `xl/calcChain.xml` — Excel rebuilds it on the next calculation.
-  - `xl/externalLinks/externalLink1.xml` and `xl/externalLinks/_rels/externalLink1.xml.rels` — the copy keeps the formulas that use the external link, but loses the link.
+- The scrub restores external links from the input package (ADR-0011, spec 0012).
 - The copy also loses the sparklines in the `extLst` element of a sheet. The part-name test does not detect this loss.
 - `umya-spreadsheet` can panic on damaged input. pseudofy catches the panic (spec 0003). A release profile must not set `panic = "abort"`.
 - `umya-spreadsheet` adds approximately 89 crates to the build.
