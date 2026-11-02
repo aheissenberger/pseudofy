@@ -1,0 +1,4 @@
+target/
+secrets/
+.private_*
+out/

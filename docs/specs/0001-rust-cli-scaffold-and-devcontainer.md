@@ -1,7 +1,7 @@
 # Feature Delta Spec: Rust CLI scaffold and devcontainer
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2, §4 · `docs/adr/0001-use-rust-for-the-cli.md` · `docs/adr/0002-develop-in-a-devcontainer.md` · `docs/adr/0004-initial-crate-set.md`
 
@@ -17,7 +17,7 @@
 
 ### Added
 
-- `.devcontainer/devcontainer.json` — Rust image with a pinned tag, VS Code extensions `rust-analyzer` and `tamasfe.even-better-toml`.
+- `.devcontainer/devcontainer.json` — Rust image with a pinned tag, VS Code extensions `rust-analyzer`, `tamasfe.even-better-toml`, and `anthropic.claude-code`. A named volume keeps `~/.claude` across container rebuilds.
 - `rust-toolchain.toml` — one pinned stable Rust version, components `rustfmt` and `clippy`.
 - `Cargo.toml`, `Cargo.lock` — binary crate `pseudofy`, edition 2024, `license = "Apache-2.0"`, dependency `clap` only.
 - `LICENSE` — the full Apache License 2.0 text from apache.org, unchanged.
@@ -42,23 +42,23 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] `src/main.rs` contains only argument parsing and dispatch.
-- [ ] This change adds only `clap` (runtime) and `assert_cmd`, `predicates` (test). ADR-0004 covers them.
-- [ ] The devcontainer image tag and the Rust version are pinned. No `latest` tag.
-- [ ] `scripts/check` exits with a non-zero code if one check fails.
+- [x] `src/main.rs` contains only argument parsing and dispatch.
+- [x] This change adds only `clap` (runtime) and `assert_cmd`, `predicates` (test). ADR-0004 covers them.
+- [x] The devcontainer image tag and the Rust version are pinned. No `latest` tag.
+- [x] `scripts/check` exits with a non-zero code if one check fails.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] `pseudofy --version` prints `pseudofy 0.1.0`.
-- [ ] `pseudofy --help` lists the subcommands `init` and `run`.
-- [ ] `pseudofy run` exits with code 2 and prints "not implemented" to stderr.
-- [ ] `pseudofy` with an unknown subcommand exits with a non-zero code.
+- [x] `pseudofy --version` prints `pseudofy 0.1.0`.
+- [x] `pseudofy --help` lists the subcommands `init` and `run`.
+- [x] `pseudofy run` exits with code 2 and prints "not implemented" to stderr.
+- [x] `pseudofy` with an unknown subcommand exits with a non-zero code.
 
 **Tests to add/update:**
 
-- [ ] `tests/cli.rs` — the four behaviors above.
+- [x] `tests/cli.rs` — the four behaviors above.
 
 **Commands that must pass:**
 
