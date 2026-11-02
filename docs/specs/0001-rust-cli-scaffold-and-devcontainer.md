@@ -17,7 +17,7 @@
 
 ### Added
 
-- `.devcontainer/devcontainer.json` — Rust image with a pinned tag, VS Code extensions `rust-analyzer` and `tamasfe.even-better-toml`.
+- `.devcontainer/devcontainer.json` — Rust image with a pinned tag, VS Code extensions `rust-analyzer`, `tamasfe.even-better-toml`, and `anthropic.claude-code`.
 - `rust-toolchain.toml` — one pinned stable Rust version, components `rustfmt` and `clippy`.
 - `Cargo.toml`, `Cargo.lock` — binary crate `pseudofy`, edition 2024, `license = "Apache-2.0"`, dependency `clap` only.
 - `LICENSE` — the full Apache License 2.0 text from apache.org, unchanged.
