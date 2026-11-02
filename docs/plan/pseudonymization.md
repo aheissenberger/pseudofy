@@ -34,6 +34,7 @@ The README must state this limit.
 15. The source is in a public GitHub repository.
 17. Homebrew installs pseudofy on an Apple Silicon Mac from the tap `aheissenberger/tools`.
 18. pseudofy reads CSV files in UTF-8 and in Windows-1252. The copy keeps the encoding of the input file.
+19. A config setting makes `run` copy each other project file unchanged to the output directory. The default is off (ADR-0012).
 
 ## 3. Terms
 

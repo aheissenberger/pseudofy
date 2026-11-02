@@ -25,6 +25,8 @@ pub struct Summary {
     /// Files that could not be read or written. `run` reports each one and
     /// continues with the other files.
     pub failed: usize,
+    /// Other files copied unchanged. `None` if `copy_other_files` is off (spec 0014).
+    pub copied: Option<usize>,
 }
 
 /// A CSV or XLSX file of the project that both passes handle.

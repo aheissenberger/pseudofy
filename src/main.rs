@@ -95,8 +95,12 @@ fn init(project: &Path, language: Option<Language>) -> anyhow::Result<()> {
 
 fn run(project: &Path, out: &Path) -> anyhow::Result<()> {
     let summary = run::run(project, out)?;
+    let copied = summary
+        .copied
+        .map(|n| format!(", copied unchanged: {n}"))
+        .unwrap_or_default();
     println!(
-        "files: {}, replaced values: {}, collisions: {}",
+        "files: {}, replaced values: {}, collisions: {}{copied}",
         summary.files, summary.replaced, summary.collisions
     );
     if summary.collisions > 0 {
