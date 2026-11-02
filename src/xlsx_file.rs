@@ -117,7 +117,8 @@ pub fn process(
     panic_guard::catch(|| writer::xlsx::write_writer(&book, &mut out))
         .ok_or_else(unwritable)?
         .map_err(|_| unwritable())?;
-    let out = xlsx_scrub::scrub(&out).map_err(|_| unwritable())?;
+    let original = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
+    let out = xlsx_scrub::scrub(&original, &out).map_err(|_| unwritable())?;
     write_output(out_root, output, &out, rel)?;
     Ok(result.stats)
 }
