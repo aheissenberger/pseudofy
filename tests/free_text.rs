@@ -328,3 +328,195 @@ fn no_real_name_appears_in_any_output_file_or_in_stdout_and_stderr() {
     assert_no_leak(&stdout, "stdout");
     assert_no_leak(&stderr, "stderr");
 }
+
+/// Creates a project with a key and one CSV rule given as TOML lines.
+fn project_with_rule(free_text: &str, rule_lines: &str) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "secrets/pseudofy.key", &format!("{KEY}\n"));
+    let text = format!(
+        "language = \"de\"\nfree_text = \"{free_text}\"\n\n[[rule]]\nfiles = \"**/*.csv\"\n{rule_lines}"
+    );
+    write_file(dir.path(), "config/pseudofy.toml", &text);
+    dir
+}
+
+fn assert_absent(text: &str, words: &[&str], what: &str) {
+    let lower = text.to_lowercase();
+    for word in words {
+        assert!(!lower.contains(&word.to_lowercase()), "{what} leaks {word}");
+    }
+}
+
+#[test]
+fn quotes_and_possessives_stay_around_the_pseudonyms() {
+    let dir = project(None);
+    write_file(
+        dir.path(),
+        "people.csv",
+        &format!("{HEADER}Zorbina,Quenzel,c8 'Zorbina Quenzel' and Zorbina's\n"),
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    let (first, last) = fakes(&t, 1);
+    assert_eq!(t[1][2], format!("c8 '{first} {last}' and {first}'s"));
+    assert_absent(&t[1][2], &["Zorbina", "Quenzel"], "note");
+}
+
+#[test]
+fn two_first_name_and_two_last_name_columns_all_count_as_known_names() {
+    let dir = project_with_rule(
+        "tokens",
+        "first_name = [\"first\", \"first2\"]\nlast_name = [\"last\", \"last2\"]\n",
+    );
+    write_file(
+        dir.path(),
+        "people.csv",
+        "first,last,first2,last2,note\nZorbina,Quenzel,Pirmox,Hulbert,Zorbina / Pirmox / Hulbert\n",
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    let row = &t[1];
+    assert_eq!(row[4], format!("{} / {} / {}", row[0], row[2], row[3]));
+    assert_absent(&row[4], &["Zorbina", "Pirmox", "Hulbert"], "note");
+}
+
+#[test]
+fn full_name_with_an_email_suffix_is_replaced_and_email_parts_stay() {
+    let dir = project_with_rule("tokens", "full_name = [\"name\"]\n");
+    write_file(
+        dir.path(),
+        "people.csv",
+        "name,note\nOttilie Wenzhart <ottilie.wenzhart@firma.test>,Ottilie Wenzhart / firma / test\n",
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    let fake_name = t[1][0].split(" <").next().unwrap().to_string();
+    assert_ne!(fake_name, "Ottilie Wenzhart");
+    assert_eq!(t[1][1], format!("{fake_name} / firma / test"));
+}
+
+#[test]
+fn mode_full_replaces_hyphenated_names_and_full_names_with_initials() {
+    let dir = project_with_rule(
+        "full",
+        "first_name = [\"first\"]\nlast_name = [\"last\"]\nfull_name = [\"name\"]\n",
+    );
+    write_file(
+        dir.path(),
+        "people.csv",
+        "first,last,name,note\nLisandra-Mae,Kroft,Berta C. Kunzl,Lisandra-Mae Kroft\n\
+         Pirmox,Hulbert,Berta C. Kunzl,Berta C. Kunzl\n",
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    assert_eq!(t[1][3], format!("{} {}", t[1][0], t[1][1]));
+    assert_absent(&t[1][3], &["Lisandra", "Kroft"], "note");
+    assert_eq!(t[2][3], t[2][2]);
+    assert_absent(&t[2][3], &["Berta", "Kunzl"], "note");
+}
+
+#[test]
+fn case_folding_matches_special_letters() {
+    let dir = project(None);
+    write_file(
+        dir.path(),
+        "people.csv",
+        &format!("{HEADER}İlkay,Strauß,İlkay / İLKAY\nPirmox,Hulbert,STRAUSS\n"),
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    assert_eq!(t[1][2], format!("{} / {}", t[1][0], t[1][0].to_uppercase()));
+    assert_eq!(t[2][2], t[1][1].to_uppercase());
+}
+
+#[test]
+fn multi_token_last_name_is_replaced_as_a_whole_and_parts_alone_stay() {
+    let dir = project(None);
+    write_file(
+        dir.path(),
+        "people.csv",
+        &format!(
+            "{HEADER}Tamsorin,de Velgrad,Tamsorin de Velgrad\nPirmox,Hulbert,firma.de and de facto\n"
+        ),
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    assert_eq!(t[1][2], format!("{} {}", t[1][0], t[1][1]));
+    assert_eq!(t[2][2], "firma.de and de facto");
+}
+
+#[test]
+fn a_note_without_a_known_name_is_byte_equal() {
+    let dir = project(None);
+    let note = "Mu\u{308}hle offen";
+    write_file(
+        dir.path(),
+        "people.csv",
+        &format!("{HEADER}Zorbina,Quenzel,{note}\n"),
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    assert_eq!(t[1][2].as_bytes(), note.as_bytes());
+}
+
+#[test]
+fn a_file_that_fails_in_pass_one_adds_no_names() {
+    let dir = project(None);
+    let mut bad = format!("{HEADER}Zorbina,Quenzel,x").into_bytes();
+    bad.extend_from_slice(&[0xff, b'\n']);
+    fs::write(dir.path().join("bad.csv"), bad).unwrap();
+    write_file(
+        dir.path(),
+        "good.csv",
+        &format!("{HEADER}Pirmox,Hulbert,Zorbina\n"),
+    );
+    let out = TempDir::new().unwrap();
+    let assert = pseudofy()
+        .args(["run", "--project"])
+        .arg(dir.path())
+        .arg("--out")
+        .arg(out.path())
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert_eq!(stderr.matches("bad.csv").count(), 1, "stderr was: {stderr}");
+    let t = table(out.path(), "good.csv");
+    assert_eq!(t[1][2], "Zorbina");
+}
+
+#[test]
+fn xlsx_header_equal_to_a_known_name_stays_unchanged() {
+    let dir = project(None);
+    write_file(
+        dir.path(),
+        "people.csv",
+        &format!("{HEADER}Zorbina,Quenzel,x\n"),
+    );
+    let mut book = umya_spreadsheet::new_file_empty_worksheet();
+    let sheet = book.new_sheet("Daten").unwrap();
+    sheet.cell_mut("A1").set_value_string("Zorbina");
+    sheet.cell_mut("A2").set_value_string("Zorbina");
+    save(&book, dir.path(), "notes.xlsx");
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    let book = umya_spreadsheet::reader::xlsx::read(out.path().join("notes.xlsx")).unwrap();
+    let sheet = book.sheet_by_name("Daten").unwrap();
+    assert_eq!(sheet.value("A1"), "Zorbina");
+    assert_eq!(sheet.value("A2"), t[1][0]);
+}
+
+#[test]
+fn a_token_that_is_mostly_a_last_name_gets_the_last_name_pseudonym() {
+    let dir = project(None);
+    write_file(
+        dir.path(),
+        "people.csv",
+        &format!(
+            "{HEADER}Zorbina,Quenzel,x\nPirmox,Quenzel,x\nQuenzel,Hulbert,x\nTamsorin,Velgrad,Quenzel arrived\n"
+        ),
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    assert_ne!(t[1][1], t[3][0], "test needs distinct pseudonyms");
+    assert_eq!(t[4][2], format!("{} arrived", t[1][1]));
+}
