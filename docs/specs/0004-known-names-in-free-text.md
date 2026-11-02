@@ -27,6 +27,7 @@
 - `src/csv_file.rs`, `src/xlsx_file.rs` — pass 1 reads the name columns of each file. Pass 2 gives the matcher to the cell replacement.
 - `src/cells.rs` — replace known names in each text cell outside the name and email columns, after the emails.
 - `src/config.rs` template from `pseudofy init` — a commented `free_text` line.
+- `src/text.rs` — the curly apostrophe (U+2019) and U+02BC are name characters like `'`. `O’Brien` is one token in name columns and in free text.
 - `tests/xlsx.rs` — the `sheets` glob test uses a name that occurs in no name column. Known names now change the other sheets too.
 
 ### Removed
@@ -50,6 +51,8 @@
 - [ ] A longer match has priority over a shorter match.
 - [ ] Known names stay in memory only. pseudofy never writes them to a file or a log.
 - [ ] Header rows are not changed.
+- [ ] If two column spellings fold to one key (`Strauss`, `Strauß`), each spelling in free text gets the pseudonym of the same spelling in its column. The result does not depend on file names or file order.
+- [ ] A cell segment that contains a match is written in NFC. A segment without a match stays byte-equal.
 - [ ] A file that fails in pass 1 adds no known names. Pass 2 reports it.
 
 ## 4. Acceptance Criteria & Verification
