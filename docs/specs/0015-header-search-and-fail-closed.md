@@ -17,13 +17,16 @@
 
 ### Added
 
-- Header search: the header is the first of the first 20 non-empty rows (CSV records, sheet rows) that contains a header text of a rule that applies. Each row above the header is a title row.
+- Header search: among the first 20 non-empty rows (CSV records, sheet rows), the header is the row with the most cells that are exactly a header text of a rule that applies. If two rows have this highest count, the file fails: `<path>: header row is ambiguous` (XLSX: `<path>: sheet <n>: header row is ambiguous`). Each row above the header is a title row.
+- CSV delimiter: pseudofy tries `,`, `;`, and tab. It takes the delimiter whose header row has the most header texts.
 - Fail closed:
   - CSV: if a rule matches the file and the file has none of the header texts of that rule, the file fails: `<path>: no header of rule "<glob>" in the first 20 rows`.
   - XLSX: the same check runs for each sheet that a rule applies to (after the `sheets` globs). The message names the sheet: `<path>: sheet <n>: no header of rule "<glob>" in the first 20 rows`. `<n>` is the sheet position (1-based), not the sheet name.
+  - XLSX: if a rule matches the file and its `sheets` globs match no sheet, the file fails: `<path>: rule "<glob>" matches no sheet`.
   - If a file fails, pseudofy writes no copy of the file. The run continues with the next file and exits with an error.
 - Title rows and the header: pseudofy replaces each email and each known name in them (as in free text, spec 0004). A header text that is a configured header stays unchanged.
-- CSV: if a quoted field is still open at the end of the file, the file fails: `<path>: unclosed quote`.
+- CSV: if a quoted field is still open at the end of the file, the file fails: `<path>: unclosed quote`. An escaped quote `""` inside a quoted field does not close the field.
+- CSV: a changed record keeps the bytes of its unchanged fields, also their quotes. Only a changed field is written again.
 
 ### Modified
 
@@ -59,7 +62,11 @@
 - [ ] A workbook with `sheets = ["Daten"]` and an info sheet without headers gets a copy.
 - [ ] A sheet with a title in row 1 and the header in row 2 gets its names replaced. The title text gets email and known-name replacement.
 - [ ] An email in a CSV header line or in a sheet header row is replaced.
-- [ ] A CSV with an unclosed quote fails with `unclosed quote`.
+- [ ] A CSV with an unclosed quote fails with `unclosed quote`, also when the open field contains `""`. A valid field `"x"" y,"` does not fail.
+- [ ] A title line `Export der Felder Name, Email` above `name,email` does not hide the name column. Two rows with the same highest header count make the file fail.
+- [ ] A semicolon file with the title line `Liste: Name, Email` uses `;`.
+- [ ] A rule with `sheets = ["Kunden"]` on a workbook without that sheet makes the file fail.
+- [ ] A changed header line keeps the quotes of its unchanged fields.
 - [ ] The copy of `tests/fixtures/fidelity.xlsx` contains no first name of the input.
 
 **Tests to add/update:**
