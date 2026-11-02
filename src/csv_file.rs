@@ -391,7 +391,9 @@ fn transform(
             .ok_or_else(|| anyhow!("{rel}: cannot write line {line}"))?;
     }
     // Fail closed: a rule that finds none of its headers in the header row.
-    if let Some(glob) = failing_rule(rules, search.header.as_deref(), columns) {
+    // A file without a non-empty record (`searched == 0`) has nothing to leak.
+    let failing = failing_rule(rules, search.header.as_deref(), columns);
+    if let Some(glob) = failing.filter(|_| search.searched > 0) {
         return Err(anyhow!(
             "{rel}: no header of rule \"{glob}\" in the first {HEADER_SEARCH_ROWS} rows"
         ));
@@ -895,7 +897,8 @@ mod tests {
             error,
             "t.csv: no header of rule \"*.csv\" in the first 20 rows"
         );
-        assert!(strict(b"").is_err());
+        // A file without a non-empty record has nothing to leak.
+        assert!(strict(b"").is_ok());
     }
 
     #[test]

@@ -581,7 +581,7 @@ fn unicode_email_in_free_text_is_replaced_without_leaking_the_name() {
     write_file(
         dir.path(),
         "data.csv",
-        "id,note\n1,please write to anna.müller@acme.test soon\n",
+        "id,note,email\n1,please write to anna.müller@acme.test soon,\n",
     );
     let out = run_clean(dir.path());
     let text = read(out.path(), "data.csv");
@@ -1038,7 +1038,7 @@ fn windows_1252_copy_keeps_shape_header_delimiter_and_line_ending() {
 
 #[test]
 fn windows_1252_file_without_a_value_to_replace_is_byte_equal() {
-    let bytes = encode_1252("id;note\r\n1;Grüße aus Köln\r\n");
+    let bytes = encode_1252("id;note;email\r\n1;Grüße aus Köln;\r\n");
     let project = raw_project(&[("plain.csv", &bytes)]);
     let (out, _) = run_ok(project.path());
     assert_eq!(fs::read(out.path().join("plain.csv")).unwrap(), bytes);
@@ -1310,4 +1310,13 @@ fn file_without_a_matching_rule_gets_emails_replaced_in_its_first_line() {
         "{text}"
     );
     assert!(first.ends_with(",Notiz"), "{text}");
+}
+
+#[test]
+fn empty_csv_with_a_matching_rule_gets_a_copy() {
+    // Spec 0015: a file without a non-empty record has nothing to leak.
+    let dir = project(KEY_A, None, &[]);
+    write_file(dir.path(), "empty.csv", "\n\n");
+    let out = run_clean(dir.path());
+    assert!(out.path().join("empty.csv").exists());
 }
