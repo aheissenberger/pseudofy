@@ -25,6 +25,7 @@
 
 - `src/run.rs` — select `.xlsx` files and call `src/xlsx_file.rs`.
 - `src/csv_file.rs` — move the shared code to `src/cells.rs`.
+- `src/main.rs` — a panic hook prints only the code location, never the panic message. A crate can panic on a damaged workbook.
 - `src/config.rs` — a rule gets the optional field `sheets` (list of sheet-name globs, for example `"Kunden*"`). Without `sheets`, the rule applies to each sheet.
 - `Cargo.toml` — add `umya-spreadsheet`.
 
