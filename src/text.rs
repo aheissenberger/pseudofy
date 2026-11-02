@@ -1,6 +1,8 @@
 //! Name tokens, case styles, email search, and transliteration.
 
 use regex::Regex;
+use unicode_normalization::UnicodeNormalization;
+use unicode_normalization::char::is_combining_mark;
 
 /// Role of a name column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -28,7 +30,7 @@ struct Token {
 }
 
 fn is_token_char(c: char) -> bool {
-    c.is_alphabetic() || c == '\''
+    c.is_alphabetic() || c == '\'' || is_combining_mark(c)
 }
 
 /// Replace each name token in `value`.
@@ -40,6 +42,8 @@ pub fn replace_name(
     role: NameRole,
     replace: &mut dyn FnMut(Part, &str) -> String,
 ) -> String {
+    let normalized: String = value.nfc().collect();
+    let value = normalized.as_str();
     let mut tokens = split_tokens(value);
     assign_parts(value, role, &mut tokens);
     let mut out = String::with_capacity(value.len());
@@ -145,7 +149,7 @@ fn apply_case(token: &str, pseudonym: &str) -> String {
 /// Regex that finds email addresses in a cell.
 pub fn email_regex() -> anyhow::Result<Regex> {
     Ok(Regex::new(
-        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+",
+        r#"[^\s@<>(),;:"'\[\]]+@[^\s@<>(),;:"'\[\]]+\.[^\s@<>(),;:"'\[\]]+"#,
     )?)
 }
 
@@ -159,7 +163,17 @@ pub fn replace_emails(
     let mut pos = 0;
     for m in regex.find_iter(value) {
         out.push_str(value.get(pos..m.start()).unwrap_or(""));
-        out.push_str(&replace(m.as_str()));
+        let matched = m.as_str();
+        let trimmed = matched.trim_end_matches('.');
+        let has_domain = trimmed
+            .split_once('@')
+            .is_some_and(|(_, d)| d.contains('.') && !d.starts_with('.'));
+        if has_domain {
+            out.push_str(&replace(trimmed));
+            out.push_str(matched.get(trimmed.len()..).unwrap_or(""));
+        } else {
+            out.push_str(matched);
+        }
         pos = m.end();
     }
     out.push_str(value.get(pos..).unwrap_or(""));
@@ -169,16 +183,18 @@ pub fn replace_emails(
 /// Transliterate `ä ö ü ß` (also uppercase) and lowercase, then keep `[a-z0-9-]`.
 pub(crate) fn ascii_local_part(name: &str) -> String {
     let mut out = String::new();
-    for c in name.chars() {
+    for c in name.nfc() {
         match c {
             'ä' | 'Ä' => out.push_str("ae"),
             'ö' | 'Ö' => out.push_str("oe"),
             'ü' | 'Ü' => out.push_str("ue"),
             'ß' | 'ẞ' => out.push_str("ss"),
             _ => {
-                let l = c.to_ascii_lowercase();
-                if l.is_ascii_lowercase() || l.is_ascii_digit() || l == '-' {
-                    out.push(l);
+                for d in std::iter::once(c).nfd().filter(|d| !is_combining_mark(*d)) {
+                    let l = d.to_ascii_lowercase();
+                    if l.is_ascii_lowercase() || l.is_ascii_digit() || l == '-' {
+                        out.push(l);
+                    }
                 }
             }
         }
@@ -241,6 +257,64 @@ mod tests {
         assert_eq!(ascii_local_part("Groß"), "gross");
         assert_eq!(ascii_local_part("ÄÖÜ Ä"), "aeoeueae");
         assert_eq!(ascii_local_part("Anne-Marie O'Neil 2"), "anne-marieoneil2");
+    }
+
+    #[test]
+    fn nfd_and_nfc_names_are_equal() {
+        let nfd = "Ju\u{308}rgen-Lena";
+        let nfc = "J\u{fc}rgen-Lena";
+        let mut seen = Vec::new();
+        let mut f = |_: Part, t: &str| {
+            seen.push(t.to_string());
+            "Berta".to_string()
+        };
+        let a = replace_name(nfd, NameRole::First, &mut f);
+        let b = replace_name(nfc, NameRole::First, &mut f);
+        assert_eq!(a, "Berta-Berta");
+        assert_eq!(a, b);
+        assert_eq!(seen, ["J\u{fc}rgen", "Lena", "J\u{fc}rgen", "Lena"]);
+    }
+
+    #[test]
+    fn unicode_emails_match_whole() -> anyhow::Result<()> {
+        let re = email_regex()?;
+        let mut seen = Vec::new();
+        let mut rep = |m: &str| {
+            seen.push(m.to_string());
+            "x@y.z".to_string()
+        };
+        assert_eq!(
+            replace_emails("anna.m\u{fc}ller@acme.test", &re, &mut rep),
+            "x@y.z"
+        );
+        assert_eq!(
+            replace_emails("info@b\u{e4}ckerei-zorbel.at", &re, &mut rep),
+            "x@y.z"
+        );
+        assert_eq!(
+            replace_emails("Zorbel <zorbel@acme.test>", &re, &mut rep),
+            "Zorbel <x@y.z>"
+        );
+        assert_eq!(
+            replace_emails("mail a@b.test.", &re, &mut rep),
+            "mail x@y.z."
+        );
+        assert_eq!(
+            seen,
+            [
+                "anna.m\u{fc}ller@acme.test",
+                "info@b\u{e4}ckerei-zorbel.at",
+                "zorbel@acme.test",
+                "a@b.test"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn accents_are_dropped_in_local_part() {
+        assert_eq!(ascii_local_part("D\u{e9}sir\u{e9}e"), "desiree");
+        assert_eq!(ascii_local_part("Se\u{301}bastien"), "sebastien");
     }
 
     #[test]
