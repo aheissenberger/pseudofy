@@ -1,4 +1,4 @@
-//! `pseudofy run`: find the files, apply the rules, write the copies.
+//! `pseudofy run`: find the CSV and XLSX files, apply the rules, write the copies.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -12,6 +12,7 @@ use crate::csv_file;
 use crate::key;
 use crate::pseudonym::Pseudonymizer;
 use crate::text;
+use crate::xlsx_file;
 
 /// Counts for the summary line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -24,7 +25,9 @@ pub struct Summary {
     pub failed: usize,
 }
 
-/// Write a pseudonymized copy of each CSV file under `project` to `out`.
+/// Write a pseudonymized copy of each CSV and XLSX file under `project` to
+/// `out`. A failed file is reported and counted in `failed`; the run goes on.
+/// Excel lock files (`~$*`) are skipped.
 pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
     let key = key::load(project)?;
     let config = config::load(project)?;
@@ -80,7 +83,11 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
             eprintln!("warning: {rel}: symlink skipped");
             continue;
         }
-        if !entry.file_type().is_file() || !is_csv(entry.path()) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let csv = is_csv(entry.path());
+        if !csv && !is_workbook(entry.path()) {
             continue;
         }
         let rules: Vec<&Rule> = matchers
@@ -92,15 +99,28 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
             eprintln!("warning: {rel}: no rule matches; only emails are replaced");
         }
         let target = out.join(relative);
-        match csv_file::process(
-            entry.path(),
-            &out,
-            &target,
-            &rel,
-            &rules,
-            &mut pseudonymizer,
-            &email_regex,
-        ) {
+        let result = if csv {
+            csv_file::process(
+                entry.path(),
+                &out,
+                &target,
+                &rel,
+                &rules,
+                &mut pseudonymizer,
+                &email_regex,
+            )
+        } else {
+            process_xlsx(
+                entry.path(),
+                &out,
+                &target,
+                &rel,
+                &rules,
+                &mut pseudonymizer,
+                &email_regex,
+            )
+        };
+        match result {
             Ok(replaced) => {
                 summary.replaced += replaced;
                 summary.files += 1;
@@ -113,6 +133,30 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
     }
     summary.collisions = pseudonymizer.collisions();
     Ok(summary)
+}
+
+/// Process one XLSX file and report its formula and rich-text counts.
+/// Returns the number of replaced values.
+fn process_xlsx(
+    input: &Path,
+    out: &Path,
+    target: &Path,
+    rel: &str,
+    rules: &[&Rule],
+    pseudonymizer: &mut Pseudonymizer,
+    email_regex: &regex::Regex,
+) -> anyhow::Result<usize> {
+    let stats = xlsx_file::process(input, out, target, rel, rules, pseudonymizer, email_regex)?;
+    if stats.formulas > 0 {
+        println!("{rel}: {} formula cells unchanged", stats.formulas);
+    }
+    if stats.rich_text > 0 {
+        eprintln!(
+            "warning: {rel}: {} rich-text cells written as plain text",
+            stats.rich_text
+        );
+    }
+    Ok(stats.replaced)
 }
 
 /// Canonical project and output directories. Fail if the output could
@@ -169,6 +213,23 @@ fn is_csv(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
         .is_some_and(|ext| ext.eq_ignore_ascii_case("csv"))
+}
+
+/// An XLSX file that is not an Excel lock file.
+fn is_workbook(path: &Path) -> bool {
+    is_xlsx(path) && !is_lock_file(path)
+}
+
+fn is_xlsx(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("xlsx"))
+}
+
+/// Excel lock file (`~$name.xlsx`): not a workbook.
+fn is_lock_file(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("~$"))
 }
 
 /// Relative path with `/` separators.
@@ -246,5 +307,13 @@ mod tests {
         assert!(is_csv(Path::new("a/b.CSV")));
         assert!(!is_csv(Path::new("a/b.xlsx")));
         assert_eq!(relative_text(Path::new("a/b.csv")), "a/b.csv");
+    }
+
+    #[test]
+    fn xlsx_extension_and_lock_files() {
+        assert!(is_xlsx(Path::new("a/b.XLSX")));
+        assert!(!is_xlsx(Path::new("a/b.xls")));
+        assert!(is_lock_file(Path::new("a/~$b.xlsx")));
+        assert!(!is_lock_file(Path::new("a/b.xlsx")));
     }
 }

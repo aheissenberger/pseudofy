@@ -36,6 +36,9 @@ pub struct Rule {
     pub full_name: Vec<String>,
     #[serde(default)]
     pub email: Vec<String>,
+    /// Sheet-name globs for XLSX files. Empty: the rule applies to each sheet.
+    #[serde(default)]
+    pub sheets: Vec<String>,
 }
 
 fn default_email_subdomains() -> bool {
