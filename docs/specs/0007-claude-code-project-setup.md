@@ -1,7 +1,7 @@
 # Feature Delta Spec: Claude Code project setup
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** active
 **Author:** Claude (agent)
 **Related:** `docs/adr/0007-split-agent-work-by-file-ownership.md` · `docs/adr/0006-strict-lint-policy-in-cargo-toml.md` · `docs/adr/0002-develop-in-a-devcontainer.md`
 
@@ -19,7 +19,7 @@
 
 - `CLAUDE.md` — project rules: spec-driven workflow, secrets rules, "never print a real value", `scripts/check` before a finish, the orchestration protocol from ADR-0007.
 - `.claude/settings.json` — permissions and the Stop hook.
-  - `deny`: `Read`, `Edit`, `Write` on `./secrets/**` and `./**/.private_*/**`.
+  - `deny`: `Read`, `Edit`, `Write` on `**/secrets/**` and `**/.private_*/**`.
   - `allow`: `cargo fmt`, `cargo clippy`, `cargo test`, `cargo build`, `cargo check`, `./scripts/check`, `./scripts/docs-check`, read-only `git` commands.
 - `.claude/hooks/stop-check` — Stop hook. If the working tree has no change, exit 0. Else run `./scripts/check`. If `cargo` is not on the `PATH`, run it with `devcontainer exec`. If the check fails, exit 2 and write the last 60 output lines to stderr.
 - `.claude/agents/rust-implementer.md` — `model: sonnet`, `effort: medium`, `isolation: worktree`. Implements one task. Writes only the files of its write set. Runs `./scripts/check`. Commits in its worktree.
@@ -27,10 +27,13 @@
 - `.claude/agents/rust-reviewer.md` — `model: opus`, `effort: high`, no `Write` and no `Edit`. Reviews a diff against the spec, the invariants, and real-value leaks.
 - `.claude/agents/check-runner.md` — `model: haiku`, `effort: low`, tools `Bash`, `Read`. Runs `./scripts/check`. Returns only the failed checks and their first errors.
 - `.claude/agents/crate-researcher.md` — `model: haiku`, `effort: low`, no `Write` and no `Edit`. Answers API questions for the pinned crate versions from the sources in the Cargo registry.
+- `.devcontainer/post-create.sh` — give `~/.claude` to the user `vscode`. Install `ripgrep`, `fd-find` (as `fd`), and `shellcheck` from the Debian packages.
+- `.devcontainer/devcontainer-lock.json` — the devcontainer CLI writes it. It pins the digest of each feature.
 
 ### Modified
 
 - `.gitignore` — add `.claude/worktrees/` and `.claude/settings.local.json`.
+- `.devcontainer/devcontainer.json` — add the feature `ghcr.io/devcontainers/features/github-cli:1`. `postCreateCommand` runs `.devcontainer/post-create.sh`.
 
 ### Removed
 
@@ -45,24 +48,26 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] Each agent file uses only fields from the Claude Code subagent documentation.
-- [ ] No agent except the main session edits `Cargo.toml`, `Cargo.lock`, `src/main.rs`, or `docs/`.
-- [ ] No two agents that run at the same time have a common file in their write sets.
-- [ ] The Stop hook never prints a file from `secrets/` or `.private_*`.
-- [ ] The Stop hook works in the devcontainer and on the host.
+- [x] Each agent file uses only fields from the Claude Code subagent documentation.
+- [x] No agent except the main session edits `Cargo.toml`, `Cargo.lock`, `src/main.rs`, or `docs/`.
+- [x] No two agents that run at the same time have a common file in their write sets.
+- [x] The Stop hook never prints a file from `secrets/` or `.private_*`.
+- [x] The Stop hook works in the devcontainer and on the host.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] `.claude/hooks/stop-check` exits 0 on a clean working tree.
-- [ ] `.claude/hooks/stop-check` exits 2 if `src/main.rs` contains `unwrap()`.
+- [x] `.claude/hooks/stop-check` exits 0 on a clean working tree.
+- [x] `.claude/hooks/stop-check` exits 2 if `src/main.rs` contains `unwrap()`.
 - [ ] `/agents` in Claude Code lists the five project agents.
 - [ ] A `Read` of `secrets/x` is denied.
+- [x] `rg`, `fd`, `shellcheck`, and `gh` exist in the devcontainer.
+- [x] `shellcheck` gives no finding for `.claude/hooks/stop-check` and `.devcontainer/post-create.sh`.
 
 **Tests to add/update:**
 
-- [ ] None. The hook behavior is checked with the commands below.
+- [x] None. The hook behavior is checked with the commands below.
 
 **Commands that must pass:**
 
@@ -70,6 +75,8 @@
 devcontainer exec --workspace-folder . ./scripts/check
 devcontainer exec --workspace-folder . bash -c 'echo "{}" | .claude/hooks/stop-check; echo "exit=$?"'
 python3 -m json.tool .claude/settings.json
+devcontainer exec --workspace-folder . bash -c 'rg --version && fd --version && gh --version'
+devcontainer exec --workspace-folder . shellcheck .claude/hooks/stop-check .devcontainer/post-create.sh
 ```
 
 **Manual verification (only if unavoidable):**

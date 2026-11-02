@@ -2,3 +2,5 @@ target/
 secrets/
 .private_*
 out/
+.claude/worktrees/
+.claude/settings.local.json
