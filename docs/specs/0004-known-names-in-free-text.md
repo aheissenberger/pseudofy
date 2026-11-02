@@ -46,7 +46,7 @@
 - [ ] A known name in free text gets the same pseudonym as in its name column.
 - [ ] The match is whole-word and case-insensitive. The replacement keeps the case style of the matched text.
 - [ ] `full` replaces only complete full names ("Anna Muster", "Muster, Anna").
-- [ ] `tokens` also replaces each single first-name and last-name token.
+- [ ] `tokens` also replaces each single first-name and last-name token. A single token matches only if the word in the text is not all lowercase. `Mark` and `MARK` match, `mark` does not. Full-name matches stay case-insensitive.
 - [ ] `off` replaces no known name outside the name columns. Pass 1 does not run. Emails are still replaced in each cell.
 - [ ] A longer match has priority over a shorter match.
 - [ ] Known names stay in memory only. pseudofy never writes them to a file or a log.
@@ -79,5 +79,5 @@ devcontainer exec --workspace-folder . ./scripts/check
 
 ## 5. Rollback / Notes (optional)
 
-The mode `tokens` can replace normal words that are also names, for example "Mark" or "Rose".
+The mode `tokens` can replace normal words that are also names, for example "Mark" or "Rose" at the start of a sentence. A lowercase word like "mark" is not replaced. A known name written only in lowercase, for example "anna", stays in free text unless it is part of a full name.
 If the user sees too many wrong replacements, the user sets `free_text = "full"`.
