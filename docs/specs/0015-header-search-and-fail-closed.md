@@ -1,7 +1,7 @@
 # Feature Delta Spec: Header search and fail closed
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0002-pseudonym-engine-and-csv.md` · `docs/specs/0003-xlsx-support.md` · `docs/specs/0004-known-names-in-free-text.md`
 
@@ -46,32 +46,32 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] A failed file has no copy in the output directory. A stale copy from an earlier run stays as it was.
-- [ ] No error message contains a cell value or a header text. A message contains the path, the sheet position, and the rule glob only.
-- [ ] Data rows below the header are processed as before.
-- [ ] A CSV keeps its bytes outside the changed fields: delimiter, quoting, line ends, encoding, BOM.
-- [ ] No new crate. No `unwrap()` or `expect()` outside tests.
+- [x] A failed file has no copy in the output directory. A stale copy from an earlier run stays as it was.
+- [x] No error message contains a cell value or a header text. A message contains the path, the sheet position, and the rule glob only.
+- [x] Data rows below the header are processed as before.
+- [x] A CSV keeps its bytes outside the changed fields: delimiter, quoting, line ends, encoding, BOM.
+- [x] No new crate. No `unwrap()` or `expect()` outside tests.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] A CSV `Zorbina Quenzel,zorbina.quenzel@acme.test` without a header fails. The output has no copy.
-- [ ] A CSV with a title line `Kontakte von zorbina.quenzel@acme.test` above the header `name,email` gets a copy. The title line has a fake email. Each name below the header is replaced.
-- [ ] A workbook with two sheets fails if sheet 2 has no header. The message names `sheet 2`.
-- [ ] A workbook with `sheets = ["Daten"]` and an info sheet without headers gets a copy.
-- [ ] A sheet with a title in row 1 and the header in row 2 gets its names replaced. The title text gets email and known-name replacement.
-- [ ] An email in a CSV header line or in a sheet header row is replaced.
-- [ ] A CSV with an unclosed quote fails with `unclosed quote`, also when the open field contains `""`. A valid field `"x"" y,"` does not fail.
-- [ ] A title line `Export der Felder Name, Email` above `name,email` does not hide the name column. Two rows with the same highest header count make the file fail.
-- [ ] A semicolon file with the title line `Liste: Name, Email` uses `;`.
-- [ ] A rule with `sheets = ["Kunden"]` on a workbook without that sheet makes the file fail.
-- [ ] A changed header line keeps the quotes of its unchanged fields.
-- [ ] The copy of `tests/fixtures/fidelity.xlsx` contains no first name of the input.
+- [x] A CSV `Zorbina Quenzel,zorbina.quenzel@acme.test` without a header fails. The output has no copy.
+- [x] A CSV with a title line `Kontakte von zorbina.quenzel@acme.test` above the header `name,email` gets a copy. The title line has a fake email. Each name below the header is replaced.
+- [x] A workbook with two sheets fails if sheet 2 has no header. The message names `sheet 2`.
+- [x] A workbook with `sheets = ["Daten"]` and an info sheet without headers gets a copy.
+- [x] A sheet with a title in row 1 and the header in row 2 gets its names replaced. The title text gets email and known-name replacement.
+- [x] An email in a CSV header line or in a sheet header row is replaced.
+- [x] A CSV with an unclosed quote fails with `unclosed quote`, also when the open field contains `""`. A valid field `"x"" y,"` does not fail.
+- [x] A title line `Export der Felder Name, Email` above `name,email` does not hide the name column. Two rows with the same highest header count make the file fail.
+- [x] A semicolon file with the title line `Liste: Name, Email` uses `;`.
+- [x] A rule with `sheets = ["Kunden"]` on a workbook without that sheet makes the file fail.
+- [x] A changed header line keeps the quotes of its unchanged fields.
+- [x] The copy of `tests/fixtures/fidelity.xlsx` contains no first name of the input.
 
 **Tests to add/update:**
 
-- [ ] `tests/csv.rs`, `tests/xlsx.rs`, `tests/xlsx_fidelity.rs` — the behaviors above.
+- [x] `tests/csv.rs`, `tests/xlsx.rs`, `tests/xlsx_fidelity.rs` — the behaviors above.
 
 **Commands that must pass:**
 
