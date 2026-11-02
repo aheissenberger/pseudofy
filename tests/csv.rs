@@ -989,6 +989,12 @@ fn win_copy() -> Vec<u8> {
 fn windows_1252_file_gets_a_windows_1252_copy_with_pseudonyms() {
     let copy = win_copy();
     assert!(!copy.starts_with(&[0xEF, 0xBB, 0xBF]), "copy has a BOM");
+    // The note `Grüße` is untouched; in Windows-1252 it is `Gr\xfc\xdfe`.
+    assert!(std::str::from_utf8(&copy).is_err(), "copy is UTF-8");
+    assert!(
+        copy.windows(5).any(|window| window == b"Gr\xfc\xdfe"),
+        "copy is not Windows-1252"
+    );
     let text = decode_1252(&copy);
     let table = rows(&text, ';');
     for header in ["first_name", "last_name", "name"] {
@@ -1066,4 +1072,43 @@ fn windows_1252_run_prints_no_real_value() {
             );
         }
     }
+}
+
+fn assert_rejected(name: &str, bytes: &[u8]) {
+    let dir = project(KEY_A, None, &[]);
+    fs::write(dir.path().join(name), bytes).unwrap();
+    write_file(dir.path(), "z_good.csv", "first_name\nTamsorin\n");
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).failure();
+    let stderr = stderr_text(&assert);
+    assert!(
+        stderr.contains(&format!("{name}: unsupported or damaged encoding")),
+        "{stderr}"
+    );
+    assert!(stderr.contains("1 file(s) failed"), "{stderr}");
+    assert_no_leak(&stderr, "stderr");
+    assert!(!out.path().join(name).exists());
+    assert!(out.path().join("z_good.csv").exists());
+}
+
+#[test]
+fn utf8_file_with_one_invalid_byte_is_rejected() {
+    assert_rejected(
+        "mixed.csv",
+        b"first_name;name\nZorbina;Zorbina Qu\xc3\xa4nzel\xff\n",
+    );
+}
+
+#[test]
+fn utf8_bom_before_windows_1252_text_is_rejected() {
+    assert_rejected("bom.csv", b"\xEF\xBB\xBFname\r\nZorbina Qu\xe4nzel\r\n");
+}
+
+#[test]
+fn utf16_file_is_rejected() {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in "first_name\r\nZorbina\r\n".encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    assert_rejected("unicode.csv", &bytes);
 }

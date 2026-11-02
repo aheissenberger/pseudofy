@@ -72,9 +72,18 @@ fn transform_encoded(
     replace: &mut dyn FnMut(Kind, &str) -> String,
     rel: &str,
 ) -> anyhow::Result<Transformed> {
-    let rest = input.strip_prefix(BOM).unwrap_or(input);
-    if std::str::from_utf8(rest).is_ok() {
+    let damaged = || anyhow!("{rel}: unsupported or damaged encoding");
+    if input.starts_with(b"\xFF\xFE") || input.starts_with(b"\xFE\xFF") || input.contains(&0) {
+        return Err(damaged());
+    }
+    let rest = input.strip_prefix(BOM);
+    if std::str::from_utf8(rest.unwrap_or(input)).is_ok() {
         return transform(input, columns, email_regex, names, emails, replace, rel);
+    }
+    // Invalid UTF-8 after a UTF-8 BOM, or next to valid UTF-8 sequences, is a
+    // damaged or mixed file. Decoding it as Windows-1252 would hide real names.
+    if rest.is_some() || has_utf8_multibyte(input) {
+        return Err(damaged());
     }
     let (decoded, _) = WINDOWS_1252.decode_without_bom_handling(input);
     let mut result = transform(
@@ -94,6 +103,21 @@ fn transform_encoded(
     }
     result.bytes = encoded.into_owned();
     Ok(result)
+}
+
+/// `true` if `bytes` contain a valid UTF-8 sequence of two to four bytes.
+fn has_utf8_multibyte(bytes: &[u8]) -> bool {
+    bytes.iter().enumerate().any(|(index, &byte)| {
+        let len = match byte {
+            0xC2..=0xDF => 2,
+            0xE0..=0xEF => 3,
+            0xF0..=0xF4 => 4,
+            _ => return false,
+        };
+        bytes
+            .get(index..index + len)
+            .is_some_and(|window| std::str::from_utf8(window).is_ok())
+    })
 }
 
 fn detect_delimiter(header_line: &[u8]) -> u8 {
@@ -418,6 +442,34 @@ mod tests {
         let (encoded, _, unmappable) = WINDOWS_1252.encode(&decoded);
         assert!(!unmappable);
         assert_eq!(&*encoded, all.as_slice());
+    }
+
+    fn rejected(input: &[u8]) -> String {
+        match run_enc(input, &columns()) {
+            Ok(_) => String::from("accepted"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn damaged_or_mixed_encodings_are_rejected() {
+        let message = "t.csv: unsupported or damaged encoding";
+        // UTF-8 with one invalid byte.
+        assert_eq!(rejected(b"name\nJ\xc3\xb6rg M\xc3\xbcller\xff\n"), message);
+        // UTF-8 BOM before Windows-1252 text.
+        assert_eq!(rejected(b"\xEF\xBB\xBFname\nJ\xf6rg\n"), message);
+        // UTF-16 with and without BOM.
+        assert_eq!(rejected(b"\xFF\xFEn\0a\0m\0e\0"), message);
+        assert_eq!(rejected(b"\xFE\xFF\0n\0a\0m\0e"), message);
+        assert_eq!(rejected(b"n\0a\0m\0e\0\n\0"), message);
+    }
+
+    #[test]
+    fn utf8_multibyte_detection() {
+        assert!(has_utf8_multibyte(b"a\xc3\xa4b"));
+        assert!(has_utf8_multibyte(b"\xe2\x82\xac"));
+        assert!(!has_utf8_multibyte(b"J\xf6rg M\xfcller \x80 \xc3"));
+        assert!(!has_utf8_multibyte(b"\xe2\x82"));
     }
 
     #[test]
