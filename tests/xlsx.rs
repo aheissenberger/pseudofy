@@ -875,3 +875,184 @@ fn inline_string_with_two_runs_is_refused() {
     fs::write(dir.path().join("mappe.xlsx"), edited).unwrap();
     run_refused(&dir, "mappe.xlsx");
 }
+
+// ---- External links (spec 0012, ADR-0011) ----
+
+const FIXTURE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+const LINK_PART: &str = "xl/externalLinks/externalLink1.xml";
+const LINK_RELS_PART: &str = "xl/externalLinks/_rels/externalLink1.xml.rels";
+const CACHED_NAME: &str = "Zorbina Quenzel";
+
+fn fixture_bytes(name: &str) -> Vec<u8> {
+    fs::read(Path::new(FIXTURE_DIR).join(name)).unwrap()
+}
+
+/// Runs pseudofy on the bytes, saved as `mappe.xlsx` in a project whose
+/// rule matches the headers of the fidelity fixture. Returns the copy's parts.
+fn copy_parts(bytes: &[u8]) -> Vec<(String, String)> {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "secrets/pseudofy.key", &format!("{KEY}\n"));
+    write_file(
+        dir.path(),
+        "config/pseudofy.toml",
+        "language = \"de\"\n\n[[rule]]\nfiles = \"*.xlsx\"\n\
+         first_name = [\"First Name\"]\nlast_name = [\"Last Name\"]\nemail = [\"Email\"]\n",
+    );
+    fs::write(dir.path().join("mappe.xlsx"), bytes).unwrap();
+    let (out, _, _) = run_ok(dir.path());
+    package_parts(&fs::read(out.path().join("mappe.xlsx")).unwrap())
+}
+
+fn part_text(parts: &[(String, String)], name: &str) -> String {
+    parts
+        .iter()
+        .find(|(part, _)| part == name)
+        .unwrap_or_else(|| panic!("the package has no part {name}"))
+        .1
+        .clone()
+}
+
+fn has_part(parts: &[(String, String)], name: &str) -> bool {
+    parts.iter().any(|(part, _)| part == name)
+}
+
+/// The start tags `<tag ...>` of an XML text, without the angle brackets.
+fn start_tags<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
+    let open = format!("<{tag} ");
+    let mut tags = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        rest = &rest[start + 1..];
+        tags.push(&rest[..rest.find('>').unwrap()]);
+    }
+    tags
+}
+
+fn attribute(tag: &str, name: &str) -> Option<String> {
+    let key = format!(" {name}=\"");
+    let at = tag.find(&key)? + key.len();
+    let value = &tag[at..];
+    Some(value[..value.find('"').unwrap()].to_string())
+}
+
+fn has_external_link_parts(parts: &[(String, String)]) -> bool {
+    parts
+        .iter()
+        .any(|(name, _)| name.starts_with("xl/externalLinks/"))
+}
+
+#[test]
+fn copy_keeps_each_external_link_part_of_the_input() {
+    let input = package_parts(&fixture_bytes("fidelity.xlsx"));
+    assert!(has_part(&input, LINK_PART));
+    let copy = copy_parts(&fixture_bytes("fidelity.xlsx"));
+    for (name, _) in input
+        .iter()
+        .filter(|(name, _)| name.starts_with("xl/externalLinks/"))
+    {
+        assert!(has_part(&copy, name), "the copy lost {name}");
+    }
+    assert!(has_part(&copy, LINK_RELS_PART));
+}
+
+#[test]
+fn copy_lists_one_external_reference_per_link() {
+    let input = package_parts(&fixture_bytes("fidelity.xlsx"));
+    let links = input
+        .iter()
+        .filter(|(name, _)| name.starts_with("xl/externalLinks/externalLink"))
+        .count();
+    let copy = copy_parts(&fixture_bytes("fidelity.xlsx"));
+    let workbook = part_text(&copy, "xl/workbook.xml");
+    assert!(workbook.contains("<externalReferences>"));
+    assert_eq!(start_tags(&workbook, "externalReference").len(), links);
+}
+
+#[test]
+fn external_reference_id_resolves_to_the_external_link_part() {
+    let copy = copy_parts(&fixture_bytes("fidelity.xlsx"));
+    let workbook = part_text(&copy, "xl/workbook.xml");
+    let rels = part_text(&copy, "xl/_rels/workbook.xml.rels");
+    let references = start_tags(&workbook, "externalReference");
+    assert_eq!(references.len(), 1);
+    let id = attribute(references[0], "r:id").unwrap();
+
+    let relationships = start_tags(&rels, "Relationship");
+    let mut ids: Vec<String> = relationships
+        .iter()
+        .map(|tag| attribute(tag, "Id").unwrap())
+        .collect();
+    let total = ids.len();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), total, "a relationship Id occurs twice");
+
+    let matching: Vec<&&str> = relationships
+        .iter()
+        .filter(|tag| attribute(tag, "Id").as_deref() == Some(id.as_str()))
+        .collect();
+    assert_eq!(matching.len(), 1, "r:id {id} is not in workbook.xml.rels");
+    let kind = attribute(matching[0], "Type").unwrap();
+    let target = attribute(matching[0], "Target").unwrap();
+    assert!(kind.ends_with("/externalLink"), "type: {kind}");
+    assert!(
+        target.ends_with("externalLinks/externalLink1.xml"),
+        "target: {target}"
+    );
+}
+
+#[test]
+fn content_types_has_an_override_for_the_external_link() {
+    let copy = copy_parts(&fixture_bytes("fidelity.xlsx"));
+    let types = part_text(&copy, "[Content_Types].xml");
+    assert!(
+        types.contains("PartName=\"/xl/externalLinks/externalLink1.xml\""),
+        "no Override for the external link"
+    );
+}
+
+#[test]
+fn cached_external_values_do_not_reach_the_copy() {
+    let marker = "<sheetData sheetId=\"0\"/>";
+    let cached = format!(
+        "<sheetData sheetId=\"0\"><row r=\"1\"><cell r=\"A1\" t=\"str\">\
+         <v>{CACHED_NAME}</v></cell></row></sheetData>"
+    );
+    let input = rewrite_package(
+        &fixture_bytes("fidelity.xlsx"),
+        |name, text| (name == LINK_PART).then(|| text.replacen(marker, &cached, 1)),
+        &[],
+    );
+    let parts = package_parts(&input);
+    assert!(part_text(&parts, LINK_PART).contains(CACHED_NAME));
+
+    let copy = copy_parts(&input);
+    assert!(has_part(&copy, LINK_PART), "the link part is missing");
+    for (name, text) in &copy {
+        assert!(
+            !text.contains(CACHED_NAME) && !text.contains("Quenzel"),
+            "the cached name occurs in {name}"
+        );
+        if name.starts_with("xl/externalLinks/") {
+            assert!(
+                !text.contains("<cell") && !text.contains("<v>"),
+                "{name} keeps cached cells"
+            );
+        }
+    }
+}
+
+#[test]
+fn workbook_without_external_links_gets_none() {
+    let copy = copy_parts(&fixture_bytes("fidelity_reference.xlsx"));
+    assert!(!has_external_link_parts(&copy));
+    assert!(!part_text(&copy, "xl/workbook.xml").contains("<externalReferences"));
+}
+
+#[test]
+fn generated_workbook_gets_no_external_links() {
+    let bytes = book_bytes(&simple_book("Tamsorin Velgrad", "tamsorin@acme.test"));
+    let copy = copy_parts(&bytes);
+    assert!(!has_external_link_parts(&copy));
+    assert!(!part_text(&copy, "xl/workbook.xml").contains("<externalReferences"));
+}

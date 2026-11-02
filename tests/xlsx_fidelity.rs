@@ -19,14 +19,10 @@ const KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abc
 const FIXTURES: [&str; 2] = ["fidelity.xlsx", "fidelity_reference.xlsx"];
 
 /// Parts that the copy may lose. Keep this list equal to the list in ADR-0004.
-const ALLOWED_LOST: [&str; 3] = [
+const ALLOWED_LOST: [&str; 1] = [
     // umya-spreadsheet does not write the calculation chain. Excel rebuilds it
     // on the next calculation.
     "xl/calcChain.xml",
-    // umya-spreadsheet has no model for external links. The copy keeps the
-    // formulas that use the link, but loses the link (ADR-0004).
-    "xl/externalLinks/externalLink1.xml",
-    "xl/externalLinks/_rels/externalLink1.xml.rels",
 ];
 
 fn part_names(path: &Path) -> BTreeSet<String> {
