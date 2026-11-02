@@ -49,6 +49,7 @@ ADR-0010 adds `zip` and `quick-xml` as runtime crates. ADR-0009 adds `encoding_r
   - `xl/calcChain.xml` — Excel rebuilds it on the next calculation.
 - The scrub restores external links from the input package (ADR-0011, spec 0012).
 - The scrub restores the sparklines in the `extLst` element of a sheet from the input package (ADR-0011, spec 0013).
+- `zip` 8.6.0 has the advisories RUSTSEC-2026-0367, -0368, -0369, and -0429. Each is about `extract`. pseudofy and `umya-spreadsheet` never call `extract`. `umya-spreadsheet` 3.1.1 requires `zip` ^8.6, so `deny.toml` accepts these advisories until `umya-spreadsheet` accepts `zip` 9 (spec 0020).
 - `umya-spreadsheet` can panic on damaged input. pseudofy catches the panic (spec 0003). A release profile must not set `panic = "abort"`.
 - `umya-spreadsheet` adds approximately 89 crates to the build.
 - `umya-spreadsheet` is slower than `calamine` and uses more memory on large workbooks.

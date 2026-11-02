@@ -10,6 +10,16 @@ targets = [
 [advisories]
 unmaintained = "workspace"
 yanked = "deny"
+# zip 8.6.0: umya-spreadsheet 3.1.1 requires zip ^8.6, so zip 9 is not possible
+# yet. Each advisory is about ZipArchive::extract or ZipStreamReader::extract.
+# pseudofy and umya-spreadsheet never call extract (ADR-0004, spec 0020).
+# Remove these entries when umya-spreadsheet accepts zip >= 9.
+ignore = [
+    { id = "RUSTSEC-2026-0367", reason = "extract only; not called" },
+    { id = "RUSTSEC-2026-0368", reason = "extract only; not called" },
+    { id = "RUSTSEC-2026-0369", reason = "extract only; not called" },
+    { id = "RUSTSEC-2026-0429", reason = "extract only; not called" },
+]
 
 [bans]
 multiple-versions = "allow"
