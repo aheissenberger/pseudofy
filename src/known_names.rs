@@ -416,7 +416,7 @@ fn trailing_initial(
     folded: &[String],
     roles: &HashMap<String, Part>,
     last: usize,
-    edits: &mut Vec<(usize, Part)>,
+    edits: &mut Edits,
 ) {
     let (Some(prev), Some(next)) = (toks.get(last), toks.get(last + 1)) else {
         return;
@@ -426,8 +426,26 @@ fn trailing_initial(
     };
     let gap = text.get(prev.end..next.start).unwrap_or("");
     let spaced = !gap.is_empty() && gap.chars().all(char::is_whitespace);
-    if upper_initial(text, next) && spaced && !edits.iter().any(|(idx, _)| *idx == last + 1) {
-        edits.push((last + 1, *part));
+    if upper_initial(text, next) && spaced && !edits.has(last + 1) {
+        edits.push(last + 1, *part);
+    }
+}
+
+/// The token edits of one text, with a set of the edited token indexes.
+#[derive(Default)]
+struct Edits {
+    list: Vec<(usize, Part)>,
+    edited: HashSet<usize>,
+}
+
+impl Edits {
+    fn push(&mut self, index: usize, part: Part) {
+        self.edited.insert(index);
+        self.list.push((index, part));
+    }
+
+    fn has(&self, index: usize) -> bool {
+        self.edited.contains(&index)
     }
 }
 
@@ -570,7 +588,7 @@ impl Matcher {
             })
             .collect();
         // (token index, part), and the number of names.
-        let mut edits: Vec<(usize, Part)> = Vec::new();
+        let mut edits = Edits::default();
         let mut count = 0;
         let mut i = 0;
         while i < toks.len() {
@@ -586,10 +604,10 @@ impl Matcher {
                         (None, Split::At(m)) => k < m,
                         (None, Split::Full) => k + 1 != n,
                     };
-                    edits.push((w, if first { Part::First } else { Part::Last }));
+                    edits.push(w, if first { Part::First } else { Part::Last });
                 }
                 if let Some(tok) = found.init {
-                    edits.push((tok, Part::First));
+                    edits.push(tok, Part::First);
                 }
                 count += 1;
                 let last = found.words.last().map_or(i, |w| *w);
@@ -607,7 +625,7 @@ impl Matcher {
             });
             let part = folded.get(i).and_then(|f| self.singles.get(f.as_str()));
             if let (Some(part), false) = (part, lowercase) {
-                edits.push((i, *part));
+                edits.push(i, *part);
                 count += 1;
                 trailing_initial(text, &toks, &folded, &self.initial_after, i, &mut edits);
             }
@@ -616,6 +634,7 @@ impl Matcher {
         if count == 0 {
             return (input.to_string(), 0);
         }
+        let mut edits = edits.list;
         edits.sort_by_key(|(idx, _)| *idx);
         let mut out = String::with_capacity(text.len());
         let mut pos = 0;
@@ -680,6 +699,18 @@ mod tests {
         let mut f = KnownNames::default();
         f.add_person("Kesta J.", "Arvo");
         assert_eq!(run(&f, FreeText::Tokens, "Kesta J.").0, "F5 F.");
+    }
+
+    #[test]
+    fn many_repeats_of_a_name_with_a_trailing_initial_are_fast() {
+        let mut k = KnownNames::default();
+        k.add_person("Anna J.", "Berg");
+        k.add_full("Anna B J.");
+        let text = "Anna B ".repeat(100_000);
+        let start = std::time::Instant::now();
+        let (out, _) = run(&k, FreeText::Tokens, &text);
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(out.starts_with("F4 F F4 F "), "{}", &out[..20]);
     }
 
     #[test]

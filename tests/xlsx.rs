@@ -744,9 +744,21 @@ fn comments_part_gives_a_comments_warning() {
     let dir = project(None);
     let bytes = book_bytes(&simple_book("Tamsorin Velgrad", "tamsorin@acme.test"));
     let comments = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><comments xmlns=\"{MAIN_NS}\"><authors><author>Autor</author></authors><commentList/></comments>"
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><comments xmlns=\"{MAIN_NS}\"><authors><author>Autor</author></authors><commentList><comment ref=\"A2\" authorId=\"0\"><text><r><t>Hinweis</t></r></text></comment></commentList></comments>"
     );
-    let edited = rewrite_package(&bytes, |_, _| None, &[("xl/comments1.xml", &comments)]);
+    // The comments part must hang on the sheet: the warning comes from the
+    // package that the crate writes, and the crate drops loose parts.
+    let rels = rels_xml(&[("comments", "../comments1.xml".to_owned())]);
+    let types = "<Override PartName=\"/xl/comments1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml\"/></Types>";
+    let edited = repackage(
+        &bytes,
+        str::to_owned,
+        |name, text| (name == "[Content_Types].xml").then(|| text.replacen("</Types>", types, 1)),
+        &[
+            ("xl/comments1.xml".to_owned(), comments),
+            ("xl/worksheets/_rels/sheet1.xml.rels".to_owned(), rels),
+        ],
+    );
     fs::write(dir.path().join("mappe.xlsx"), edited).unwrap();
     let (_out, _, stderr) = run_ok(dir.path());
     let line = stderr
@@ -1488,4 +1500,376 @@ fn key_value_layout_has_two_equal_header_rows_and_fails() {
     let (out, stderr) = run_failing(dir.path());
     assert_error_line(&stderr, "mappe.xlsx: sheet 1: header row is ambiguous");
     assert!(!out.path().join("mappe.xlsx").exists());
+}
+
+// ---- Input hardening (spec 0017) ----
+
+const REL_BASE: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const RELS_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
+
+/// A `.rels` part with `(type suffix, target)` relationships.
+fn rels_xml(items: &[(&str, String)]) -> String {
+    use std::fmt::Write as _;
+    let mut text =
+        format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships xmlns=\"{RELS_NS}\">");
+    for (index, (kind, target)) in items.iter().enumerate() {
+        write!(
+            text,
+            "<Relationship Id=\"rId{}\" Type=\"{REL_BASE}/{kind}\" Target=\"{target}\"/>",
+            index + 1
+        )
+        .unwrap();
+    }
+    text + "</Relationships>"
+}
+
+/// Rebuilds the package: `rename` gives the new name of each part, `edit` the
+/// new text, `extra` parts are appended.
+fn repackage(
+    bytes: &[u8],
+    rename: impl Fn(&str) -> String,
+    edit: impl Fn(&str, &str) -> Option<String>,
+    extra: &[(String, String)],
+) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default();
+    for (name, text) in package_parts(bytes) {
+        let text = edit(&name, &text).unwrap_or(text);
+        writer.start_file(rename(&name), options).unwrap();
+        writer.write_all(text.as_bytes()).unwrap();
+    }
+    for (name, text) in extra {
+        writer.start_file(name.as_str(), options).unwrap();
+        writer.write_all(text.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+fn real_book_bytes() -> Vec<u8> {
+    book_bytes(&simple_book("Zorbina Quenzel", "zorbina@acme.test"))
+}
+
+/// Puts `hostile` as `mappe.xlsx` and a valid `gut.xlsx` into a project and
+/// runs. The run must fail for `mappe.xlsx` only, with exit code 1 (no abort).
+/// Returns stderr; checks that `gut.xlsx` has its copy and `mappe.xlsx` none.
+fn run_hostile(hostile: &[u8]) -> String {
+    let dir = project(None);
+    fs::write(dir.path().join("mappe.xlsx"), hostile).unwrap();
+    save(
+        &simple_book("Tamsorin Velgrad", "tamsorin@acme.test"),
+        dir.path(),
+        "gut.xlsx",
+    );
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).failure();
+    let output = assert.get_output();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(1), "stderr: {stderr}");
+    assert!(stderr.contains("mappe.xlsx"), "stderr: {stderr}");
+    assert!(stderr.contains("1 file(s) failed"), "stderr: {stderr}");
+    assert_no_leak(&stderr, "stderr");
+    assert!(
+        !out.path().join("mappe.xlsx").exists(),
+        "a copy was written"
+    );
+    assert!(
+        out.path().join("gut.xlsx").exists(),
+        "no copy of the valid file"
+    );
+    stderr
+}
+
+/// The package plus a relationship part for `sheet1` that lists `items`.
+fn with_sheet_rels(bytes: &[u8], items: &[(&str, String)], extra: &[(String, String)]) -> Vec<u8> {
+    let mut parts = vec![(
+        "xl/worksheets/_rels/sheet1.xml.rels".to_owned(),
+        rels_xml(items),
+    )];
+    parts.extend(extra.iter().cloned());
+    repackage(bytes, str::to_owned, |_, _| None, &parts)
+}
+
+#[test]
+fn pivot_parts_under_other_names_are_refused() {
+    let pivot = |name: &str, target: &str| {
+        with_sheet_rels(
+            &real_book_bytes(),
+            &[("pivotTable", target.to_owned())],
+            &[(name.to_owned(), "<pivotTableDefinition/>".to_owned())],
+        )
+    };
+    let cases = [
+        pivot(
+            "xl/PivotCache/pivotCacheRecords1.xml",
+            "../pivotCache/pivotCacheRecords1.xml",
+        ),
+        pivot(
+            "xl\\pivotCache\\pivotCacheRecords1.xml",
+            "../pivotCache/pivotCacheRecords1.xml",
+        ),
+        pivot(
+            "xl/PIVOTTABLES/pivotTable1.xml",
+            "../pivotTables/pivotTable1.xml",
+        ),
+        // Only the relationship type says pivot.
+        pivot("xl/data/p.xml", "../data/p.xml"),
+    ];
+    for (index, case) in cases.iter().enumerate() {
+        let stderr = run_hostile(case);
+        assert!(stderr.contains("pivot"), "case {index}, stderr: {stderr}");
+    }
+}
+
+#[test]
+fn pivot_content_type_alone_is_refused() {
+    let types = "<Override PartName=\"/xl/data/p.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.spreadsheetml.pivotTable+xml\"/></Types>";
+    let bytes = repackage(
+        &real_book_bytes(),
+        str::to_owned,
+        |name, text| (name == "[Content_Types].xml").then(|| text.replacen("</Types>", types, 1)),
+        &[("xl/data/p.xml".to_owned(), "<x/>".to_owned())],
+    );
+    let stderr = run_hostile(&bytes);
+    assert!(stderr.contains("pivot"), "stderr: {stderr}");
+}
+
+/// A package where the sheet part has the name `part`, the workbook
+/// relationship points to `target`, and the sheet text is `sheet`.
+fn moved_sheet(part: &str, target: &str, sheet: &str) -> Vec<u8> {
+    repackage(
+        &real_book_bytes(),
+        |name| {
+            if name == "xl/worksheets/sheet1.xml" {
+                part.to_owned()
+            } else {
+                name.to_owned()
+            }
+        },
+        |name, text| match name {
+            "xl/_rels/workbook.xml.rels" => Some(text.replace("worksheets/sheet1.xml", target)),
+            "xl/worksheets/sheet1.xml" => Some(sheet.to_owned()),
+            _ => None,
+        },
+        &[],
+    )
+}
+
+fn sheet_with_header() -> String {
+    let header = "<headerFooter><oddHeader>&amp;LZorbina Quenzel</oddHeader></headerFooter>";
+    let sheet = package_parts(&real_book_bytes())
+        .into_iter()
+        .find(|(name, _)| name == "xl/worksheets/sheet1.xml")
+        .unwrap()
+        .1;
+    sheet.replacen("</worksheet>", &format!("{header}</worksheet>"), 1)
+}
+
+#[test]
+fn header_in_a_sheet_with_another_name_gets_the_warning() {
+    let sheet = sheet_with_header();
+    let cases = [
+        ("xl/Worksheets/sheet1.xml", "worksheets/sheet1.xml"),
+        ("xl\\worksheets\\sheet1.xml", "worksheets/sheet1.xml"),
+        ("xl/data/s.xml", "data/s.xml"),
+    ];
+    for (part, target) in cases {
+        let dir = project(None);
+        fs::write(
+            dir.path().join("mappe.xlsx"),
+            moved_sheet(part, target, &sheet),
+        )
+        .unwrap();
+        let (out, _, stderr) = run_ok(dir.path());
+        assert!(out.path().join("mappe.xlsx").exists(), "{part}");
+        let line = stderr
+            .lines()
+            .find(|line| line.contains("not pseudonymized"))
+            .unwrap_or_default();
+        assert!(line.contains("headers/footers"), "{part}, stderr: {stderr}");
+        assert_no_leak(&stderr, "stderr");
+    }
+}
+
+#[test]
+fn prefixed_shared_strings_under_another_name_are_refused() {
+    let strings = ["name", "email", "Zorbina Quenzel", "zorbina@acme.test"];
+    let items = strings
+        .map(|text| format!("<x:si><x:t>{text}</x:t></x:si>"))
+        .concat();
+    let sst = format!("<x:sst xmlns:x=\"{MAIN_NS}\">{items}</x:sst>");
+    let bytes = repackage(
+        &real_book_bytes(),
+        |name| {
+            if name == "xl/sharedStrings.xml" {
+                "xl/SharedStrings.xml".to_owned()
+            } else {
+                name.to_owned()
+            }
+        },
+        |name, _| (name == "xl/sharedStrings.xml").then(|| sst.clone()),
+        &[],
+    );
+    let dir = project(None);
+    fs::write(dir.path().join("mappe.xlsx"), bytes).unwrap();
+    run_refused(&dir, "mappe.xlsx");
+}
+
+#[test]
+fn inline_string_with_two_runs_under_another_name_is_refused() {
+    let sheet = sheet_with(concat!(
+        "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>name</t></is></c></row>",
+        "<row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><r><t>Zorbina</t></r><r><t> Quenzel</t></r></is></c></row>"
+    ));
+    for (part, target) in [
+        ("xl/Worksheets/sheet1.xml", "worksheets/sheet1.xml"),
+        ("xl/data/s.xml", "data/s.xml"),
+    ] {
+        let dir = project(None);
+        fs::write(
+            dir.path().join("mappe.xlsx"),
+            moved_sheet(part, target, &sheet),
+        )
+        .unwrap();
+        run_refused(&dir, "mappe.xlsx");
+    }
+}
+
+#[test]
+fn relationship_cycle_fails_the_file_and_the_run_goes_on() {
+    // sheet1 -> sheet1 overflowed the stack of the crate.
+    let cycle = with_sheet_rels(
+        &real_book_bytes(),
+        &[("worksheet", "sheet1.xml".to_owned())],
+        &[],
+    );
+    let stderr = run_hostile(&cycle);
+    assert!(stderr.contains("relationship cycle"), "stderr: {stderr}");
+
+    // A longer loop: sheet1 -> a -> b -> a.
+    let parts: Vec<(String, String)> = vec![
+        ("xl/worksheets/a.xml".into(), "<x/>".into()),
+        ("xl/worksheets/b.xml".into(), "<x/>".into()),
+        (
+            "xl/worksheets/_rels/a.xml.rels".into(),
+            rels_xml(&[("worksheet", "b.xml".into())]),
+        ),
+        (
+            "xl/worksheets/_rels/b.xml.rels".into(),
+            rels_xml(&[("worksheet", "a.xml".into())]),
+        ),
+    ];
+    let looped = with_sheet_rels(
+        &real_book_bytes(),
+        &[("worksheet", "a.xml".to_owned())],
+        &parts,
+    );
+    let stderr = run_hostile(&looped);
+    assert!(stderr.contains("relationship cycle"), "stderr: {stderr}");
+}
+
+/// Parts p0..p{count-1}; each has two relationships to the next one.
+fn fan_out_parts(count: usize) -> Vec<(String, String)> {
+    let mut parts = Vec::new();
+    for index in 0..count {
+        parts.push((format!("xl/worksheets/p{index}.xml"), "<x/>".to_owned()));
+        let next = format!("p{}.xml", index + 1);
+        parts.push((
+            format!("xl/worksheets/_rels/p{index}.xml.rels"),
+            rels_xml(&[("worksheet", next.clone()), ("worksheet", next)]),
+        ));
+    }
+    parts
+}
+
+#[test]
+fn fan_out_chain_fails_fast() {
+    let bytes = with_sheet_rels(
+        &real_book_bytes(),
+        &[("worksheet", "p0.xml".to_owned())],
+        &fan_out_parts(40),
+    );
+    let start = std::time::Instant::now();
+    let stderr = run_hostile(&bytes);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    assert!(stderr.contains("nested too deeply"), "stderr: {stderr}");
+
+    // 14 levels pass the depth limit; 2^14 references pass the count limit.
+    let bytes = with_sheet_rels(
+        &real_book_bytes(),
+        &[("worksheet", "p0.xml".to_owned())],
+        &fan_out_parts(14),
+    );
+    let start = std::time::Instant::now();
+    let stderr = run_hostile(&bytes);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    assert!(stderr.contains("too large"), "stderr: {stderr}");
+}
+
+#[test]
+fn deep_relationship_chain_fails() {
+    // 20 parts in a line, one relationship each.
+    let mut parts = Vec::new();
+    for index in 0..20 {
+        parts.push((format!("xl/worksheets/p{index}.xml"), "<x/>".to_owned()));
+        parts.push((
+            format!("xl/worksheets/_rels/p{index}.xml.rels"),
+            rels_xml(&[("worksheet", format!("p{}.xml", index + 1))]),
+        ));
+    }
+    let bytes = with_sheet_rels(
+        &real_book_bytes(),
+        &[("worksheet", "p0.xml".to_owned())],
+        &parts,
+    );
+    let stderr = run_hostile(&bytes);
+    assert!(stderr.contains("nested too deeply"), "stderr: {stderr}");
+}
+
+#[test]
+fn many_missing_targets_fail_without_a_long_scan() {
+    // 9 000 relationships to parts that do not exist, 9 000 other parts.
+    let missing: Vec<(&str, String)> = (0..9_000)
+        .map(|index| ("image", format!("missing{index}.png")))
+        .collect();
+    let extra: Vec<(String, String)> = (0..9_000)
+        .map(|index| (format!("xl/media/m{index}.bin"), String::new()))
+        .collect();
+    let bytes = with_sheet_rels(&real_book_bytes(), &missing, &extra);
+    let start = std::time::Instant::now();
+    let stderr = run_hostile(&bytes);
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    assert!(stderr.contains("too large"), "stderr: {stderr}");
+}
+
+#[test]
+fn too_many_zip_entries_fail() {
+    let extra: Vec<(String, String)> = (0..10_001)
+        .map(|index| (format!("xl/media/m{index}.bin"), String::new()))
+        .collect();
+    let bytes = repackage(&real_book_bytes(), str::to_owned, |_, _| None, &extra);
+    let stderr = run_hostile(&bytes);
+    assert!(stderr.contains("too large"), "stderr: {stderr}");
+}
+
+#[test]
+fn shared_references_to_one_big_part_count_each_time() {
+    // 1 MiB of blanks (a few hundred bytes in the file), referenced 600 times:
+    // 600 MiB for the crate, which reads the part for each reference.
+    let big = ("xl/media/big.bin".to_owned(), " ".repeat(1024 * 1024));
+    let many: Vec<(&str, String)> = (0..600)
+        .map(|_| ("image", "../media/big.bin".to_owned()))
+        .collect();
+    let bytes = with_sheet_rels(&real_book_bytes(), &many, std::slice::from_ref(&big));
+    let stderr = run_hostile(&bytes);
+    assert!(stderr.contains("too large"), "stderr: {stderr}");
+
+    // The same part with a few references is fine.
+    let few: Vec<(&str, String)> = (0..3)
+        .map(|_| ("image", "../media/big.bin".to_owned()))
+        .collect();
+    let bytes = with_sheet_rels(&real_book_bytes(), &few, &[big]);
+    let dir = project(None);
+    fs::write(dir.path().join("mappe.xlsx"), bytes).unwrap();
+    let (out, _, _) = run_ok(dir.path());
+    assert!(out.path().join("mappe.xlsx").exists());
 }

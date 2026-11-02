@@ -37,23 +37,15 @@ pub struct XlsxStats {
 /// A rule with the sheet-name globs of its `sheets` field (`None`: each sheet).
 type SheetRule<'a> = (Option<GlobSet>, &'a Rule);
 
-/// Read the workbook at `input`. With `quiet`, nothing is printed.
 /// Read `input` once. Return the workbook and the package bytes it came from.
-fn open_book(input: &Path, rel: &str, quiet: bool) -> anyhow::Result<(Workbook, Vec<u8>)> {
+/// The package check runs before `umya-spreadsheet` reads a byte.
+fn open_book(input: &Path, rel: &str) -> anyhow::Result<(Workbook, Vec<u8>)> {
     let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
     let unreadable = || anyhow!("{rel}: cannot read the workbook");
-    if has_pivot_parts(&bytes) {
-        return Err(anyhow!("{rel}: workbook has pivot tables; not supported"));
-    }
+    xlsx_scrub::check_package(&bytes).map_err(|reason| anyhow!("{rel}: {reason}"))?;
     let found = xlsx_scrub::inspect(&bytes).map_err(|_| unreadable())?;
     if found.unsupported {
         return Err(anyhow!("{rel}: unsupported workbook layout"));
-    }
-    if !quiet && !found.kinds.is_empty() {
-        eprintln!(
-            "warning: {rel}: not pseudonymized: {}",
-            found.kinds.join(", ")
-        );
     }
     // The crate can panic on a damaged workbook; its error texts are not used.
     let book =
@@ -72,7 +64,7 @@ pub fn collect(
     cells: &CellFns,
     known: &mut KnownNames,
 ) -> anyhow::Result<()> {
-    let (mut book, _) = open_book(input, rel, true)?;
+    let (mut book, _) = open_book(input, rel)?;
     let mut collector = Collector::default();
     transform(
         &mut book,
@@ -99,7 +91,7 @@ pub fn process(
     cells: &CellFns,
 ) -> anyhow::Result<XlsxStats> {
     // The scrub restores parts from the same bytes that were inspected and read.
-    let (mut book, original) = open_book(input, rel, false)?;
+    let (mut book, original) = open_book(input, rel)?;
 
     let mut replace = |kind: Kind, value: &str| match kind {
         Kind::First => pseudonymizer.first_name(value),
@@ -113,18 +105,21 @@ pub fn process(
     panic_guard::catch(|| writer::xlsx::write_writer(&book, &mut out))
         .ok_or_else(unwritable)?
         .map_err(|_| unwritable())?;
+    // Defense in depth: no pivot part, whatever its name was in the input.
+    if xlsx_scrub::has_pivot_entries(&out) {
+        return Err(anyhow!("{rel}: workbook has pivot tables; not supported"));
+    }
     let out = xlsx_scrub::scrub(&original, &out).map_err(|_| unwritable())?;
+    // The warnings come from the written package, where part names are canonical.
+    let written = xlsx_scrub::inspect(&out).map_err(|_| unwritable())?;
     write_output(out_root, output, &out, rel)?;
+    if !written.kinds.is_empty() {
+        eprintln!(
+            "warning: {rel}: not pseudonymized: {}",
+            written.kinds.join(", ")
+        );
+    }
     Ok(result.stats)
-}
-
-/// True if the package has a pivot cache or a pivot table part.
-fn has_pivot_parts(bytes: &[u8]) -> bool {
-    zip::ZipArchive::new(Cursor::new(bytes)).is_ok_and(|archive| {
-        archive
-            .file_names()
-            .any(|name| name.starts_with("xl/pivotCache/") || name.starts_with("xl/pivotTables/"))
-    })
 }
 
 /// Replace each email in `value` through the email pseudonym.
@@ -827,19 +822,5 @@ mod tests {
             error.as_deref(),
             Some("t.xlsx: sheet 1: header row is ambiguous")
         );
-    }
-
-    #[test]
-    fn pivot_parts_are_detected() {
-        use std::io::Write;
-        let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        let options = zip::write::SimpleFileOptions::default();
-        writer
-            .start_file("xl/pivotCache/pivotCacheDefinition1.xml", options)
-            .unwrap();
-        writer.write_all(b"<x/>").unwrap();
-        let bytes = writer.finish().unwrap().into_inner();
-        assert!(has_pivot_parts(&bytes));
-        assert!(!has_pivot_parts(b"not a zip"));
     }
 }
