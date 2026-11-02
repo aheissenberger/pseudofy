@@ -1,0 +1,518 @@
+//! End-to-end tests for `pseudofy run` on CSV files (spec 0002).
+//! All data is invented. Each test works in a temporary directory.
+
+#![expect(
+    clippy::unwrap_used,
+    reason = "test helpers outside #[test] functions may panic"
+)]
+
+use std::collections::BTreeMap;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use assert_cmd::Command;
+use predicates::prelude::*;
+use predicates::str::contains;
+use tempfile::TempDir;
+
+const KEY_A: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const KEY_B: &str = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+
+const REAL_TOKENS: [&str; 4] = ["zorbina", "quenzel", "tamsorin", "velgrad"];
+const REAL_EMAIL_PARTS: [&str; 5] = ["acme.test", "other.test", "a@", "b@", "c@"];
+
+fn pseudofy() -> Command {
+    Command::cargo_bin("pseudofy").unwrap()
+}
+
+fn fixture(name: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures")
+        .join(name);
+    fs::read_to_string(path).unwrap()
+}
+
+fn config(email_subdomains: Option<bool>) -> String {
+    let mut text = String::from("language = \"de\"\n");
+    if let Some(value) = email_subdomains {
+        text.push_str("email_subdomains = ");
+        text.push_str(&value.to_string());
+        text.push('\n');
+    }
+    text.push_str(
+        "\n[[rule]]\nfiles = \"**/*.csv\"\nfirst_name = [\"first_name\"]\n\
+         last_name = [\"last_name\"]\nfull_name = [\"name\"]\nemail = [\"email\"]\n",
+    );
+    text
+}
+
+/// Creates a project with a key and a config and copies the fixtures into it.
+fn project(key: &str, email_subdomains: Option<bool>, fixtures: &[&str]) -> TempDir {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "secrets/pseudofy.key", &format!("{key}\n"));
+    write_file(
+        dir.path(),
+        "config/pseudofy.toml",
+        &config(email_subdomains),
+    );
+    for name in fixtures {
+        write_file(dir.path(), name, &fixture(name));
+    }
+    dir
+}
+
+fn write_file(root: &Path, relative: &str, content: &str) {
+    let path = root.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, content).unwrap();
+}
+
+fn run(project: &Path, out: &Path) -> assert_cmd::assert::Assert {
+    pseudofy()
+        .args(["run", "--project"])
+        .arg(project)
+        .arg("--out")
+        .arg(out)
+        .assert()
+}
+
+/// Runs successfully into a fresh output directory and returns it with stdout.
+fn run_ok(project: &Path) -> (TempDir, String) {
+    let out = TempDir::new().unwrap();
+    let assert = run(project, out.path()).success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    (out, stdout)
+}
+
+fn read(root: &Path, relative: &str) -> String {
+    fs::read_to_string(root.join(relative)).unwrap()
+}
+
+/// Splits CSV text without quoted delimiters into rows of cells.
+fn rows(text: &str, delimiter: char) -> Vec<Vec<String>> {
+    text.lines()
+        .map(|line| {
+            line.split(delimiter)
+                .map(|cell| cell.trim_matches('"').to_string())
+                .collect()
+        })
+        .collect()
+}
+
+fn column(table: &[Vec<String>], header: &str) -> Vec<String> {
+    let index = table[0].iter().position(|h| h == header).unwrap();
+    table[1..].iter().map(|row| row[index].clone()).collect()
+}
+
+/// Returns the words of `text` that contain an at sign.
+fn emails_in(text: &str) -> Vec<String> {
+    text.split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '"')
+        .filter(|word| word.contains('@'))
+        .map(str::to_string)
+        .collect()
+}
+
+fn is_slug(part: &str) -> bool {
+    !part.is_empty()
+        && part
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+}
+
+/// Checks a fake email and returns the subdomain label, if any.
+fn check_fake_email(email: &str, subdomains: bool) -> Option<String> {
+    let (local, domain) = email.split_once('@').unwrap();
+    let (first, last) = local.split_once('.').unwrap();
+    assert!(is_slug(first) && is_slug(last), "bad local part: {email}");
+    if subdomains {
+        let label = domain.strip_suffix(".example.com").unwrap();
+        assert!(
+            (6..=10).contains(&label.len()) && label.chars().all(|c| c.is_ascii_lowercase()),
+            "bad label: {email}"
+        );
+        Some(label.to_string())
+    } else {
+        assert_eq!(domain, "example.com", "bad domain: {email}");
+        None
+    }
+}
+
+fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for entry in fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                files.insert(path.clone(), fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
+}
+
+fn snapshot_relative(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    snapshot(root)
+        .into_iter()
+        .map(|(path, data)| (path.strip_prefix(root).unwrap().to_path_buf(), data))
+        .collect()
+}
+
+fn tokens(text: &str) -> Vec<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+// --- Names ---------------------------------------------------------------
+
+#[test]
+fn same_name_in_two_files_gets_the_same_pseudonym() {
+    let dir = project(KEY_A, None, &["people_a.csv", "people_b.csv"]);
+    let (out, _) = run_ok(dir.path());
+    let a = rows(&read(out.path(), "people_a.csv"), ',');
+    let b = rows(&read(out.path(), "people_b.csv"), ',');
+    assert_eq!(column(&a, "first_name")[0], column(&b, "first_name")[0]);
+    assert_eq!(column(&a, "last_name")[0], column(&b, "last_name")[0]);
+    assert_eq!(column(&a, "name")[0], column(&b, "name")[0]);
+}
+
+#[test]
+fn first_name_and_full_name_share_the_first_name_pseudonym() {
+    let dir = project(KEY_A, None, &["people_a.csv"]);
+    let (out, _) = run_ok(dir.path());
+    let table = rows(&read(out.path(), "people_a.csv"), ',');
+    for i in 0..2 {
+        let full = &column(&table, "name")[i];
+        let parts: Vec<&str> = full.split(' ').collect();
+        assert_eq!(parts.len(), 2, "full name keeps two tokens: {full}");
+        assert_eq!(parts[0], column(&table, "first_name")[i]);
+        assert_eq!(parts[1], column(&table, "last_name")[i]);
+    }
+}
+
+#[test]
+fn last_comma_first_is_supported_and_shares_pseudonyms() {
+    let dir = project(KEY_A, None, &["people_a.csv", "last_first.csv"]);
+    let (out, _) = run_ok(dir.path());
+    let people = rows(&read(out.path(), "people_a.csv"), ',');
+    let table = rows(&read(out.path(), "last_first.csv"), ';');
+    let full = &column(&table, "name")[0];
+    let (last, first) = full.split_once(", ").unwrap();
+    assert_eq!(first, column(&people, "first_name")[0]);
+    assert_eq!(last, column(&people, "last_name")[0]);
+}
+
+#[test]
+fn name_case_style_is_kept() {
+    let dir = project(KEY_A, None, &["people_a.csv", "upper.csv"]);
+    let (out, _) = run_ok(dir.path());
+    let people = rows(&read(out.path(), "people_a.csv"), ',');
+    let upper = rows(&read(out.path(), "upper.csv"), ',');
+    let first = &column(&upper, "first_name")[0];
+    let last = &column(&upper, "last_name")[0];
+    assert_eq!(first, &first.to_uppercase());
+    assert_eq!(last, &last.to_uppercase());
+    assert_eq!(
+        first.to_lowercase(),
+        column(&people, "first_name")[0].to_lowercase()
+    );
+    assert_eq!(
+        last.to_lowercase(),
+        column(&people, "last_name")[0].to_lowercase()
+    );
+}
+
+// --- Determinism and keys ------------------------------------------------
+
+#[test]
+fn two_runs_with_one_key_give_byte_equal_output() {
+    let dir = project(KEY_A, None, &["people_a.csv", "people_b.csv"]);
+    let (first, _) = run_ok(dir.path());
+    let (second, _) = run_ok(dir.path());
+    assert_eq!(
+        snapshot_relative(first.path()),
+        snapshot_relative(second.path())
+    );
+    assert!(!snapshot_relative(first.path()).is_empty());
+}
+
+#[test]
+fn two_keys_give_different_output() {
+    let one = project(KEY_A, None, &["people_a.csv"]);
+    let two = project(KEY_B, None, &["people_a.csv"]);
+    let (out_one, _) = run_ok(one.path());
+    let (out_two, _) = run_ok(two.path());
+    assert_ne!(
+        read(out_one.path(), "people_a.csv"),
+        read(out_two.path(), "people_a.csv")
+    );
+}
+
+// --- Emails ----------------------------------------------------------------
+
+#[test]
+fn without_subdomains_every_email_ends_in_example_com() {
+    let dir = project(KEY_A, Some(false), &["people_a.csv"]);
+    let (out, _) = run_ok(dir.path());
+    let text = read(out.path(), "people_a.csv");
+    let table = rows(&text, ',');
+    let emails = column(&table, "email");
+    assert!(emails.iter().all(|e| e.ends_with("@example.com")));
+    let found = emails_in(&text);
+    assert_eq!(found.len(), 3, "a, b and the one in the free text");
+    for email in found {
+        check_fake_email(&email, false);
+    }
+}
+
+#[test]
+fn default_gives_one_subdomain_per_real_domain_ignoring_case() {
+    let dir = project(KEY_A, None, &["people_a.csv"]);
+    let (out, _) = run_ok(dir.path());
+    let table = rows(&read(out.path(), "people_a.csv"), ',');
+    let emails = column(&table, "email");
+    let label_a = check_fake_email(&emails[0], true).unwrap();
+    let label_b = check_fake_email(&emails[1], true).unwrap();
+    let in_text = emails_in(&column(&table, "note")[0]);
+    assert_eq!(in_text.len(), 1);
+    let label_c = check_fake_email(&in_text[0], true).unwrap();
+    assert_eq!(label_a, label_b, "acme.test and ACME.test");
+    assert_ne!(label_a, label_c, "acme.test and other.test");
+}
+
+#[test]
+fn explicit_subdomains_true_behaves_like_the_default() {
+    let dir = project(KEY_A, Some(true), &["people_a.csv"]);
+    let (out, _) = run_ok(dir.path());
+    let text = read(out.path(), "people_a.csv");
+    let found = emails_in(&text);
+    assert_eq!(found.len(), 3);
+    for email in found {
+        check_fake_email(&email, true);
+    }
+}
+
+#[test]
+fn same_email_in_two_files_gets_the_same_fake_email() {
+    let dir = project(KEY_A, None, &["people_a.csv", "people_b.csv"]);
+    let (out, _) = run_ok(dir.path());
+    let a = rows(&read(out.path(), "people_a.csv"), ',');
+    let b = rows(&read(out.path(), "people_b.csv"), ',');
+    let free_text = emails_in(&column(&a, "note")[0]);
+    assert_eq!(free_text[0], column(&b, "email")[0], "c@other.test");
+}
+
+#[test]
+fn emails_in_free_text_columns_are_replaced() {
+    let dir = project(KEY_A, None, &["people_a.csv"]);
+    let (out, _) = run_ok(dir.path());
+    let table = rows(&read(out.path(), "people_a.csv"), ',');
+    let note = &column(&table, "note")[0];
+    assert!(note.starts_with("write to "));
+    assert!(note.ends_with(" today"));
+    assert!(!note.contains("other.test"));
+}
+
+// --- No leaks ----------------------------------------------------------------
+
+#[test]
+fn no_real_name_or_email_appears_in_the_output() {
+    let dir = project(KEY_A, None, &["people_a.csv", "people_b.csv", "upper.csv"]);
+    let (out, stdout) = run_ok(dir.path());
+    for name in ["people_a.csv", "people_b.csv", "upper.csv"] {
+        let text = read(out.path(), name);
+        let lower = text.to_lowercase();
+        for part in REAL_EMAIL_PARTS {
+            assert!(!lower.contains(part), "{name} leaks {part}");
+        }
+        for token in tokens(&text) {
+            assert!(
+                !REAL_TOKENS.contains(&token.as_str()),
+                "{name} leaks {token}"
+            );
+        }
+    }
+    let lower = stdout.to_lowercase();
+    for token in REAL_TOKENS.iter().chain(REAL_EMAIL_PARTS.iter()) {
+        assert!(!lower.contains(token), "stdout leaks {token}");
+    }
+}
+
+#[test]
+fn output_never_contains_the_project_key() {
+    let dir = project(KEY_A, None, &["people_a.csv"]);
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).success();
+    let output = assert.get_output();
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(KEY_A));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(KEY_A));
+    assert!(!read(out.path(), "people_a.csv").contains(KEY_A));
+}
+
+#[test]
+fn pseudonym_differs_from_the_real_value_in_every_name_cell() {
+    let dir = project(KEY_A, None, &["people_a.csv"]);
+    let (out, _) = run_ok(dir.path());
+    let before = rows(&fixture("people_a.csv"), ',');
+    let after = rows(&read(out.path(), "people_a.csv"), ',');
+    for header in ["first_name", "last_name", "name", "email"] {
+        for (real, fake) in column(&before, header).iter().zip(column(&after, header)) {
+            assert_ne!(real.to_lowercase(), fake.to_lowercase(), "{header}");
+        }
+    }
+}
+
+// --- Structure -------------------------------------------------------------
+
+fn variant(base: &str, delimiter: char, line_ending: &str) -> String {
+    let mut text = String::new();
+    for line in base.lines() {
+        text.push_str(&line.replace(',', &delimiter.to_string()));
+        text.push_str(line_ending);
+    }
+    text
+}
+
+#[test]
+fn output_keeps_shape_header_delimiter_and_line_ending() {
+    for delimiter in [',', ';', '\t'] {
+        for line_ending in ["\n", "\r\n"] {
+            let input = variant(&fixture("people_a.csv"), delimiter, line_ending);
+            let dir = project(KEY_A, None, &[]);
+            write_file(dir.path(), "data.csv", &input);
+            let (out, _) = run_ok(dir.path());
+            let output = read(out.path(), "data.csv");
+            let label = format!("delimiter {delimiter:?}, ending {line_ending:?}");
+
+            let before = rows(&input, delimiter);
+            let after = rows(&output, delimiter);
+            assert_eq!(before.len(), after.len(), "rows, {label}");
+            for (b, a) in before.iter().zip(&after) {
+                assert_eq!(b.len(), a.len(), "columns, {label}");
+            }
+            assert_eq!(before[0], after[0], "header, {label}");
+            assert_eq!(
+                input.lines().next(),
+                output.lines().next(),
+                "header line, {label}"
+            );
+            assert_eq!(
+                input.matches("\r\n").count(),
+                output.matches("\r\n").count(),
+                "CRLF count, {label}"
+            );
+            assert_eq!(
+                input.matches('\n').count(),
+                output.matches('\n').count(),
+                "LF count, {label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn input_files_are_unchanged_after_run() {
+    let dir = project(
+        KEY_A,
+        None,
+        &["people_a.csv", "people_b.csv", "last_first.csv"],
+    );
+    let before = snapshot(dir.path());
+    let (_out, _) = run_ok(dir.path());
+    assert_eq!(before, snapshot(dir.path()));
+}
+
+#[test]
+fn files_in_subdirectories_are_written_to_the_same_relative_path() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(dir.path(), "team/east/people.csv", &fixture("people_a.csv"));
+    let (out, _) = run_ok(dir.path());
+    let table = rows(&read(out.path(), "team/east/people.csv"), ',');
+    assert_eq!(table.len(), 3);
+}
+
+// --- Summary and errors ------------------------------------------------------
+
+#[test]
+fn summary_line_reports_files_replaced_values_and_collisions() {
+    let dir = project(KEY_A, None, &["people_a.csv", "people_b.csv"]);
+    let (_out, stdout) = run_ok(dir.path());
+    let line = stdout
+        .lines()
+        .find(|l| l.starts_with("files: "))
+        .unwrap_or_else(|| panic!("no summary line in {stdout:?}"));
+    let parts: Vec<&str> = line.split(", ").collect();
+    assert_eq!(parts.len(), 3, "{line}");
+    assert_eq!(parts[0], "files: 2");
+    let replaced: u32 = parts[1]
+        .strip_prefix("replaced values: ")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(replaced > 0);
+    let _collisions: u32 = parts[2]
+        .strip_prefix("collisions: ")
+        .unwrap()
+        .parse()
+        .unwrap();
+}
+
+#[test]
+fn missing_key_fails_and_points_to_init() {
+    let dir = project(KEY_A, None, &["people_a.csv"]);
+    fs::remove_file(dir.path().join("secrets/pseudofy.key")).unwrap();
+    let out = TempDir::new().unwrap();
+    run(dir.path(), out.path())
+        .failure()
+        .stderr(contains("pseudofy init"));
+}
+
+#[test]
+fn out_equal_to_project_fails() {
+    let dir = project(KEY_A, None, &["people_a.csv"]);
+    let before = snapshot(dir.path());
+    run(dir.path(), dir.path()).failure();
+    assert_eq!(before, snapshot(dir.path()));
+}
+
+#[test]
+fn out_inside_project_works_and_is_not_read_again() {
+    let dir = project(KEY_A, None, &["people_a.csv", "people_b.csv"]);
+    let out = dir.path().join("out");
+    let first = run(dir.path(), &out).success();
+    let first_stdout = String::from_utf8(first.get_output().stdout.clone()).unwrap();
+    assert!(first_stdout.contains("files: 2,"), "{first_stdout}");
+    let written = snapshot(&out);
+    assert_eq!(written.len(), 2);
+
+    let second = run(dir.path(), &out).success();
+    let second_stdout = String::from_utf8(second.get_output().stdout.clone()).unwrap();
+    assert!(second_stdout.contains("files: 2,"), "{second_stdout}");
+    assert!(!out.join("out").exists(), "out was read as input");
+    assert_eq!(written, snapshot(&out));
+}
+
+#[test]
+fn files_in_secrets_and_config_are_not_processed() {
+    let dir = project(KEY_A, None, &["people_a.csv"]);
+    write_file(dir.path(), "secrets/extra.csv", &fixture("people_a.csv"));
+    write_file(dir.path(), "config/extra.csv", &fixture("people_a.csv"));
+    let (out, stdout) = run_ok(dir.path());
+    assert!(stdout.contains("files: 1,"), "{stdout}");
+    assert!(!out.path().join("secrets").exists());
+    assert!(!out.path().join("config").exists());
+    assert!(out.path().join("people_a.csv").exists());
+}
+
+#[test]
+fn run_does_not_print_real_values_on_stderr() {
+    let dir = project(KEY_A, None, &["people_a.csv"]);
+    let out = TempDir::new().unwrap();
+    run(dir.path(), out.path())
+        .success()
+        .stderr(contains("Zorbina").not().and(contains("acme").not()));
+}
