@@ -9,10 +9,10 @@
 
 ## 1. Objective & Context
 
-**Problem:** A project with 10 000 persons still gets about 25 person collisions with `two_first_names = true`. One real first name always gets one fake first name. Two persons with the same real first name collide if their two real last names get one fake last name. The last-name list has 1 888 entries, so this happens for 1 of 1 888 such pairs.
+**Problem:** A project with 10 000 persons still gets about 15 person collisions with `two_first_names = true`. One real first name always gets one fake first name. Two persons with the same real first name collide if their two real last names get one fake last name. The last-name list has 1 887 entries, so this happens for 1 of 1 887 such pairs.
 Spec 0022 and the README say that `two_first_names = true` gives about 0.01 person collisions. This is not correct.
 **Today:** a fake last-name token is one entry of the last-name list.
-**After this change:** the setting `two_last_names` gives each fake last-name token a second last name: `Berger-Wagner`. With `two_first_names` and `two_last_names`, person collisions drop to about 0.03 for 10 000 persons.
+**After this change:** the setting `two_last_names` gives each fake last-name token a second last name: `Berger-Wagner`. With `two_first_names` and `two_last_names`, person collisions drop to about 0.02 for 10 000 persons.
 
 ## 2. Scope
 
@@ -67,8 +67,15 @@ devcontainer exec --workspace-folder . ./scripts/check
 
 ## 5. Rollback / Notes (optional)
 
-Expected person collisions for 10 000 persons with the German lists:
-- persons with the same real first name and different real last names: about 25 with one last name, about 0.01 with two last names;
-- persons with the same real last name and different real first names: about 16 with one first name, about 0.01 with two first names.
+Expected person collisions for 10 000 persons with the German lists (1 644 first names, 1 887 last names), and uniform names. Measured with the binary on invented data, after review:
+
+| `two_first_names` | `two_last_names` | Person collisions |
+| --- | --- | --- |
+| false | false | 45 |
+| false | true | 14 |
+| true | false | 15 |
+| true | true | 0 |
+
+The three causes are: the same first name (about 15), the same last name (about 15), and both names different with both fake parts equal (about 16). Each setting removes two of the three causes.
 
 A change of `two_last_names` changes each fake last name of the project.

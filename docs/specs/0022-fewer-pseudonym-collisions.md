@@ -71,5 +71,5 @@ devcontainer exec --workspace-folder . ./scripts/check
 ## 5. Rollback / Notes (optional)
 
 Expected collisions for 10 000 persons: emails about 16 to about 0.2.
-The estimate "persons with `two_first_names = true`: about 0.01" is wrong. `two_first_names` removes only collisions of persons with the same last name. Spec 0024 gives the corrected numbers and adds `two_last_names`.
+The estimate "persons with `two_first_names = true`: about 0.01" is wrong. `two_first_names` alone leaves about 15 person collisions for 10 000 persons. Spec 0024 gives the corrected numbers and adds `two_last_names`.
 A change of `two_first_names` changes each fake first name of the project.
