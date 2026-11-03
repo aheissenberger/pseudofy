@@ -70,19 +70,30 @@ pub(crate) fn is_apostrophe(c: char) -> bool {
 }
 
 /// The one normalization of name columns, free text, and email addresses
-/// (ADR-0013): remove format characters, NFC, lowercase, U+2019 and U+02BC to
-/// `'`, `ß` to `ss`, no U+0307 after `i` (so `İ` equals `i`), trimmed.
+/// (ADR-0013): remove format characters, NFC, lowercase (the whole string, so
+/// a Greek final sigma is right), U+2019 and U+02BC to `'`, `ß` to `ss`, no
+/// U+0307 after `i` (so `İ` equals `i`), trimmed.
 pub(crate) fn normalize(text: &str) -> String {
+    normalize_with(text, true)
+}
+
+/// `normalize` for the domain of an email address: `ß` stays (IDNA2008 keeps
+/// it, so `straße.test` and `strasse.test` are different domains).
+pub(crate) fn normalize_domain(text: &str) -> String {
+    normalize_with(text, false)
+}
+
+fn normalize_with(text: &str, sharp_s_to_ss: bool) -> String {
     let visible: String = text.chars().filter(|c| !is_format_char(*c)).collect();
-    let mut out = String::with_capacity(visible.len());
-    for c in visible.nfc() {
-        for l in c.to_lowercase() {
-            match l {
-                'ß' => out.push_str("ss"),
-                '\u{2019}' | '\u{2bc}' => out.push('\''),
-                '\u{307}' if out.ends_with('i') => {}
-                _ => out.push(l),
-            }
+    let nfc: String = visible.nfc().collect();
+    let lower = nfc.to_lowercase();
+    let mut out = String::with_capacity(lower.len());
+    for c in lower.chars() {
+        match c {
+            'ß' if sharp_s_to_ss => out.push_str("ss"),
+            '\u{2019}' | '\u{2bc}' => out.push('\''),
+            '\u{307}' if out.ends_with('i') => {}
+            _ => out.push(c),
         }
     }
     out.trim().to_string()
@@ -94,18 +105,34 @@ fn is_token_char(c: char) -> bool {
 
 /// Titles and salutations: not names, never replaced. Case-insensitive; the
 /// dot is no token character, so `Dr.` and `Dr` are the same. `DI` counts only
-/// in capitals, because `di` is a particle and `Di` can be a name.
+/// in capitals, because `di` is a particle and `Di` can be a name. A title
+/// counts only before the first name token (`full_slots`).
 fn is_title(token: &str) -> bool {
-    const TITLES: [&str; 13] = [
-        "dr", "prof", "mag", "mmag", "ing", "dipl", "univ", "herr", "frau", "mr", "mrs", "ms", "mx",
+    const TITLES: [&str; 9] = [
+        "dr", "prof", "mag", "ing", "herr", "frau", "mr", "mrs", "ms",
     ];
     token == "DI" || TITLES.contains(&token.to_lowercase().as_str())
 }
 
-/// Suffixes: not names, never replaced. Roman numerals only in capitals.
+/// Suffixes: not names, never replaced. Only the usual spellings count
+/// (`Mba` is a name, `MBA` a suffix). A suffix counts only after the last name
+/// token (`full_slots`).
 fn is_suffix(token: &str) -> bool {
-    const SUFFIXES: [&str; 6] = ["jr", "sr", "msc", "bsc", "mba", "phd"];
-    matches!(token, "II" | "III" | "IV") || SUFFIXES.contains(&token.to_lowercase().as_str())
+    matches!(
+        token,
+        "Jr" | "JR"
+            | "Sr"
+            | "SR"
+            | "II"
+            | "III"
+            | "MBA"
+            | "MSc"
+            | "MSC"
+            | "BSc"
+            | "BSC"
+            | "PhD"
+            | "PHD"
+    )
 }
 
 /// Lowercase particles belong to the last name (`van Beethoven`). They stay
@@ -131,10 +158,13 @@ pub(crate) enum Slot {
 
 /// Slots of the name tokens (byte ranges in `value`) of a `full_name` value.
 ///
-/// - Titles and suffixes are `Skip`.
-/// - Exactly one comma between name tokens (a comma with only titles or
-///   suffixes on one side does not count) means `Last, First`: the tokens
-///   before it are the last name, those after it the first name.
+/// - A run of titles at the start and a run of suffixes at the end are `Skip`.
+///   Titles or suffixes in the middle are names, and the last token is never
+///   a title or a suffix (`Anna Herr`, `Kim Mba`, a single `Ing`).
+/// - Exactly one comma between name tokens (a comma with only suffixes on one
+///   side does not count) means `Last, First`: the tokens before it are the
+///   last name, those after it the first name. Titles right after the comma
+///   are `Skip` (`Zorbel, Dr. Hans`).
 /// - Otherwise the final token is the last name, and the lowercase particles
 ///   right before it belong to it. All other tokens are first names.
 /// - A single word is a last name.
@@ -145,9 +175,19 @@ pub(crate) fn full_slots(value: &str, ranges: &[(usize, usize)]) -> Vec<Slot> {
             .and_then(|r| value.get(r.0..r.1))
             .unwrap_or("")
     };
-    let eligible: Vec<usize> = (0..ranges.len())
-        .filter(|i| !is_title(raw(*i)) && !is_suffix(raw(*i)))
-        .collect();
+    let n = ranges.len();
+    let mut lo = 0;
+    while lo < n && is_title(raw(lo)) {
+        lo += 1;
+    }
+    let mut hi = n;
+    while hi > lo && is_suffix(raw(hi - 1)) {
+        hi -= 1;
+    }
+    if lo >= hi && n > 0 {
+        (lo, hi) = (n - 1, n);
+    }
+    let eligible: Vec<usize> = (lo..hi).collect();
     let first_end = eligible.first().and_then(|i| ranges.get(*i)).map(|r| r.1);
     let last_start = eligible.last().and_then(|i| ranges.get(*i)).map(|r| r.0);
     let mut commas = value.match_indices(',').map(|(pos, _)| pos).filter(|pos| {
@@ -171,8 +211,13 @@ pub(crate) fn full_slots(value: &str, ranges: &[(usize, usize)]) -> Vec<Slot> {
             let particle = k + 1 < before.len() && is_particle(raw(*i));
             set(*i, if particle { Slot::Particle } else { Slot::Last });
         }
-        for i in after {
-            set(i, Slot::First);
+        let titles = after
+            .iter()
+            .take_while(|i| is_title(raw(**i)))
+            .count()
+            .min(after.len().saturating_sub(1));
+        for (k, i) in after.into_iter().enumerate() {
+            set(i, if k < titles { Slot::Skip } else { Slot::First });
         }
     } else if let Some((core, rest)) = eligible.split_last() {
         set(*core, Slot::Last);
@@ -311,18 +356,17 @@ fn apply_case(token: &str, pseudonym: &str) -> String {
     }
 }
 
-/// Characters of an unquoted local part: RFC 5322 `atext` without
-/// `! / ? & =` (text or URL punctuation around an address), plus Unicode
-/// letters, digits, marks, and format characters. A dot is allowed only
-/// between two such words.
-const LOCAL_CHARS: &str = r"[\p{L}\p{N}\p{M}\p{Cf}_%+*#$^`{|}~'-]";
+/// Characters of an unquoted local part: RFC 5322 `atext`, plus Unicode
+/// letters, digits, marks, and format characters. A dot is allowed only between
+/// two such words. In a URL, `email_spans` cuts the part before the last
+/// separator.
+const LOCAL_CHARS: &str = r"[\p{L}\p{N}\p{M}\p{Cf}_%+*#$^`{|}\~'\-!/?\&=]";
 
 /// Regex that finds email addresses in a cell.
 ///
 /// Local part: words of `LOCAL_CHARS` joined by single dots (the first
 /// character is a letter, digit, or `_`), or a quoted string. Domain: labels
-/// of letters, digits, and `-`, joined by dots. One label is enough
-/// (`localhost`). `email_spans` checks the rest.
+/// of letters, digits, and `-`, joined by dots. `email_spans` checks the rest.
 pub fn email_regex() -> anyhow::Result<Regex> {
     let label = r"[\p{L}\p{N}](?:[\p{L}\p{N}\p{M}\p{Cf}-]*[\p{L}\p{N}\p{M}])?";
     let pattern = [
@@ -340,33 +384,80 @@ pub fn email_regex() -> anyhow::Result<Regex> {
     Ok(Regex::new(&pattern)?)
 }
 
-/// `true` if the address at `start` is inside a URL and not a `user@host`
-/// after `?`, `&`, `=`, or `mailto:` (then it is the userinfo or the path).
-fn is_url_part(value: &str, start: usize) -> bool {
-    let before = value.get(..start).unwrap_or("");
-    let word = before
-        .rfind(char::is_whitespace)
-        .map_or(before, |i| before.get(i..).unwrap_or(""));
-    let lower = word.trim_start().to_ascii_lowercase();
-    let in_url = lower.contains("://") || lower.starts_with("www.");
-    in_url && !(lower.ends_with(['?', '&', '=']) || lower.ends_with("mailto:"))
+/// `true` if `bytes` ends with `suffix` (ASCII, case-insensitive).
+fn ends_with_ignore_case(bytes: &[u8], suffix: &[u8]) -> bool {
+    bytes
+        .len()
+        .checked_sub(suffix.len())
+        .and_then(|from| bytes.get(from..))
+        .is_some_and(|tail| tail.eq_ignore_ascii_case(suffix))
+}
+
+/// Separators inside a URL, before the part that is an address.
+fn is_url_separator(c: char) -> bool {
+    matches!(c, '/' | ':' | ';' | ',' | '|' | '?' | '&' | '=' | '"')
 }
 
 /// Byte ranges of the email addresses in `value`.
 ///
-/// Punctuation around an address is not part of it. A match is skipped if
-/// the last label of its domain has no letter (`3@4.50`), or if it is the
-/// userinfo or the path of a URL.
+/// One linear pass. Punctuation around an address is not part of it. A match
+/// is skipped if its domain has one label that is not `localhost`, or if the
+/// last label has no letter (`3@4.50`). Every other match is an address, also
+/// in a URL. If the non-space run before the `@` holds `://`, `www.`, or
+/// `mailto:`, only the text after the last separator of the match is the local
+/// part (`https://x.test/anna@firma.test`: `anna@firma.test`), so the URL
+/// stays. Outside a URL the local part is the whole match.
 pub fn email_spans(value: &str, regex: &Regex) -> Vec<std::ops::Range<usize>> {
-    regex
-        .find_iter(value)
-        .filter(|m| {
-            let domain = m.as_str().rsplit_once('@').map_or("", |(_, d)| d);
-            let tld = domain.rsplit('.').next().unwrap_or("");
-            tld.chars().any(char::is_alphabetic) && !is_url_part(value, m.start())
-        })
-        .map(|m| m.range())
-        .collect()
+    let bytes = value.as_bytes();
+    let mut out = Vec::new();
+    // Bytes before `pos` are seen; `in_url` is for the current non-space run.
+    let (mut pos, mut in_url) = (0usize, false);
+    for m in regex.find_iter(value) {
+        let text = m.as_str();
+        let Some(at) = text.rfind('@') else { continue };
+        let local = text.get(..at).unwrap_or("");
+        let domain = text.get(at + 1..).unwrap_or("");
+        let tld = domain.rsplit('.').next().unwrap_or("");
+        let single = !domain.contains('.');
+        if !tld.chars().any(char::is_alphabetic)
+            || (single && !domain.eq_ignore_ascii_case("localhost"))
+        {
+            continue;
+        }
+        let at_pos = m.start() + at;
+        for (i, c) in value.get(pos..at_pos).unwrap_or("").char_indices() {
+            let end = pos + i + c.len_utf8();
+            if c.is_whitespace() {
+                in_url = false;
+                continue;
+            }
+            let seen = bytes.get(..end).unwrap_or(&[]);
+            let www_start = ends_with_ignore_case(seen, b"www.")
+                && end
+                    .checked_sub(5)
+                    .and_then(|k| bytes.get(k))
+                    .is_none_or(|b| !b.is_ascii_alphanumeric());
+            if www_start
+                || ends_with_ignore_case(seen, b"://")
+                || ends_with_ignore_case(seen, b"mailto:")
+            {
+                in_url = true;
+            }
+        }
+        pos = pos.max(at_pos);
+        let mut start = m.start();
+        if in_url && !local.starts_with('"') {
+            let cut = local.rfind(is_url_separator).map_or(0, |i| i + 1);
+            let kept = local.get(cut..).unwrap_or("");
+            let trimmed = kept.trim_start_matches(|c: char| !(c.is_alphanumeric() || c == '_'));
+            if trimmed.is_empty() {
+                continue;
+            }
+            start += at - trimmed.len();
+        }
+        out.push(start..m.end());
+    }
+    out
 }
 
 /// Replace each email address in `value` with `replace(address)`.
@@ -604,8 +695,8 @@ mod tests {
         assert_eq!(run("Mrs. Zorbel", NameRole::Full), "Mrs. Muster");
         assert_eq!(run("Ms. Anna Zorbel", NameRole::Full), "Ms. Berta Muster");
         assert_eq!(
-            run("Dipl.-Ing. DI Hans Zorbel", NameRole::Full),
-            "Dipl.-Ing. DI Berta Muster"
+            run("Ing. DI Hans Zorbel", NameRole::Full),
+            "Ing. DI Berta Muster"
         );
         assert_eq!(run("Hans Zorbel Jr.", NameRole::Full), "Berta Muster Jr.");
         assert_eq!(run("Hans Zorbel III", NameRole::Full), "Berta Muster III");
@@ -618,9 +709,30 @@ mod tests {
             run("Zorbel, Hans, Jr.", NameRole::Full),
             "Muster, Berta, Jr."
         );
-        assert_eq!(run("Dr.", NameRole::Full), "Dr.");
+        // The last token is a name, even if it looks like a title.
+        assert_eq!(run("Dr.", NameRole::Full), "Muster.");
+        assert_eq!(run("Dr. Jr.", NameRole::Full), "Dr. Muster.");
         // `Di` is a name, `di` a particle.
         assert_eq!(run("Di Zorbel", NameRole::Full), "Berta Muster");
+    }
+
+    #[test]
+    fn titles_and_suffixes_count_only_at_the_ends() {
+        for (value, want) in [
+            ("Anna Herr", "F[Anna] L[Herr]"),
+            ("Kim Mba", "F[Kim] L[Mba]"),
+            ("Lena Ing", "F[Lena] L[Ing]"),
+            ("Zorbina Frau", "F[Zorbina] L[Frau]"),
+            ("ANNA DI", "F[ANNA] L[DI]"),
+            ("Ing", "L[Ing]"),
+            ("Mba", "L[Mba]"),
+            ("Hans Dr. Zorbel", "F[Hans] F[Dr]. L[Zorbel]"),
+            ("Hans Jr. Zorbel", "F[Hans] F[Jr]. L[Zorbel]"),
+            ("Herr Dr. Hans Zorbel", "Herr Dr. F[Hans] L[Zorbel]"),
+            ("Hans Zorbel Jr. MSc", "F[Hans] L[Zorbel] Jr. MSc"),
+        ] {
+            assert_eq!(tagged(value, NameRole::Full), want, "{value}");
+        }
     }
 
     #[test]
@@ -699,6 +811,14 @@ mod tests {
         ] {
             assert_eq!(normalize(a), normalize(b), "{a:?} {b:?}");
         }
+        assert_eq!(
+            normalize("\u{39f}\u{394}\u{3a5}\u{3a3}\u{3a3}\u{395}\u{3a5}\u{3a3}"),
+            normalize("\u{39f}\u{3b4}\u{3c5}\u{3c3}\u{3c3}\u{3b5}\u{3c5}\u{3c2}")
+        );
+        assert_ne!(
+            normalize_domain("stra\u{df}e.test"),
+            normalize_domain("strasse.test")
+        );
         assert_ne!(normalize("M\u{fc}ller"), normalize("Muller"));
         assert_eq!(normalize("Karl"), "karl");
     }
@@ -721,7 +841,6 @@ mod tests {
             "anna.zorbel@firma.test\u{2026}",
             "anna.zorbel@firma.test\u{3002}",
             "!anna.zorbel@firma.test",
-            "x/anna.zorbel@firma.test",
             "(anna.zorbel@firma.test)",
         ] {
             assert_eq!(found(value)?, ["anna.zorbel@firma.test"], "{value}");
@@ -730,23 +849,102 @@ mod tests {
     }
 
     #[test]
-    fn urls_keep_their_shape() -> anyhow::Result<()> {
+    fn urls_keep_their_shape_and_every_address_is_replaced() -> anyhow::Result<()> {
         let re = email_regex()?;
         let url = "https://firma.test/x?u=anna.zorbel@firma.test&y=1";
         let out = replace_emails(url, &re, &mut |_| "x@y.test".to_string());
         assert_eq!(out, "https://firma.test/x?u=x@y.test&y=1");
-        assert_eq!(found("https://anna@firma.test/p")?, Vec::<String>::new());
-        assert_eq!(found("https://user:pw@firma.test/p")?, Vec::<String>::new());
+        for (value, want) in [
+            ("https://anna@firma.test/p", "https://x@y.test/p"),
+            ("https://user:pw@firma.test/p", "https://user:x@y.test/p"),
+            (
+                "https://firma.test/a.b@c.test",
+                "https://firma.test/x@y.test",
+            ),
+            (
+                "https://x.test/tamsorin.velgrad@acme.test",
+                "https://x.test/x@y.test",
+            ),
+            ("https://x.test;a@acme.test", "https://x.test;x@y.test"),
+            (
+                "Links:https://x.test,b@acme.test",
+                "Links:https://x.test,x@y.test",
+            ),
+            (
+                "www.x.test/kontakt/b@acme.test",
+                "www.x.test/kontakt/x@y.test",
+            ),
+            ("https://x.test|t@acme.test", "https://x.test|x@y.test"),
+            (
+                r#"{"url":"https://x.test","mail":"t@acme.test"}"#,
+                r#"{"url":"https://x.test","mail":"x@y.test"}"#,
+            ),
+            (
+                r#"<a href="https://x.test">x</a><br>t@acme.test"#,
+                r#"<a href="https://x.test">x</a><br>x@y.test"#,
+            ),
+            (
+                "https://x.test/share?to=a@acme.test,b@acme.test",
+                "https://x.test/share?to=x@y.test,x@y.test",
+            ),
+            (
+                "https://x.test/share?to=a@acme.test;b@acme.test",
+                "https://x.test/share?to=x@y.test;x@y.test",
+            ),
+            (
+                "https://f.test/?a=1&m=b@c.test",
+                "https://f.test/?a=1&m=x@y.test",
+            ),
+            (
+                "mailto:anna@firma.test?subject=x",
+                "mailto:x@y.test?subject=x",
+            ),
+            ("see MAILTO:anna@firma.test", "see MAILTO:x@y.test"),
+        ] {
+            let out = replace_emails(value, &re, &mut |_| "x@y.test".to_string());
+            assert_eq!(out, want, "{value}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_part_is_whole_outside_a_url() -> anyhow::Result<()> {
         assert_eq!(
-            found("https://firma.test/a.b@c.test")?,
-            Vec::<String>::new()
+            found("tamsorin.velgrad=work@acme.test")?,
+            ["tamsorin.velgrad=work@acme.test"]
         );
-        assert_eq!(found("https://f.test/?a=1&m=b@c.test")?, ["b@c.test"]);
+        assert_eq!(found("zorbina!q@acme.test")?, ["zorbina!q@acme.test"]);
+        assert_eq!(found("a/b@acme.test")?, ["a/b@acme.test"]);
         assert_eq!(
-            found("mailto:anna@firma.test?subject=x")?,
-            ["anna@firma.test"]
+            found("tamsorin&velgrad@acme.test")?,
+            ["tamsorin&velgrad@acme.test"]
         );
-        assert_eq!(found("see MAILTO:anna@firma.test")?, ["anna@firma.test"]);
+        assert_eq!(
+            found("x/anna.zorbel@firma.test")?,
+            ["x/anna.zorbel@firma.test"]
+        );
+        // In a URL, only the part after the last separator is the local part.
+        assert_eq!(found("https://x.test/a=b@acme.test")?, ["b@acme.test"]);
+        Ok(())
+    }
+
+    #[test]
+    fn email_scan_is_linear() -> anyhow::Result<()> {
+        let re = email_regex()?;
+        let time = |n: usize| -> anyhow::Result<std::time::Duration> {
+            let value = "a@b.cd,".repeat(n);
+            let start = std::time::Instant::now();
+            assert_eq!(email_spans(&value, &re).len(), n);
+            Ok(start.elapsed())
+        };
+        let small = time(20_000)?;
+        let large = time(200_000)?;
+        assert!(large < std::time::Duration::from_secs(20), "{large:?}");
+        // 10 times the input: far below the 100 times of a quadratic scan.
+        assert!(
+            large < small * 40 + std::time::Duration::from_millis(200),
+            "{small:?} {large:?}"
+        );
         Ok(())
     }
 
@@ -755,6 +953,14 @@ mod tests {
         assert_eq!(found("Preis 3@4.50 EUR")?, Vec::<String>::new());
         assert_eq!(found("a@1.2.3.4")?, Vec::<String>::new());
         assert_eq!(found("a@b.c1")?, ["a@b.c1"]);
+        Ok(())
+    }
+
+    #[test]
+    fn single_label_domain_is_only_localhost() -> anyhow::Result<()> {
+        assert_eq!(found("Preis 3@St\u{fc}ck")?, Vec::<String>::new());
+        assert_eq!(found("a@host")?, Vec::<String>::new());
+        assert_eq!(found("a@LOCALHOST")?, ["a@LOCALHOST"]);
         Ok(())
     }
 
@@ -776,7 +982,7 @@ mod tests {
         assert_eq!(found(".a@b.test")?, ["a@b.test"]);
         assert_eq!(found("a..b@c.test")?, ["b@c.test"]);
         assert_eq!(found("a.@c.test")?, Vec::<String>::new());
-        assert_eq!(found("a@b..test")?, ["a@b"]);
+        assert_eq!(found("a@b..test")?, Vec::<String>::new());
         assert_eq!(found("a@-b.test")?, Vec::<String>::new());
         assert_eq!(found("a+tag_1%x@b.test")?, ["a+tag_1%x@b.test"]);
         Ok(())

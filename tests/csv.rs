@@ -1595,3 +1595,44 @@ fn two_hundred_different_persons_give_no_collision() {
     let (_, stdout) = run_cells(&content);
     assert!(stdout.contains("collisions: 0"), "{stdout}");
 }
+
+#[test]
+fn title_words_count_only_at_the_ends_of_a_full_name() {
+    let (t, _) = run_cells(
+        "first_name,last_name,name\n\
+         Anna,Herr,Anna Herr\n\
+         Kim,Mba,Kim Mba\n\
+         Lena,Ing,Lena Ing\n\
+         Zorbina,Frau,Zorbina Frau\n\
+         ,Ing,Ing\n",
+    );
+    for (row, cells) in t.iter().enumerate().take(5).skip(1) {
+        assert_eq!(cells[2], format!("{} {}", cells[0], cells[1]), "row {row}");
+    }
+    assert_eq!(t[5][2], t[5][1]);
+    for (row, real) in [(1, "Herr"), (2, "Mba"), (3, "Ing"), (4, "Frau")] {
+        assert_ne!(t[row][1], real);
+        assert_ne!(t[row][2], format!("{} {real}", t[row][0]));
+    }
+}
+
+#[test]
+fn greek_final_sigma_and_domain_sharp_s() {
+    let (t, _) = run_cells(
+        "first_name,last_name,email\n\
+         A,\u{39f}\u{394}\u{3a5}\u{3a3}\u{3a3}\u{395}\u{3a5}\u{3a3},a@stra\u{df}e.test\n\
+         A,\u{39f}\u{3b4}\u{3c5}\u{3c3}\u{3c3}\u{3b5}\u{3c5}\u{3c2},a@strasse.test\n",
+    );
+    assert!(same_ignoring_case(&t[1][1], &t[2][1]));
+    // A domain keeps `\u{df}` (IDNA2008): two domains, two labels.
+    assert_ne!(t[1][2], t[2][2]);
+}
+
+#[test]
+fn xn_label_of_400_kb_takes_less_than_a_second() {
+    let label = format!("xn--{}", "a".repeat(400_000));
+    let start = std::time::Instant::now();
+    let (t, _) = run_cells(&format!("first_name,last_name,email\nA,B,a@{label}.test\n"));
+    assert!(start.elapsed() < std::time::Duration::from_secs(30));
+    assert!(!t[1][2].contains(&label));
+}

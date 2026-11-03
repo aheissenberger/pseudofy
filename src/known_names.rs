@@ -139,7 +139,11 @@ fn fold(token: &str) -> String {
 }
 
 fn is_sep_char(c: char) -> bool {
-    c.is_whitespace() || matches!(c, '-' | '\u{2010}' | '\u{2011}' | '\u{2013}' | '\u{2014}')
+    c.is_whitespace()
+        || matches!(
+            c,
+            '-' | '\u{200b}' | '\u{2010}' | '\u{2011}' | '\u{2013}' | '\u{2014}'
+        )
 }
 
 enum Gap {
@@ -463,6 +467,33 @@ impl Matcher {
         self.persons.is_empty() && self.singles.is_empty()
     }
 
+    /// A token with U+200B that is no known name is also read as its parts
+    /// (`Zorbina\u{200b}Quenzel`).
+    fn split_zero_width(&self, text: &str, toks: Vec<Tok>) -> Vec<Tok> {
+        let mut out = Vec::with_capacity(toks.len());
+        for tok in toks {
+            let raw = text.get(tok.start..tok.end).unwrap_or("");
+            if !raw.contains('\u{200b}') || self.canon.contains_key(&fold(raw)) {
+                out.push(tok);
+                continue;
+            }
+            let mut offset = tok.start;
+            for part in raw.split('\u{200b}') {
+                let (start, end) = (offset, offset + part.len());
+                offset = end + '\u{200b}'.len_utf8();
+                if part.chars().any(char::is_alphabetic) {
+                    let initial = part.chars().filter(|c| !is_format_char(*c)).count() == 1;
+                    out.push(Tok {
+                        start,
+                        end,
+                        initial,
+                    });
+                }
+            }
+        }
+        out
+    }
+
     /// Longest person sequence that starts at token `i`.
     fn find_window(
         &self,
@@ -578,7 +609,7 @@ impl Matcher {
             Cow::Owned(input.nfc().collect())
         };
         let text = nfc.as_ref();
-        let toks = lex(text);
+        let toks = self.split_zero_width(text, lex(text));
         let folded: Vec<String> = toks
             .iter()
             .map(|t| {
@@ -941,6 +972,22 @@ mod tests {
         assert_eq!(
             run(&c, FreeText::Full, "Kesta Arvo"),
             ("F6 L4".to_string(), 1)
+        );
+    }
+
+    #[test]
+    fn zero_width_space_between_two_known_names_matches_both() {
+        let mut k = KnownNames::default();
+        k.add_person("Zorbina", "Quenzel");
+        for mode in [FreeText::Tokens, FreeText::Full] {
+            assert_eq!(
+                run(&k, mode, "Zorbina\u{200b}Quenzel"),
+                ("F7\u{200b}L7".to_string(), 1)
+            );
+        }
+        assert_eq!(
+            run(&k, FreeText::Tokens, "Zorbina\u{200b}Unbekannt").0,
+            "F7\u{200b}Unbekannt"
         );
     }
 

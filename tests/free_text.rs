@@ -845,7 +845,97 @@ fn address_in_a_url_changes_and_the_url_stays_valid() {
     let (again, rest) = rest.split_once(" und ").unwrap();
     assert_eq!(fake, again);
     assert!(fake.contains('@'));
-    assert_eq!(rest, "https://anna@firma.test/p");
+    // The userinfo is an address, too.
+    let userinfo = rest.strip_prefix("https://").unwrap();
+    let (address, path) = userinfo.split_once('/').unwrap();
+    assert_eq!(path, "p");
+    assert!(
+        address.contains('@') && !address.starts_with("anna@"),
+        "{address}"
+    );
+}
+
+#[test]
+fn every_address_next_to_a_url_is_replaced_and_the_url_keeps_its_form() {
+    let notes = [
+        "https://x.test/tamsorin.velgrad@acme.test",
+        "https://tamsorin@acme.test/",
+        "https://x.test;tamsorin@acme.test",
+        "Links:https://x.test,tamsorin@acme.test",
+        "www.x.test/kontakt/tamsorin@acme.test",
+        "https://x.test|tamsorin@acme.test",
+        r#"{"url":"https://x.test","mail":"tamsorin@acme.test"}"#,
+        r#"<a href="https://x.test">x</a><br>tamsorin@acme.test"#,
+        "https://x.test/share?to=tamsorin@acme.test,velgrad@acme.test",
+        "https://x.test/share?to=tamsorin@acme.test;velgrad@acme.test",
+    ];
+    let rows = notes.iter().fold(String::new(), |acc, n| {
+        acc + &format!("Zorbina,Quenzel,{}\n", quoted(n))
+    });
+    let t = run_people(&rows);
+    for (i, note) in notes.iter().enumerate() {
+        let out = &t[i + 1][2];
+        assert_absent(out, &["tamsorin", "velgrad", "acme"], "note");
+        assert_eq!(out.matches('@').count(), note.matches('@').count(), "{out}");
+    }
+    assert!(t[1][2].starts_with("https://x.test/"));
+    assert!(t[5][2].starts_with("www.x.test/kontakt/"));
+    assert!(t[7][2].starts_with(r#"{"url":"https://x.test","mail":""#));
+    assert!(t[9][2].starts_with("https://x.test/share?to="));
+}
+
+#[test]
+fn local_part_with_url_characters_leaves_nothing_of_the_real_local_part() {
+    let notes = [
+        "tamsorin.velgrad=work@acme.test",
+        "zorbina!qx@acme.test",
+        "tamsorin/velgrad@acme.test",
+        "tamsorin&velgrad@acme.test",
+    ];
+    let rows = notes.iter().fold(String::new(), |acc, n| {
+        acc + &format!("Zorbina,Quenzel,{}\n", quoted(&format!("Mail {n}.")))
+    });
+    let t = run_people(&rows);
+    for i in 0..notes.len() {
+        let out = &t[i + 1][2];
+        assert_absent(out, &["tamsorin", "velgrad", "acme", "qx", "work"], "note");
+        assert!(out.starts_with("Mail ") && out.ends_with('.'), "{out}");
+        assert_eq!(out.matches('@').count(), 1, "{out}");
+    }
+}
+
+#[test]
+fn greek_final_sigma_gets_one_pseudonym_in_free_text() {
+    let t = run_people(
+        "\u{39f}\u{3b4}\u{3c5}\u{3c3}\u{3c3}\u{3b5}\u{3c5}\u{3c2},Quenzel,\
+         \u{39f}\u{394}\u{3a5}\u{3a3}\u{3a3}\u{395}\u{3a5}\u{3a3} und \u{39f}\u{3b4}\u{3c5}\u{3c3}\u{3c3}\u{3b5}\u{3c5}\u{3c2}\n",
+    );
+    let fake = t[1][0].to_uppercase();
+    assert_eq!(t[1][2], format!("{fake} und {}", t[1][0]));
+}
+
+#[test]
+fn a_cell_of_many_addresses_is_processed_quickly() {
+    let cell = "a@b.cd,".repeat(20_000);
+    let start = std::time::Instant::now();
+    let t = run_people(&format!("Zorbina,Quenzel,{}\n", quoted(&cell)));
+    assert!(start.elapsed() < std::time::Duration::from_secs(60));
+    assert_eq!(t[1][2].matches('@').count(), 20_000);
+    assert!(!t[1][2].contains("a@b.cd"));
+}
+
+#[test]
+fn name_columns_and_free_text_agree_on_titles_at_the_ends_only() {
+    let t = run_people("Anna,Herr,Anna Herr und Herr Anna\n");
+    let (f, l) = fakes(&t, 1);
+    assert_eq!(t[1][2], format!("{f} {l} und {l} {f}"));
+}
+
+#[test]
+fn zero_width_space_between_two_known_names_is_matched() {
+    let t = run_people("Zorbina,Quenzel,Hallo Zorbina\u{200b}Quenzel!\n");
+    let (f, l) = fakes(&t, 1);
+    assert_eq!(t[1][2], format!("Hallo {f}\u{200b}{l}!"));
 }
 
 #[test]
