@@ -824,7 +824,7 @@ const MAX_DEPTH: usize = 16;
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Limit for the work of the case-insensitive part lookups of the crate
 /// (name comparisons in total).
-const MAX_LOOKUPS: u64 = 25_000_000;
+const MAX_LOOKUPS: u64 = 10_000_000;
 
 const UNREADABLE: &str = "cannot read the workbook";
 const PIVOT: &str = "workbook has pivot tables; not supported";
