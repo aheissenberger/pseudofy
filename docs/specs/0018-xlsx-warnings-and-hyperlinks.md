@@ -27,13 +27,15 @@ The README does not list these parts. It also does not explain the limits of the
 
 - `src/xlsx_scrub.rs` — the warning scan also reports these kinds:
   - `formulas` — a cell has a formula.
-  - `drawings` — a drawing part has text (`a:t`).
-  - `tables` — a table has a total label or a total formula.
-  - `number formats` — a number format has literal text.
+  - `drawings` — a drawing part has text (`a:t`), or a shape or picture has alt text (`descr`, `title`) or a name other than the default.
+  - `tables` — a table has a total label, a total formula, or a column name that is not a configured header text.
+  - `number formats` — a number format has literal text (`"…"`, `\`, or `[$…]`).
   - `embedded objects` — the package has an embedded object.
 - `src/xlsx_file.rs` — hyperlink targets:
   - `mailto:` — replace the display name before the address with the pseudonym of the name (full-name role). Replace the address as today.
-  - Other URLs — percent-decode the target, replace emails and known names as in free text (spec 0004), and encode the replaced parts again. Keep each unchanged byte.
+  - Other URLs — percent-decode the target, replace emails and known names as in free text (spec 0004), and encode the replaced parts again. Keep each unchanged byte. In the query, `+` is a space. An invalid escape stays as it is and does not stop the decode of the other bytes. `\` in a `file:` link stays.
+  - A link to a place in the workbook (`location`) stays unchanged. It names a sheet, and sheet names stay unchanged.
+  - A `mailto:` with more than one display name gets each name replaced on its own.
 
 ### Modified
 
@@ -65,6 +67,9 @@ The README does not list these parts. It also does not explain the limits of the
 - [ ] A number format `"Quenzel-Format "0` gets the warning `number formats`.
 - [ ] `mailto:"Zorbina Quenzel" <zorbina.quenzel@acme.test>` gets a fake display name and a fake address.
 - [ ] `https://intranet.acme.test/people/zorbina-quenzel?u=Zorbina%20Quenzel` gets the known name replaced in the query.
+- [ ] `?u=Zorbina+Quenzel` with `free_text = "full"` gets the name replaced. `%2B` stays `%2B`.
+- [ ] A `location` link `'Zorbina Quenzel'!A1` stays unchanged.
+- [ ] A picture with `descr` and a table with a column name that is not a header text get a warning.
 
 **Tests to add/update:**
 
@@ -79,4 +84,4 @@ devcontainer exec --workspace-folder . ./scripts/check
 
 ## 5. Rollback / Notes (optional)
 
-A name in a URL path with `-` between first and last name (`zorbina-quenzel`) is not a known name in free text. The README names this limit.
+A lowercase name in a host name (`zorbina.quenzel.example.org`) is not replaced (spec 0004: all-lowercase words). The README names this limit.
