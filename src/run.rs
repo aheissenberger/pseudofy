@@ -135,7 +135,9 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
             .map(|(_, rule)| *rule)
             .collect();
         if rules.is_empty() {
-            eprintln!("warning: {rel}: no rule matches; only emails are replaced");
+            eprintln!(
+                "warning: {rel}: no rule matches this path (check \"files\" in the config); only emails are replaced"
+            );
         }
         items.push(Item {
             path: entry.path().to_path_buf(),

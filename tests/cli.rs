@@ -369,6 +369,24 @@ fn run_with_copy_other_files_reports_a_failed_copy_by_path() {
     assert!(!stderr.contains("some notes"), "{stderr}");
 }
 
+#[test]
+fn run_names_the_files_glob_when_no_rule_matches() {
+    let dir = other_files_project("");
+    let mut book = umya_spreadsheet::new_file();
+    let sheet = book.sheet_mut(0).unwrap();
+    sheet.cell_mut("A1").set_value_string("name");
+    sheet.cell_mut("A2").set_value_string("Zorbina Quenzel");
+    umya_spreadsheet::writer::xlsx::write(&book, dir.path().join("list.xlsx")).unwrap();
+    let out = tempfile::TempDir::new().unwrap();
+    let stderr = stderr_of(&run_output(dir.path(), out.path()));
+    assert!(
+        stderr.contains(
+            "warning: list.xlsx: no rule matches this path (check \"files\" in the config); only emails are replaced"
+        ),
+        "{stderr}"
+    );
+}
+
 fn run_output(project: &std::path::Path, out: &std::path::Path) -> std::process::Output {
     pseudofy()
         .args(["run", "--project"])
