@@ -1,7 +1,7 @@
 # Feature Delta Spec: Rule file lists and exclusions
 
 **Date:** 2026-11-03
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/adr/0014-copy-excluded-and-other-files-unchanged.md` · `docs/specs/0002-pseudonym-engine-and-csv.md` · `docs/specs/0014-copy-other-files.md` · `docs/specs/0015-header-search-and-fail-closed.md`
 
