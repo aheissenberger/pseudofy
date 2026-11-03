@@ -7,18 +7,18 @@ use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use regex::Regex;
 use umya_spreadsheet::{CellRawValue, Workbook, reader, writer};
 
 use crate::cells::{
-    CellFns, ColRole, Collector, Columns, EmailFn, HEADER_SEARCH_ROWS, HeaderPick, Kind,
-    collect_columns, failing_rule, header_count, pick_header, role_of, transform_cell,
+    CellFns, ColRole, Collector, Columns, HEADER_SEARCH_ROWS, HeaderPick, Kind, collect_columns,
+    failing_rule, header_count, name_kind, pick_header, role_of, transform_cell,
     transform_text_cell, write_output,
 };
 use crate::config::Rule;
 use crate::known_names::KnownNames;
 use crate::panic_guard;
 use crate::pseudonym::Pseudonymizer;
+use crate::text::{self, NameRole};
 use crate::xlsx_scrub;
 
 /// Counts for one processed workbook.
@@ -136,7 +136,21 @@ pub fn process(
     }
     let out = xlsx_scrub::scrub(&original, &out).map_err(|_| unwritable())?;
     // The warnings come from the written package, where part names are canonical.
-    let written = xlsx_scrub::inspect(&out).map_err(|_| unwritable())?;
+    let headers: Vec<String> = rules
+        .iter()
+        .flat_map(|rule| {
+            [
+                &rule.first_name,
+                &rule.last_name,
+                &rule.full_name,
+                &rule.email,
+            ]
+            .into_iter()
+            .flatten()
+        })
+        .map(|header| header.trim().to_lowercase())
+        .collect();
+    let written = xlsx_scrub::inspect_with_headers(&out, &headers).map_err(|_| unwritable())?;
     write_output(out_root, output, &out, rel, input)?;
     if !written.kinds.is_empty() {
         eprintln!(
@@ -147,80 +161,219 @@ pub fn process(
     Ok(result.stats)
 }
 
-/// Replace each email in `value` through the email pseudonym.
-fn replace_in_text(
-    value: &str,
-    email_regex: &Regex,
-    emails: EmailFn,
-    replace: &mut dyn FnMut(Kind, &str) -> String,
-) -> String {
-    emails(value, email_regex, &mut |address| {
-        replace(Kind::Email, address)
-    })
-}
+/// The first char of the private-use range that stands for a byte of an
+/// escape that is no UTF-8 (`\u{F700}` + byte). The decoded text keeps such an
+/// escape, and `percent_encode` writes it again, so it is never encoded twice.
+const BYTE_BASE: u32 = 0xF700;
 
-/// Percent-decode `text` as UTF-8. An invalid escape stays as it is; if the
-/// result is not UTF-8, `text` is returned unchanged.
-fn percent_decode(text: &str) -> String {
+/// Percent-decode `text`, byte by byte. A valid UTF-8 run of decoded bytes
+/// becomes text. A byte that is no UTF-8 stays as an escape (a private-use
+/// char), and the decode goes on. An invalid escape stays as it is. With
+/// `query`, `+` is a space.
+fn percent_decode(text: &str, query: bool) -> String {
     fn hex(byte: u8) -> Option<u8> {
         char::from(byte)
             .to_digit(16)
             .and_then(|digit| u8::try_from(digit).ok())
     }
+    fn flush(pending: &mut Vec<u8>, out: &mut String) {
+        let mut rest: &[u8] = pending;
+        while !rest.is_empty() {
+            match std::str::from_utf8(rest) {
+                Ok(valid) => {
+                    out.push_str(valid);
+                    break;
+                }
+                Err(error) => {
+                    let (valid, tail) = rest.split_at(error.valid_up_to());
+                    out.push_str(std::str::from_utf8(valid).unwrap_or_default());
+                    let bad = error.error_len().unwrap_or(tail.len()).min(tail.len());
+                    for &byte in &tail[..bad] {
+                        out.push(
+                            char::from_u32(BYTE_BASE + u32::from(byte))
+                                .unwrap_or(char::REPLACEMENT_CHARACTER),
+                        );
+                    }
+                    rest = &tail[bad..];
+                }
+            }
+        }
+        pending.clear();
+    }
     let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    let mut out = String::with_capacity(text.len());
+    let mut pending: Vec<u8> = Vec::new();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%'
-            && i + 2 < bytes.len()
-            && let (Some(high), Some(low)) = (hex(bytes[i + 1]), hex(bytes[i + 2]))
+            && let (Some(&high), Some(&low)) = (bytes.get(i + 1), bytes.get(i + 2))
+            && let (Some(high), Some(low)) = (hex(high), hex(low))
         {
-            out.push(high * 16 + low);
+            pending.push(high * 16 + low);
             i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
+            continue;
         }
+        flush(&mut pending, &mut out);
+        // Copy one char (the text is valid UTF-8, `i` is on a boundary).
+        let Some(c) = text.get(i..).and_then(|rest| rest.chars().next()) else {
+            break;
+        };
+        out.push(if query && c == '+' { ' ' } else { c });
+        i += c.len_utf8();
     }
-    String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
+    flush(&mut pending, &mut out);
+    out
 }
 
-/// The new url of a hyperlink. A `mailto:` url is decoded, cut at the first
-/// `?`, and its addresses are replaced; other urls only get the replacement.
-fn new_url(
+/// Percent-encode `text`. Letters, digits, and the characters that a url
+/// keeps in a path, a query, or a mailto address stay as they are. A private-use
+/// char of `percent_decode` becomes its escape again. With `query`, a space
+/// is `+` and a plus is `%2B`.
+fn percent_encode(text: &str, query: bool) -> String {
+    const KEEP: &str = "-._~!$'()*,;:@";
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(text.len());
+    let push_escape = |out: &mut String, byte: u8| {
+        out.push('%');
+        out.push(char::from(HEX[usize::from(byte >> 4)]));
+        out.push(char::from(HEX[usize::from(byte & 15)]));
+    };
+    let mut utf8 = [0u8; 4];
+    for c in text.chars() {
+        let code = u32::from(c);
+        if (BYTE_BASE..BYTE_BASE + 256).contains(&code) {
+            push_escape(&mut out, u8::try_from(code - BYTE_BASE).unwrap_or(0));
+        } else if (c == ' ' && query) || (c == '+' && !query) {
+            out.push('+');
+        } else if c.is_ascii_alphanumeric() || (c.is_ascii() && KEEP.contains(c)) {
+            out.push(c);
+        } else {
+            for &byte in c.encode_utf8(&mut utf8).as_bytes() {
+                push_escape(&mut out, byte);
+            }
+        }
+    }
+    out
+}
+
+/// A `mailto:` url: cut at the first `?`, decoded. The display name gets the
+/// full-name pseudonym, the addresses the email pseudonym; the result is
+/// encoded. The text between two addresses is cut at `,` and `;` outside
+/// quotes, and each piece is a name of its own.
+fn new_mailto(rest: &str, fns: &CellFns, replace: &mut dyn FnMut(Kind, &str) -> String) -> String {
+    let decoded = percent_decode(rest.split('?').next().unwrap_or_default(), false);
+    let spans = text::email_spans(&decoded, fns.email_regex);
+    let names = |run: &str, replace: &mut dyn FnMut(Kind, &str) -> String| {
+        let mut out = String::with_capacity(run.len());
+        let mut piece = String::new();
+        let mut quoted = false;
+        let mut flush = |piece: &mut String, out: &mut String| {
+            out.push_str(&(fns.names)(piece, NameRole::Full, &mut |part, token| {
+                replace(name_kind(part), token)
+            }));
+            piece.clear();
+        };
+        for c in run.chars() {
+            if c == '"' {
+                quoted = !quoted;
+            }
+            if matches!(c, ',' | ';') && !quoted {
+                flush(&mut piece, &mut out);
+                out.push(c);
+            } else {
+                piece.push(c);
+            }
+        }
+        flush(&mut piece, &mut out);
+        out
+    };
+    let mut out = String::with_capacity(decoded.len());
+    let mut pos = 0;
+    for span in &spans {
+        out.push_str(&names(decoded.get(pos..span.start).unwrap_or(""), replace));
+        out.push_str(&replace(
+            Kind::Email,
+            decoded.get(span.clone()).unwrap_or(""),
+        ));
+        pos = span.end;
+    }
+    out.push_str(&names(decoded.get(pos..).unwrap_or(""), replace));
+    format!("mailto:{}", percent_encode(&out, false))
+}
+
+/// Any other url: each segment (between `/ ? & = # ; \`) is decoded and gets
+/// the free-text replacement. A changed segment is encoded again; an
+/// unchanged one stays byte for byte. In the query (after `?`, before `#`),
+/// `+` is a space.
+fn new_plain_url(
     url: &str,
-    email_regex: &Regex,
-    emails: EmailFn,
+    fns: &CellFns,
     replace: &mut dyn FnMut(Kind, &str) -> String,
 ) -> String {
+    let is_delimiter = |c: char| matches!(c, '/' | '?' | '&' | '=' | '#' | ';' | '\\');
+    let mut out = String::with_capacity(url.len());
+    let mut segment = String::new();
+    let mut in_query = false;
+    let mut flush = |segment: &mut String, out: &mut String, query: bool| {
+        if segment.is_empty() {
+            return;
+        }
+        let decoded = percent_decode(segment, query);
+        let mut free = 0;
+        let new = transform_cell(&decoded, None, fns, replace, &mut free);
+        if new == decoded {
+            out.push_str(segment);
+        } else {
+            out.push_str(&percent_encode(&new, query));
+        }
+        segment.clear();
+    };
+    for c in url.chars() {
+        if is_delimiter(c) {
+            flush(&mut segment, &mut out, in_query);
+            out.push(c);
+            match c {
+                '?' => in_query = true,
+                '#' => in_query = false,
+                _ => {}
+            }
+        } else {
+            segment.push(c);
+        }
+    }
+    flush(&mut segment, &mut out, in_query);
+    out
+}
+
+/// The new url of a hyperlink.
+fn new_url(url: &str, fns: &CellFns, replace: &mut dyn FnMut(Kind, &str) -> String) -> String {
     const SCHEME: &str = "mailto:";
     if url.len() >= SCHEME.len()
         && url.is_char_boundary(SCHEME.len())
         && url[..SCHEME.len()].eq_ignore_ascii_case(SCHEME)
     {
-        let decoded = percent_decode(&url[SCHEME.len()..]);
-        let address = decoded.split('?').next().unwrap_or_default();
-        format!(
-            "{SCHEME}{}",
-            replace_in_text(address, email_regex, emails, replace)
-        )
+        new_mailto(&url[SCHEME.len()..], fns, replace)
     } else {
-        replace_in_text(url, email_regex, emails, replace)
+        new_plain_url(url, fns, replace)
     }
 }
 
-/// Replace the emails in the url of the hyperlink of `cell` and clear its
-/// tooltip.
+/// Replace the names and emails in the url of the hyperlink of `cell` and
+/// clear its tooltip.
 fn scrub_hyperlink(
     cell: &mut umya_spreadsheet::Cell,
-    email_regex: &Regex,
-    emails: EmailFn,
+    fns: &CellFns,
     replace: &mut dyn FnMut(Kind, &str) -> String,
 ) {
     let Some(link) = cell.hyperlink() else {
         return;
     };
-    let url = new_url(link.url(), email_regex, emails, replace);
+    // A link to a place in the workbook names a sheet; sheet names stay.
+    let url = if link.location() {
+        link.url().to_owned()
+    } else {
+        new_url(link.url(), fns, replace)
+    };
     if url != link.url() || !link.tooltip().is_empty() {
         let link = cell.hyperlink_mut();
         link.set_url(url);
@@ -286,7 +439,6 @@ fn transform(
     mut collect: Option<&mut Collector>,
     rel: &str,
 ) -> anyhow::Result<Transformed> {
-    let (email_regex, emails) = (fns.email_regex, fns.emails);
     let matchers = sheet_rules(rules)?;
     let mut stats = XlsxStats::default();
     let names: Vec<String> = book
@@ -342,7 +494,7 @@ fn transform(
                 }
                 continue;
             }
-            scrub_hyperlink(cell, email_regex, emails, replace);
+            scrub_hyperlink(cell, fns, replace);
             if cell.is_formula() {
                 if header_row.is_none_or(|header| row > header) {
                     stats.formulas += 1;
@@ -764,11 +916,21 @@ mod tests {
 
     #[test]
     fn percent_decode_keeps_invalid_escapes() {
-        assert_eq!(percent_decode("a%40b"), "a@b");
-        assert_eq!(percent_decode("a%4"), "a%4");
-        assert_eq!(percent_decode("a%zzb%"), "a%zzb%");
-        assert_eq!(percent_decode("%C3%A4"), "\u{e4}");
-        assert_eq!(percent_decode("%FF"), "%FF");
+        assert_eq!(percent_decode("a%40b", false), "a@b");
+        assert_eq!(percent_decode("a%4", false), "a%4");
+        assert_eq!(percent_decode("a%zzb%", false), "a%zzb%");
+        assert_eq!(percent_decode("%C3%A4", false), "\u{e4}");
+        assert_eq!(percent_decode("a+b", true), "a b");
+        assert_eq!(percent_decode("a+b", false), "a+b");
+        // A byte that is no UTF-8 stays an escape, and the rest is decoded.
+        assert_eq!(percent_encode(&percent_decode("%FF", false), false), "%FF");
+        assert_eq!(
+            percent_encode(&percent_decode("%2CZ%C3%A4%FFx%20y", false), false),
+            ",Z%C3%A4%FFx%20y"
+        );
+        assert_eq!(percent_decode("%2CZ%FF", false).chars().count(), 3);
+        assert_eq!(percent_encode("a b+c", true), "a+b%2Bc");
+        assert_eq!(percent_encode("a b+c", false), "a%20b+c");
     }
 
     #[test]
