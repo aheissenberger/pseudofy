@@ -1,7 +1,7 @@
 # Feature Delta Spec: XLSX warnings and hyperlinks
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/specs/0003-xlsx-support.md` · `docs/specs/0017-xlsx-input-hardening.md` · `docs/adr/0012-copy-other-project-files-unchanged.md`
 
@@ -53,27 +53,27 @@ The README does not list these parts. It also does not explain the limits of the
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] A warning names the kind, never the text.
-- [ ] A hyperlink target in the copy is a valid URL.
-- [ ] No new crate. No `unwrap()` or `expect()` outside tests.
+- [x] A warning names the kind, never the text.
+- [x] A hyperlink target in the copy is a valid URL.
+- [x] No new crate. No `unwrap()` or `expect()` outside tests.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] A workbook with `="Tamsorin "&"Velgrad"` gets the warning `formulas`.
-- [ ] A workbook with a text box gets the warning `drawings`.
-- [ ] A table with `totalsRowLabel` gets the warning `tables`.
-- [ ] A number format `"Quenzel-Format "0` gets the warning `number formats`.
-- [ ] `mailto:"Zorbina Quenzel" <zorbina.quenzel@acme.test>` gets a fake display name and a fake address.
-- [ ] `https://intranet.acme.test/people/zorbina-quenzel?u=Zorbina%20Quenzel` gets the known name replaced in the query.
-- [ ] `?u=Zorbina+Quenzel` with `free_text = "full"` gets the name replaced. `%2B` stays `%2B`.
-- [ ] A `location` link `'Zorbina Quenzel'!A1` stays unchanged.
-- [ ] A picture with `descr` and a table with a column name that is not a header text get a warning.
+- [x] A workbook with `="Tamsorin "&"Velgrad"` gets the warning `formulas`.
+- [x] A workbook with a text box gets the warning `drawings`.
+- [x] A table with `totalsRowLabel` gets the warning `tables`.
+- [x] A number format `"Quenzel-Format "0` gets the warning `number formats`.
+- [x] `mailto:"Zorbina Quenzel" <zorbina.quenzel@acme.test>` gets a fake display name and a fake address.
+- [x] `https://intranet.acme.test/people/zorbina-quenzel?u=Zorbina%20Quenzel` gets the known name replaced in the query.
+- [x] `?u=Zorbina+Quenzel` with `free_text = "full"` gets the name replaced. `%2B` stays `%2B`.
+- [x] A `location` link `'Zorbina Quenzel'!A1` stays unchanged.
+- [x] A picture with `descr` and a table with a column name that is not a header text get a warning.
 
 **Tests to add/update:**
 
-- [ ] `tests/xlsx.rs` — the behaviors above. Tests build the parts in memory with `zip`.
+- [x] `tests/xlsx.rs` — the behaviors above. Tests build the parts in memory with `zip`.
 
 **Commands that must pass:**
 
@@ -83,5 +83,7 @@ devcontainer exec --workspace-folder . ./scripts/check
 ```
 
 ## 5. Rollback / Notes (optional)
+
+`umya-spreadsheet` 3.1.1 drops the `descr` and `title` alt text of pictures and shapes when it writes the package, so alt text cannot reach the copy. Custom picture names stay and get the warning `drawings`. A `location` link keeps its target, but its tooltip is cleared.
 
 A lowercase name in a host name (`zorbina.quenzel.example.org`) is not replaced (spec 0004: all-lowercase words). The README names this limit.
