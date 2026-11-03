@@ -88,11 +88,17 @@ pub struct Pseudonymizer {
     key: [u8; BLOCK],
     lists: NameLists,
     email_subdomains: bool,
+    /// Each fake first-name token is two first names joined with `-` (spec 0022).
+    two_first_names: bool,
     /// Per kind: pseudonym (lowercase) -> normalized real value.
     seen: HashMap<Kind, HashMap<String, String>>,
     /// Real values (per kind) that already count as a collision.
     counted: HashSet<(Kind, String)>,
-    collisions: usize,
+    /// Collisions of fake full names (persons).
+    person_collisions: usize,
+    /// Collisions of fake emails and of fake email domain labels.
+    email_collisions: usize,
+    domain_collisions: usize,
     group: Group,
     /// Fake full name (lowercase) -> the real persons that got it.
     persons: HashMap<String, HashSet<String>>,
@@ -210,9 +216,30 @@ fn pick(list: &[&'static str], value: u64) -> &'static str {
     list.get(index).copied().unwrap_or("")
 }
 
+/// Collision counts of one run, by kind (spec 0022).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Collisions {
+    pub persons: usize,
+    pub emails: usize,
+    pub domains: usize,
+}
+
+impl Collisions {
+    pub fn total(self) -> usize {
+        self.persons + self.emails + self.domains
+    }
+}
+
 impl Pseudonymizer {
     pub fn new(key: &ProjectKey, language: Language, email_subdomains: bool) -> Self {
         Self::build(key, names::lists(language), email_subdomains)
+    }
+
+    /// Give each fake first-name token a second first name (spec 0022).
+    #[must_use]
+    pub fn with_two_first_names(mut self, on: bool) -> Self {
+        self.two_first_names = on;
+        self
     }
 
     #[cfg(test)]
@@ -229,9 +256,12 @@ impl Pseudonymizer {
             key: block,
             lists,
             email_subdomains,
+            two_first_names: false,
             seen: HashMap::new(),
             counted: HashSet::new(),
-            collisions: 0,
+            person_collisions: 0,
+            email_collisions: 0,
+            domain_collisions: 0,
             group: Group::default(),
             persons: HashMap::new(),
         }
@@ -270,7 +300,7 @@ impl Pseudonymizer {
         if let Some((real, fake)) = std::mem::take(&mut self.group).keys() {
             let set = self.persons.entry(fake).or_default();
             if !set.is_empty() && !set.contains(&real) {
-                self.collisions += 1;
+                self.person_collisions += 1;
             }
             set.insert(real);
         }
@@ -282,7 +312,11 @@ impl Pseudonymizer {
         match map.get(&pseudonym.to_lowercase()) {
             Some(existing) if existing != normalized_real => {
                 if self.counted.insert((kind, normalized_real.to_string())) {
-                    self.collisions += 1;
+                    if kind == Kind::Domain {
+                        self.domain_collisions += 1;
+                    } else {
+                        self.email_collisions += 1;
+                    }
                 }
             }
             Some(_) => {}
@@ -302,14 +336,24 @@ impl Pseudonymizer {
                 Kind::Last => &self.lists.last,
                 _ => &self.lists.first,
             };
-            let candidate = pick(list, u64_at(&bytes, 0));
+            let double = kind == Kind::First && self.two_first_names && !single;
+            let candidate = if double {
+                double_first_name(list, &bytes)
+            } else {
+                pick(list, u64_at(&bytes, 0)).to_string()
+            };
+            // A double first name must not contain the real name as one part.
+            let same_part = double
+                && candidate
+                    .split('-')
+                    .any(|part| normalize(part) == normalized);
             let same_initial = single
                 && candidate
                     .chars()
                     .next()
                     .and_then(|c| c.to_lowercase().next())
                     == normalized.chars().next();
-            if (candidate.to_lowercase() != normalized && !same_initial)
+            if (candidate.to_lowercase() != normalized && !same_initial && !same_part)
                 || attempt >= 64
                 || list.len() < 2
             {
@@ -323,7 +367,7 @@ impl Pseudonymizer {
             result.to_lowercase()
         };
         self.note_token(kind, normalized, fake);
-        result.to_string()
+        result
     }
 
     /// Pseudonym of one first-name token, as written in the name list.
@@ -359,7 +403,9 @@ impl Pseudonymizer {
                 (f, l) if l.is_empty() => f,
                 (f, l) => format!("{f}.{l}"),
             };
-            let candidate = format!("{local}@{domain}");
+            // Two digits from 10 to 99 (spec 0022).
+            let number = 10 + u64_at(&bytes, 16) % 90;
+            let candidate = format!("{local}{number}@{domain}");
             if candidate != normalized || attempt >= 64 {
                 break candidate;
             }
@@ -386,14 +432,47 @@ impl Pseudonymizer {
     }
 
     /// Number of collisions detected so far.
-    pub fn collisions(&self) -> usize {
+    #[cfg(test)]
+    fn collisions(&self) -> usize {
+        self.collision_counts().total()
+    }
+
+    /// Collisions detected so far, by kind.
+    pub fn collision_counts(&self) -> Collisions {
         let open = self.group.keys().map_or(0, |(real, fake)| {
             self.persons.get(&fake).map_or(0, |set| {
                 usize::from(!set.is_empty() && !set.contains(&real))
             })
         });
-        self.collisions + open
+        Collisions {
+            persons: self.person_collisions + open,
+            emails: self.email_collisions,
+            domains: self.domain_collisions,
+        }
     }
+}
+
+/// Two different entries of `list` without `-`, joined with `-`:
+/// `Lukas-Maximilian`. A list without two such entries gives what it has.
+fn double_first_name(list: &[&'static str], bytes: &[u8; 32]) -> String {
+    let first = pick_plain(list, u64_at(bytes, 0), None);
+    let second = pick_plain(list, u64_at(bytes, 8), Some(first));
+    format!("{first}-{second}")
+}
+
+/// The first entry from `value` on with no `-` that is not `avoid`; else the
+/// first entry with no `-`; else the entry at `value`.
+fn pick_plain(list: &[&'static str], value: u64, avoid: Option<&str>) -> &'static str {
+    let len = list.len() as u64;
+    if len == 0 {
+        return "";
+    }
+    let start = value % len;
+    let scan = || (0..len).map(move |step| pick(list, (start + step) % len));
+    scan()
+        .find(|name| !name.contains('-') && Some(*name) != avoid)
+        .or_else(|| scan().find(|name| !name.contains('-')))
+        .unwrap_or_else(|| pick(list, start))
 }
 
 fn label_from(bytes: &[u8; 32]) -> String {
@@ -525,7 +604,7 @@ mod tests {
             },
             false,
         );
-        assert_eq!(p.email("a@b.test"), "juergen.groesser@example.com");
+        assert_eq!(p.email("a@b.test"), "juergen.groesser66@example.com");
     }
 
     #[test]
@@ -636,12 +715,111 @@ mod tests {
             },
             false,
         );
-        p.email("a@x.test");
-        assert_eq!(p.collisions(), 0);
-        p.email("b@x.test");
-        assert_eq!(p.collisions(), 1);
-        p.email("b@x.test");
-        assert_eq!(p.collisions(), 1);
+        // One name pair gives 90 local parts: 100 emails share some.
+        let fakes: HashSet<String> = (0..100).map(|i| p.email(&format!("u{i}@x.test"))).collect();
+        let shared = 100 - fakes.len();
+        assert!(shared >= 10, "{shared}");
+        assert_eq!(p.collision_counts().emails, shared);
+        assert_eq!(p.collisions(), shared);
+        p.email("u1@x.test");
+        assert_eq!(p.collisions(), shared);
+    }
+
+    #[test]
+    fn fake_emails_end_with_two_digits_and_are_stable() {
+        let mut p = engine(3, true);
+        let mut q = engine(3, true);
+        for i in 0..200 {
+            let real = format!("person{i}@firma.test");
+            let fake = p.email(&real);
+            assert_eq!(fake, q.email(&real));
+            let local = fake.split_once('@').unwrap().0;
+            let digits: String = local.chars().rev().take(2).collect();
+            let number: u32 = digits.chars().rev().collect::<String>().parse().unwrap();
+            assert!((10..=99).contains(&number), "{fake}");
+            assert!(
+                !local[..local.len() - 2].ends_with(|c: char| c.is_ascii_digit()),
+                "{fake}"
+            );
+        }
+    }
+
+    #[test]
+    fn digits_give_fewer_email_collisions() {
+        // 25 name pairs: without digits, 200 emails would share at least 175.
+        let mut p = engine(4, false);
+        for i in 0..200 {
+            p.email(&format!("person{i}@firma.test"));
+        }
+        let counts = p.collision_counts();
+        assert!(counts.emails < 40, "{counts:?}");
+        assert_eq!(counts.persons, 0);
+    }
+
+    #[test]
+    fn two_first_names_are_different_and_joined_with_a_hyphen() {
+        let mut p = engine(5, false).with_two_first_names(true);
+        let mut q = engine(5, false).with_two_first_names(true);
+        for real in ["Anna", "Karl", "Zorbina", "Tamsorin"] {
+            let fake = p.first_name(real);
+            assert_eq!(fake, q.first_name(real));
+            let (a, b) = fake.split_once('-').unwrap();
+            assert_ne!(a, b, "{fake}");
+            assert!(FIRST.contains(&a) && FIRST.contains(&b), "{fake}");
+        }
+        // An initial gets one name (the caller keeps its first letter); a last
+        // name stays one name.
+        assert!(!p.first_name("A").contains('-'));
+        assert!(!p.last_name("Zorbel").contains('-'));
+        // Off: one name of the list, as in 0.2.0.
+        let mut off = engine(5, false);
+        assert!(FIRST.contains(&off.first_name("Anna").as_str()));
+    }
+
+    #[test]
+    fn a_double_first_name_never_contains_the_real_name() {
+        let key = ProjectKey::from_bytes([1; 32]);
+        let mut p = Pseudonymizer::new(&key, Language::De, false).with_two_first_names(true);
+        let lists = names::lists(Language::De);
+        for real in lists.first.iter().filter(|name| !name.contains('-')) {
+            let fake = p.first_name(real);
+            assert!(
+                !fake.split('-').any(|part| part.eq_ignore_ascii_case(real)),
+                "{real}: {fake}"
+            );
+        }
+    }
+
+    #[test]
+    fn double_first_names_skip_hyphenated_entries() {
+        let list = vec!["Jan-Hendrik", "Anna", "Anna-Lena", "Karl"];
+        for seed in 0..20u8 {
+            let fake = double_first_name(&list, &[seed; 32]);
+            assert!(fake == "Anna-Karl" || fake == "Karl-Anna", "{fake}");
+        }
+        assert_eq!(double_first_name(&["Solo"], &[1; 32]), "Solo-Solo");
+        // Near u64::MAX the scan still visits each entry.
+        assert_eq!(double_first_name(&["A-B", "C-D", "E"], &[0xff; 32]), "E-E");
+    }
+
+    #[test]
+    fn collisions_are_counted_by_kind() {
+        let mut p = Pseudonymizer::with_lists(
+            &ProjectKey::from_bytes([1; 32]),
+            NameLists {
+                first: vec!["Anton"],
+                last: vec!["Bauer"],
+            },
+            false,
+        );
+        for (first, last) in [("Karl", "Zorbel"), ("Hans", "Quenzel")] {
+            p.first_name(first);
+            p.last_name(last);
+        }
+        let counts = p.collision_counts();
+        assert_eq!(counts.persons, 1);
+        assert_eq!(counts.emails + counts.domains, 0);
+        assert_eq!(counts.total(), 1);
     }
 
     #[test]

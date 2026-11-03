@@ -14,7 +14,7 @@ use crate::config::{self, FreeText, Rule};
 use crate::csv_file;
 use crate::key;
 use crate::known_names::KnownNames;
-use crate::pseudonym::Pseudonymizer;
+use crate::pseudonym::{Collisions, Pseudonymizer};
 use crate::text;
 use crate::xlsx_file;
 
@@ -23,7 +23,7 @@ use crate::xlsx_file;
 pub struct Summary {
     pub files: usize,
     pub replaced: usize,
-    pub collisions: usize,
+    pub collisions: Collisions,
     /// Files that could not be read or written. `run` reports each one and
     /// continues with the other files.
     pub failed: usize,
@@ -78,7 +78,8 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
     let matchers = rule_matchers(&config.rules)?;
 
     let email_regex = text::email_regex()?;
-    let mut pseudonymizer = Pseudonymizer::new(&key, config.language, config.email_subdomains);
+    let mut pseudonymizer = Pseudonymizer::new(&key, config.language, config.email_subdomains)
+        .with_two_first_names(config.two_first_names);
     let mut summary = Summary::default();
     let mut items: Vec<Item> = Vec::new();
     let mut others: Vec<(PathBuf, PathBuf, String)> = Vec::new();
@@ -172,7 +173,7 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
         &pass2,
         &mut summary,
     );
-    summary.collisions = pseudonymizer.collisions();
+    summary.collisions = pseudonymizer.collision_counts();
 
     copy_others(&others, &out, &inputs, &mut summary);
     Ok(summary)

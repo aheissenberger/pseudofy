@@ -60,6 +60,7 @@ fn init_with_language_de_ignores_the_system_language() {
     for line in [
         "# email_subdomains = true",
         "# copy_other_files = false",
+        "# two_first_names = false",
         "# free_text = \"tokens\"",
         "[[rule]]",
         "files = [\"**/*.csv\", \"**/*.xlsx\"]",

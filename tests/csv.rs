@@ -125,6 +125,11 @@ fn check_fake_email(email: &str, subdomains: bool) -> Option<String> {
     let (local, domain) = email.split_once('@').unwrap();
     let (first, last) = local.split_once('.').unwrap();
     assert!(is_slug(first) && is_slug(last), "bad local part: {email}");
+    let digits = &last[last.len() - 2..];
+    assert!(
+        digits.chars().all(|c| c.is_ascii_digit()) && !digits.starts_with('0'),
+        "no two digits from 10 to 99: {email}"
+    );
     if subdomains {
         let label = domain.strip_suffix(".example.com").unwrap();
         assert!(
@@ -1635,4 +1640,40 @@ fn xn_label_of_400_kb_takes_less_than_a_second() {
     let (t, _) = run_cells(&format!("first_name,last_name,email\nA,B,a@{label}.test\n"));
     assert!(start.elapsed() < std::time::Duration::from_secs(60));
     assert!(!t[1][2].contains(&label));
+}
+
+#[test]
+fn two_first_names_are_the_same_in_name_columns_and_free_text() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "secrets/pseudofy.key", &format!("{KEY_A}\n"));
+    let config = config(None).replace(
+        "language = \"de\"\n",
+        "language = \"de\"\ntwo_first_names = true\n",
+    );
+    write_file(dir.path(), "config/pseudofy.toml", &config);
+    write_file(
+        dir.path(),
+        "people.csv",
+        "first_name,last_name,name,note\n\
+         Zorbina,Quenzel,Zorbina Quenzel,Termin mit Zorbina Quenzel\n\
+         Tamsorin,Velgrad,T. Velgrad,offen\n",
+    );
+    let (out, _) = run_ok(dir.path());
+    let table = rows(&read(out.path(), "people.csv"), ',');
+    let first = &column(&table, "first_name")[0];
+    let last = &column(&table, "last_name")[0];
+    let (a, b) = first.split_once('-').unwrap();
+    assert!(a != b && !b.contains('-'), "{first}");
+    assert_eq!(column(&table, "name")[0], format!("{first} {last}"));
+    assert_eq!(
+        column(&table, "note")[0],
+        format!("Termin mit {first} {last}")
+    );
+    // An initial stays one letter.
+    let initial = &column(&table, "name")[1];
+    assert_eq!(
+        initial.split_once(". ").unwrap().0.chars().count(),
+        1,
+        "{initial}"
+    );
 }
