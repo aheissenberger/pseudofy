@@ -29,6 +29,13 @@
   - Refuse a pivot part by normalized name, by relationship type, or by content type.
   - Follow the relationships from `xl/_rels/workbook.xml.rels` with the rules of `umya-spreadsheet` (path join, case-insensitive lookup). Refuse a cycle, a depth above 16, or more than 10 000 relationships.
   - Refuse more than 10 000 zip entries, or a total uncompressed size above 512 MiB. Count a part once for each reference to it. Read each part with a limit, so a wrong declared size does not get past the check.
+- `src/xlsx_scrub.rs` — a canonical package for `umya-spreadsheet` (the check and the crate must see the same package):
+  - Refuse an entry whose raw name does not find itself (two names that decode to the same text), a name with `\\` or a leading `/`, and two names that are equal after ASCII lowercase.
+  - Parse each `.rels` part with exact attribute names. Refuse a non-External target with `&`. Write each `.rels` part again in a canonical form (only `Id`, `Type`, `Target`, `TargetMode`) before `umya-spreadsheet` reads the package.
+  - Refuse two `<sheet>` elements with the same `r:id` in `xl/workbook.xml`.
+  - Count each case-insensitive lookup that `umya-spreadsheet` makes, also for each External relationship. Refuse more than 25 000 000 name comparisons.
+- `src/xlsx_scrub.rs` — the external-link restore reads each link part once.
+- `src/xlsx_file.rs` — refuse an XLSX file larger than 512 MiB: `<path>: file is larger than 512 MiB`.
 - `src/xlsx_scrub.rs` — run the warning scan (comments, charts, headers and footers, data validations, conditional formatting) on the package that `umya-spreadsheet` wrote. Keep the checks for data loss (prefixed shared strings, multi-run inline strings) on the input, with normalized names.
 - `src/csv_file.rs` — refuse a CSV file above 256 MiB: `<path>: file is larger than 256 MiB`.
 
@@ -66,6 +73,9 @@
 - [ ] A fan-out chain of 40 parts fails within 5 seconds.
 - [ ] A package with a total uncompressed size above 512 MiB fails without a large memory use.
 - [ ] 100 000 repeats of a name with a trailing initial take less than 1 second.
+- [ ] Each hostile package of the review (2026-11-03) fails without an abort: External self-loops through `/_rels/.rels`, an entity in `TargetMode` or `Target`, a prefixed `Target` attribute, two entry names that decode to the same text, 300 sheets with one `r:id`, 10 000 external references to one part.
+- [ ] A drawing with 2 500 images gets a copy.
+- [ ] A package with a 600 MiB entry fails at once.
 
 **Tests to add/update:**
 
@@ -81,3 +91,5 @@ devcontainer exec --workspace-folder . ./scripts/check
 ## 5. Rollback / Notes (optional)
 
 The limits are constants. A later spec can make them config settings.
+
+`umya-spreadsheet` can need about 12 times the uncompressed size of the worksheets in memory. The README says so.
