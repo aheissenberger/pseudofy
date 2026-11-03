@@ -10,7 +10,9 @@ pseudofy does not change file and directory names. Rename a file before you shar
 In XLSX files, pseudofy does not change comments, charts, data validations, headers and footers, conditional formatting, sheet names, defined names, and document properties.
 pseudofy prints a warning for each workbook that has one of these parts, except sheet names, defined names, and document properties. Check these parts before you share the file.
 pseudofy refuses workbooks with pivot tables.
-pseudofy refuses a workbook with more than 10 000 parts or relationships, more than 512 MiB of uncompressed content, or a relationship cycle. It refuses a CSV file larger than 256 MiB.
+pseudofy refuses a workbook with more than 10 000 parts or relationships, more than 512 MiB of uncompressed content, or a relationship cycle. It refuses a CSV file larger than 256 MiB and an XLSX file larger than 512 MiB.
+It also refuses a workbook with an unusual package structure: two part names that differ only in letter case, or a relationship target with `&`.
+A large workbook can need about 12 times the uncompressed size of its sheets in memory.
 pseudofy keeps links to other workbooks, but removes their stored values, because these values can contain real names.
 Excel shows an error in a cell that uses such a link until you open the linked workbook or update the link.
 pseudofy does not change the path of a linked workbook. The path can contain a user name.
