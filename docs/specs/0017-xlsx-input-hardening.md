@@ -32,7 +32,9 @@
 - `src/xlsx_scrub.rs` — a canonical package for `umya-spreadsheet` (the check and the crate must see the same package):
   - Refuse an entry whose raw name does not find itself (two names that decode to the same text), a name with `\\` or a leading `/`, and two names that are equal after ASCII lowercase.
   - Parse each `.rels` part with exact attribute names. Accept only unprefixed `Relationship` elements. Refuse a duplicate attribute, a duplicate `Id`, a relationship without `Id`, `Type`, or `Target`, an entity in `TargetMode`, and `&`, `<`, `"`, or a control character in a non-External `Target` or an `Id`. Write each `.rels` part again in a canonical form (only `Id`, `Type`, `Target`, `TargetMode`) before `umya-spreadsheet` reads the package.
-  - Refuse two `<sheet>` elements with the same `r:id` in `xl/workbook.xml`.
+  - Refuse two `<sheet>` elements with the same `r:id` in `xl/workbook.xml`, and more than 4 096 `<sheet>` elements. Read a sheet id with the rule of `umya-spreadsheet` (exact `r:id` first).
+  - Refuse `>` in a non-External `Target` or an `Id` (the crate reads attribute values without unescape).
+  - Estimate the memory that the crate builds: the length of the shared string of each `t="s"` cell, the font, fill, border, and number format of each cell format, and the cell format of each cell, row, and column with an `s` attribute. Refuse more than 1 GiB. Refuse a shared string longer than 32 767 characters, a font name longer than 31 characters, and a number format longer than 255 characters (the limits of Excel).
   - Count each case-insensitive lookup that `umya-spreadsheet` makes, also for each External relationship. Refuse more than 10 000 000 name comparisons (about 4 seconds).
 - `src/xlsx_scrub.rs` — the external-link restore reads each link part once.
 - `src/xlsx_file.rs` — refuse an XLSX file larger than 512 MiB: `<path>: file is larger than 512 MiB`.
@@ -75,6 +77,7 @@
 - [ ] 100 000 repeats of a name with a trailing initial take less than 1 second.
 - [ ] Each hostile package of the review (2026-11-03) fails without an abort: External self-loops through `/_rels/.rels`, an entity in `TargetMode` or `Target`, a prefixed `Target` attribute, two entry names that decode to the same text, 300 sheets with one `r:id`, 10 000 external references to one part.
 - [ ] A drawing with 2 500 images gets a copy.
+- [ ] A cycle hidden behind `>` in a `Target`, one 4 MiB shared string in 2 000 cells, one 4 MiB font name in 2 000 cell formats, and 100 000 `<sheet>` elements each fail without an abort and within 10 seconds.
 - [ ] A package with a 600 MiB entry fails at once.
 
 **Tests to add/update:**
