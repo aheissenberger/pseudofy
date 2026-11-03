@@ -75,6 +75,7 @@ const WORKBOOK: &str = "xl/workbook.xml";
 const WORKBOOK_RELS: &str = "xl/_rels/workbook.xml.rels";
 const CONTENT_TYPES: &str = "[Content_Types].xml";
 const REL_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const PACKAGE_REL_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const EXTERNAL_LINK_REL: &str =
     "http://schemas.openxmlformats.org/officeDocument/2006/relationships/externalLink";
 const EXTERNAL_LINK_TYPE: &str =
@@ -229,6 +230,10 @@ fn restore_external_links<R: Read + std::io::Seek>(
         link_parts.push(link_part(target)?);
     }
     for part in &link_parts {
+        // Many references can share one part: read it once.
+        if parts.contains_key(part) {
+            continue;
+        }
         let xml = read_part(&mut source, part)?.ok_or("missing link part")?;
         parts.insert(part.clone(), strip_cached_values(&xml)?);
         let rels = rels_part(part);
@@ -818,14 +823,16 @@ const MAX_RELATIONSHIPS: usize = 10_000;
 const MAX_DEPTH: usize = 16;
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Limit for the work of the case-insensitive part lookups of the crate
-/// (entries scanned in total).
-const MAX_SLOW_LOOKUPS: u64 = 5_000_000;
+/// (name comparisons in total).
+const MAX_LOOKUPS: u64 = 25_000_000;
 
 const UNREADABLE: &str = "cannot read the workbook";
 const PIVOT: &str = "workbook has pivot tables; not supported";
 const TOO_LARGE: &str = "workbook is too large";
 const CYCLE: &str = "workbook has a relationship cycle";
 const TOO_DEEP: &str = "workbook has relationships nested too deeply";
+const NAMES: &str = "workbook has ambiguous part names";
+const SHEET_IDS: &str = "workbook lists one relationship for two sheets";
 
 /// Normalized part name: `\` becomes `/`, ASCII lowercase.
 fn fold(name: &str) -> String {
@@ -903,30 +910,92 @@ fn split_part(part: &str) -> (&str, &str) {
     part.rsplit_once('/').unwrap_or(("", part))
 }
 
+/// One relationship of a `.rels` part, as pseudofy and the crate read it.
 struct Rel {
+    id: String,
     kind: String,
     target: String,
     external: bool,
 }
 
-/// The relationships of a `.rels` part. More than `limit` is an error.
+/// True if the crate, which reads attribute values without unescaping, reads
+/// the same text as the parser: no character that the written escape changes.
+fn plain_text(text: &str) -> bool {
+    !text
+        .chars()
+        .any(|c| matches!(c, '&' | '<' | '"') || c.is_control())
+}
+
+/// The values of one `<Relationship>`: only the exact, unprefixed names count
+/// (the crate reads no other). A repeated name is an error.
+fn read_relationship(start: &BytesStart<'_>) -> Result<Rel, Failure> {
+    let mut fields: [Option<String>; 4] = [None, None, None, None];
+    for item in start.attributes() {
+        let item = item?;
+        let slot = match item.key.as_ref() {
+            b"Id" => 0,
+            b"Type" => 1,
+            b"Target" => 2,
+            b"TargetMode" => 3,
+            _ => continue,
+        };
+        // No entity in the mode: the crate compares the raw text.
+        if slot == 3 && item.value.contains(&b'&') {
+            return Err("unusual relationship".into());
+        }
+        let value = item.normalized_value(quick_xml::XmlVersion::Explicit1_0)?;
+        fields[slot] = Some(value.into_owned());
+    }
+    let [Some(id), Some(kind), Some(target), mode] = fields else {
+        return Err("incomplete relationship".into());
+    };
+    let external = mode.as_deref() == Some("External");
+    if id.is_empty() || !plain_text(&id) || (!external && !plain_text(&target)) {
+        return Err("unusual relationship".into());
+    }
+    Ok(Rel {
+        id,
+        kind,
+        target,
+        external,
+    })
+}
+
+/// The relationships of a `.rels` part. Only a `Relationships` root with
+/// `Relationship` children is accepted. More than `limit` is an error.
 fn rel_entries(xml: &[u8], limit: usize) -> Result<Vec<Rel>, &'static str> {
     let parse = || -> Result<Vec<Rel>, Failure> {
         let mut reader = Reader::from_reader(xml);
         let mut buf = Vec::new();
-        let mut found = Vec::new();
+        let mut found: Vec<Rel> = Vec::new();
+        let mut ids: HashSet<String> = HashSet::new();
+        let mut depth = 0usize;
+        let mut roots = 0usize;
         loop {
-            match reader.read_event_into(&mut buf)? {
-                Event::Start(start) | Event::Empty(start) if is_name(&start, b"Relationship") => {
-                    if found.len() >= limit {
-                        return Err(TOO_LARGE.into());
+            let event = reader.read_event_into(&mut buf)?;
+            if let Event::Start(ref start) | Event::Empty(ref start) = event {
+                match (depth, start.name().as_ref()) {
+                    (0, b"Relationships") => roots += 1,
+                    (1, b"Relationship") => {
+                        if found.len() >= limit {
+                            return Err(TOO_LARGE.into());
+                        }
+                        let rel = read_relationship(start)?;
+                        if !ids.insert(rel.id.clone()) {
+                            return Err("repeated relationship id".into());
+                        }
+                        found.push(rel);
                     }
-                    found.push(Rel {
-                        kind: attr(&start, b"Type")?.unwrap_or_default(),
-                        target: attr(&start, b"Target")?.unwrap_or_default(),
-                        external: attr(&start, b"TargetMode")?.as_deref() == Some("External"),
-                    });
+                    _ => return Err("unexpected element".into()),
                 }
+                if roots > 1 {
+                    return Err("unexpected element".into());
+                }
+            }
+            match event {
+                Event::Start(_) => depth += 1,
+                Event::End(_) => depth = depth.saturating_sub(1),
+                Event::DocType(_) => return Err("unexpected doctype".into()),
                 Event::Eof => return Ok(found),
                 _ => {}
             }
@@ -940,6 +1009,76 @@ fn rel_entries(xml: &[u8], limit: usize) -> Result<Vec<Rel>, &'static str> {
             UNREADABLE
         }
     })
+}
+
+fn escape_attr(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
+/// The canonical `.rels` part for `list`: only `Id`, `Type`, `Target` and
+/// (for an External target) `TargetMode`, escaped. The crate reads the
+/// values of this part as written, so it reads what the check saw.
+fn canonical_rels(list: &[Rel]) -> Vec<u8> {
+    let mut text = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<Relationships xmlns=\"{PACKAGE_REL_NS}\">"
+    );
+    for rel in list {
+        text.push_str("<Relationship");
+        for (name, value) in [
+            ("Id", &rel.id),
+            ("Type", &rel.kind),
+            ("Target", &rel.target),
+        ] {
+            text.push(' ');
+            text.push_str(name);
+            text.push_str("=\"");
+            text.push_str(&escape_attr(value));
+            text.push('"');
+        }
+        if rel.external {
+            text.push_str(" TargetMode=\"External\"");
+        }
+        text.push_str("/>");
+    }
+    text.push_str("</Relationships>");
+    text.into_bytes()
+}
+
+/// The `r:id` of a `<sheet>` as the crate reads it: the exact key first,
+/// then the first key with the local name `id`. The raw value.
+fn crate_sheet_id(start: &BytesStart<'_>) -> Option<String> {
+    let mut by_local = None;
+    for item in start.attributes().with_checks(false).flatten() {
+        let key = item.key.into_inner();
+        if key == b"r:id" {
+            return Some(String::from_utf8_lossy(&item.value).into_owned());
+        }
+        let local = key.rsplit(|byte| *byte == b':').next().unwrap_or(key);
+        if by_local.is_none() && local == b"id" {
+            by_local = Some(String::from_utf8_lossy(&item.value).into_owned());
+        }
+    }
+    by_local
+}
+
+/// The relationship ids of the `<sheet>` elements of a workbook.
+fn sheet_rids(workbook: &[u8]) -> Result<Vec<String>, &'static str> {
+    let mut reader = Reader::from_reader(workbook);
+    let mut buf = Vec::new();
+    let mut ids = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf).map_err(|_| UNREADABLE)? {
+            Event::Start(start) | Event::Empty(start) if start.name().as_ref() == b"sheet" => {
+                ids.extend(crate_sheet_id(&start));
+            }
+            Event::Eof => return Ok(ids),
+            _ => {}
+        }
+        buf.clear();
+    }
 }
 
 /// True if a content type of `[Content_Types].xml` is a pivot type.
@@ -968,11 +1107,11 @@ fn has_pivot_content_type(xml: &[u8]) -> Result<bool, &'static str> {
 /// The package with the part lookup of `umya-spreadsheet`.
 struct Package<'a> {
     archive: ZipArchive<Cursor<&'a [u8]>>,
-    exact: HashMap<String, usize>,
+    /// Part names in ASCII lowercase; unique after `open`.
     folded: HashMap<String, usize>,
     sizes: Vec<u64>,
-    /// Entries scanned by lookups that need the slow path of the crate.
-    slow: u64,
+    /// Name comparisons of the lookups that need the slow path of the crate.
+    lookups: u64,
     /// Parts that were counted once.
     seen: HashSet<usize>,
     /// Bytes of all parts, plus one more time per repeated reference.
@@ -983,6 +1122,9 @@ struct Package<'a> {
 }
 
 impl<'a> Package<'a> {
+    /// Open the package. The names must be canonical: each raw name finds
+    /// itself, none has a `\` or a leading `/`, and no two are equal after
+    /// ASCII lowercase. Then the crate and this check find the same entry.
     fn open(package: &'a [u8]) -> Result<(Self, Vec<String>), &'static str> {
         let mut archive = ZipArchive::new(Cursor::new(package)).map_err(|_| UNREADABLE)?;
         if archive.len() > MAX_ENTRIES {
@@ -991,14 +1133,28 @@ impl<'a> Package<'a> {
         if archive.file_names().any(is_pivot_name) {
             return Err(PIVOT);
         }
-        let mut exact = HashMap::new();
         let mut folded = HashMap::new();
-        let mut sizes = Vec::new();
         let mut names = Vec::new();
+        for index in 0..archive.len() {
+            let file = archive.by_index_raw(index).map_err(|_| UNREADABLE)?;
+            if file.size() > MAX_BYTES {
+                return Err(TOO_LARGE);
+            }
+            let name = file.name().to_owned();
+            drop(file);
+            if archive.index_for_name(&name) != Some(index)
+                || name.contains('\\')
+                || name.starts_with('/')
+                || folded.insert(name.to_ascii_lowercase(), index).is_some()
+            {
+                return Err(NAMES);
+            }
+            names.push(name);
+        }
+        let mut sizes = Vec::new();
         let mut budget = MAX_BYTES;
         for index in 0..archive.len() {
             let file = archive.by_index(index).map_err(|_| UNREADABLE)?;
-            let name = file.name().to_owned();
             // The real size counts, not the declared one.
             let used = std::io::copy(&mut file.take(budget + 1), &mut std::io::sink())
                 .map_err(|_| UNREADABLE)?;
@@ -1007,16 +1163,12 @@ impl<'a> Package<'a> {
             }
             budget -= used;
             sizes.push(used);
-            folded.entry(fold(&name)).or_insert(index);
-            exact.entry(name.clone()).or_insert(index);
-            names.push(name);
         }
         let package = Package {
             archive,
-            exact,
             folded,
             sizes,
-            slow: 0,
+            lookups: 0,
             seen: HashSet::new(),
             total: MAX_BYTES - budget,
             rels: HashMap::new(),
@@ -1026,19 +1178,29 @@ impl<'a> Package<'a> {
         Ok((package, names))
     }
 
-    /// The entry that `umya-spreadsheet` finds for `name`.
-    fn find(&mut self, name: &str) -> Result<Option<usize>, &'static str> {
-        if let Some(index) = self.exact.get(name) {
-            return Ok(Some(*index));
-        }
-        if let Some(index) = self.exact.get(&name.replace('/', "\\")) {
-            return Ok(Some(*index));
-        }
-        self.slow += u64::try_from(self.sizes.len()).unwrap_or(u64::MAX);
-        if self.slow > MAX_SLOW_LOOKUPS {
+    /// Count `cost` name comparisons of the crate.
+    fn charge(&mut self, cost: usize) -> Result<(), &'static str> {
+        self.lookups = self
+            .lookups
+            .saturating_add(u64::try_from(cost).unwrap_or(u64::MAX));
+        if self.lookups > MAX_LOOKUPS {
             return Err(TOO_LARGE);
         }
-        Ok(self.folded.get(&fold(name)).copied())
+        Ok(())
+    }
+
+    /// The entry that `umya-spreadsheet` finds for `name`: the exact name, or
+    /// else a scan over the names in the order of the archive.
+    fn find(&mut self, name: &str) -> Result<Option<usize>, &'static str> {
+        if let Some(index) = self.archive.index_for_name(name) {
+            return Ok(Some(index));
+        }
+        let found = self
+            .folded
+            .get(&name.replace('\\', "/").to_ascii_lowercase())
+            .copied();
+        self.charge(found.map_or(self.sizes.len(), |index| index + 1))?;
+        Ok(found)
     }
 
     /// Count a reference to the part. A repeated reference adds its size again.
@@ -1069,9 +1231,19 @@ impl<'a> Package<'a> {
         Ok(list)
     }
 
+    /// Count one relationship that the crate follows.
+    fn touch(&mut self) -> Result<(), &'static str> {
+        self.visited += 1;
+        if self.visited > MAX_RELATIONSHIPS {
+            return Err(TOO_LARGE);
+        }
+        Ok(())
+    }
+
     /// Follow the relationships of `part` like the crate does: the rels part
     /// is `<folder>/_rels/<file>.rels`, a target is joined to the folder of
-    /// `part`. Each reference counts, as the crate has no visited set.
+    /// `part`. Each reference counts, as the crate has no visited set. An
+    /// External relationship makes the crate look up the empty part.
     fn walk(
         &mut self,
         part: &str,
@@ -1090,8 +1262,13 @@ impl<'a> Package<'a> {
         let list = self.rels_of(rels_index)?;
         let key = fold(part);
         on_path.insert(key.clone());
-        for rel in list.iter().filter(|rel| !rel.external) {
-            self.visit(folder, &rel.target, depth + 1, on_path)?;
+        for rel in list.iter() {
+            if rel.external {
+                self.touch()?;
+                self.charge(self.sizes.len())?;
+            } else {
+                self.visit(folder, &rel.target, depth + 1, on_path)?;
+            }
         }
         on_path.remove(&key);
         Ok(())
@@ -1104,10 +1281,7 @@ impl<'a> Package<'a> {
         depth: usize,
         on_path: &mut HashSet<String>,
     ) -> Result<(), &'static str> {
-        self.visited += 1;
-        if self.visited > MAX_RELATIONSHIPS {
-            return Err(TOO_LARGE);
-        }
+        self.touch()?;
         let child = join_paths(folder, target);
         if let Some(index) = self.find(&child)? {
             self.count(index)?;
@@ -1117,15 +1291,39 @@ impl<'a> Package<'a> {
         }
         self.walk(&child, depth, on_path)
     }
+
+    /// The package again, with each `.rels` part in its canonical form.
+    fn canonical(&mut self) -> Result<Vec<u8>, &'static str> {
+        let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
+        let options = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for index in 0..self.archive.len() {
+            if let Some(list) = self.rels.get(&index) {
+                let name = {
+                    let file = self.archive.by_index_raw(index).map_err(|_| UNREADABLE)?;
+                    file.name().to_owned()
+                };
+                writer.start_file(name, options).map_err(|_| UNREADABLE)?;
+                writer
+                    .write_all(&canonical_rels(list))
+                    .map_err(|_| UNREADABLE)?;
+            } else {
+                let file = self.archive.by_index_raw(index).map_err(|_| UNREADABLE)?;
+                writer.raw_copy_file(file).map_err(|_| UNREADABLE)?;
+            }
+        }
+        let cursor = writer.finish().map_err(|_| UNREADABLE)?;
+        Ok(cursor.into_inner())
+    }
 }
 
-fn check(package: &[u8]) -> Result<(), &'static str> {
+fn check(package: &[u8]) -> Result<Vec<u8>, &'static str> {
     let (mut pkg, names) = Package::open(package)?;
-    // Pivot relationship types and content types, in each rels part.
+    // Every `.rels` part: its strict form, and the pivot relationship types.
     for (index, name) in names.iter().enumerate() {
-        if Path::new(name)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("rels"))
+        if !name.ends_with('/')
+            && Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("rels"))
         {
             let list = pkg.rels_of(index)?;
             if list.iter().any(|rel| pivot_type(&rel.kind)) {
@@ -1139,22 +1337,40 @@ fn check(package: &[u8]) -> Result<(), &'static str> {
             return Err(PIVOT);
         }
     }
+    // The crate reads the full subtree of a sheet for each `<sheet>`.
+    if let Some(index) = pkg.find(WORKBOOK)? {
+        let xml = pkg.read(index)?;
+        let mut ids = HashSet::new();
+        for id in sheet_rids(&xml)? {
+            if !ids.insert(id) {
+                return Err(SHEET_IDS);
+            }
+        }
+    }
     // The relationship graph, from the workbook.
     let rels_index = pkg.find(WORKBOOK_RELS)?.ok_or(UNREADABLE)?;
     let list = pkg.rels_of(rels_index)?;
     let mut on_path = HashSet::new();
-    for rel in list.iter().filter(|rel| !rel.external) {
-        let target = rel.target.strip_prefix("/xl/").unwrap_or(&rel.target);
-        pkg.visit("xl", target, 1, &mut on_path)?;
+    for rel in list.iter() {
+        if rel.external {
+            pkg.touch()?;
+            pkg.charge(pkg.sizes.len())?;
+        } else {
+            let target = rel.target.strip_prefix("/xl/").unwrap_or(&rel.target);
+            pkg.visit("xl", target, 1, &mut on_path)?;
+        }
     }
-    Ok(())
+    pkg.canonical()
 }
 
-/// Check the input package before `umya-spreadsheet` reads it: pivot parts
-/// (also under other names), the number of parts, their real sizes, and the
-/// relationship graph (no cycle, depth, count). Error texts name the reason
-/// only, never part contents.
-pub fn check_package(package: &[u8]) -> anyhow::Result<()> {
+/// Check the input package before `umya-spreadsheet` reads it and return it
+/// in a canonical form: part names that the crate and this check resolve to
+/// the same entry, and each `.rels` part written again with only the values
+/// that were checked. The check covers pivot parts (also under other names),
+/// the number of parts, their real sizes, and the relationship graph (no
+/// cycle, depth, count, lookup work). Error texts name the reason only,
+/// never part contents.
+pub fn check_package(package: &[u8]) -> anyhow::Result<Vec<u8>> {
     check(package).map_err(|reason| anyhow!(reason))
 }
 
@@ -2258,5 +2474,180 @@ mod tests {
         );
         let input = plain_package(&[(WORKBOOK, &workbook), (WORKBOOK_RELS, IN_RELS)]);
         assert!(scrub(&input, &plain_output(OUT_WORKBOOK)).is_err());
+    }
+
+    // ---- Canonical package (review of 2026-11-03) ----
+
+    fn external(id: &str) -> String {
+        format!(
+            r#"<Relationship Id="{id}" Type="http://x/hyperlink" Target="http://e.test/?a=1&amp;b=2" TargetMode="External" foo="bar"/>"#
+        )
+    }
+
+    fn rels_with(body: &str) -> String {
+        format!(r#"<Relationships xmlns="urn:r">{body}</Relationships>"#)
+    }
+
+    #[test]
+    fn rels_parts_are_written_again_in_a_canonical_form() {
+        let sheet_rels = rels_with(&format!(
+            r#"{}<Relationship xmlns:q="urn:q" q:x="1" Id="rId2" Type="http://x/drawing" Target="../d.xml" TargetMode="Internal"></Relationship>"#,
+            external("rId1")
+        ));
+        let more = [
+            ("xl/worksheets/sheet1.xml".to_owned(), "<w/>".to_owned()),
+            ("xl/worksheets/_rels/sheet1.xml.rels".to_owned(), sheet_rels),
+            ("xl/d.xml".to_owned(), "<d/>".to_owned()),
+        ];
+        let package = graph(&[("worksheet", "worksheets/sheet1.xml")], &more);
+        let canonical = check_package(&package).unwrap();
+        let text = part(&canonical, "xl/worksheets/_rels/sheet1.xml.rels");
+        assert!(
+            text.contains(
+                r#"xmlns="http://schemas.openxmlformats.org/package/2006/relationships""#
+            )
+        );
+        assert!(text.contains(
+            r#"<Relationship Id="rId1" Type="http://x/hyperlink" Target="http://e.test/?a=1&amp;b=2" TargetMode="External"/>"#
+        ));
+        assert!(
+            text.contains(r#"<Relationship Id="rId2" Type="http://x/drawing" Target="../d.xml"/>"#)
+        );
+        assert!(!text.contains("foo") && !text.contains("q:x"));
+        // The other parts stay as they were.
+        assert_eq!(part(&canonical, "xl/d.xml"), "<d/>");
+        assert_eq!(names(&canonical), names(&package));
+    }
+
+    #[test]
+    fn part_names_must_be_canonical() {
+        for name in ["xl\\media\\a.bin", "/xl/media/a.bin"] {
+            let package = graph(&[], &[(name.to_owned(), String::new())]);
+            assert_eq!(refused(&package), NAMES, "{name}");
+        }
+        let more = [
+            ("xl/media/a.bin".to_owned(), String::new()),
+            ("xl/Media/A.bin".to_owned(), String::new()),
+        ];
+        assert_eq!(refused(&graph(&[], &more)), NAMES);
+    }
+
+    #[test]
+    fn strict_rels_reader_refuses_unusual_parts() {
+        let bodies = [
+            r#"<Relationship Id="a" Type="t" Target="x&amp;y"/>"#,
+            r#"<Relationship Id="a" Type="t" Target="x" TargetMode="&#69;xternal"/>"#,
+            r#"<Relationship Id="a" Type="t" Target="x" Target="y"/>"#,
+            r#"<Relationship Id="a" Type="t"/>"#,
+            r#"<Relationship Id="a" Type="t" Target="x"/><Relationship Id="a" Type="t" Target="y"/>"#,
+            r#"<Relationship xmlns:q="urn:q" Id="a" Type="t" q:Target="x"/>"#,
+            r#"<Other Id="a" Type="t" Target="x"/>"#,
+            r#"<p:Relationship xmlns:p="urn:q" Id="a" Type="t" Target="x"/>"#,
+            r#"<Relationship Id="a" Type="t" Target="x"><Relationship Id="b" Type="t" Target="y"/></Relationship>"#,
+        ];
+        for body in bodies {
+            let package = plain_package(&[
+                (CONTENT_TYPES, OUT_TYPES),
+                (WORKBOOK, "<workbook/>"),
+                (WORKBOOK_RELS, &rels_with(body)),
+            ]);
+            assert_eq!(refused(&package), UNREADABLE, "{body}");
+        }
+    }
+
+    #[test]
+    fn external_relationships_count_a_scan_of_all_names() {
+        // 9 900 External relationships and 9 900 other parts: 98 million
+        // comparisons for the crate.
+        let body: String = (0..9_900)
+            .map(|index| external(&format!("r{index}")))
+            .collect();
+        let mut more: Vec<(String, String)> = (0..9_000)
+            .map(|index| (format!("xl/media/m{index}.bin"), String::new()))
+            .collect();
+        more.push(("xl/worksheets/sheet1.xml".to_owned(), "<w/>".to_owned()));
+        more.push((
+            "xl/worksheets/_rels/sheet1.xml.rels".to_owned(),
+            rels_with(&body),
+        ));
+        let package = graph(&[("worksheet", "worksheets/sheet1.xml")], &more);
+        assert_eq!(refused(&package), TOO_LARGE);
+        // A few hundred are fine.
+        let body: String = (0..300)
+            .map(|index| external(&format!("r{index}")))
+            .collect();
+        more.pop();
+        more.push((
+            "xl/worksheets/_rels/sheet1.xml.rels".to_owned(),
+            rels_with(&body),
+        ));
+        check_package(&graph(&[("worksheet", "worksheets/sheet1.xml")], &more)).unwrap();
+    }
+
+    #[test]
+    fn drawing_with_2500_images_passes_the_check() {
+        let images: Vec<(&str, String)> = (0..2_500)
+            .map(|index| ("image", format!("../media/i{index}.png")))
+            .collect();
+        let mut more = vec![
+            ("xl/worksheets/sheet1.xml".to_owned(), "<w/>".to_owned()),
+            (
+                "xl/worksheets/_rels/sheet1.xml.rels".to_owned(),
+                rels(&[("drawing", "../drawings/d.xml")]),
+            ),
+            ("xl/drawings/d.xml".to_owned(), "<d/>".to_owned()),
+            (
+                "xl/drawings/_rels/d.xml.rels".to_owned(),
+                rels(
+                    &images
+                        .iter()
+                        .map(|(k, t)| (*k, t.as_str()))
+                        .collect::<Vec<_>>(),
+                ),
+            ),
+        ];
+        more.extend((0..2_500).map(|index| (format!("xl/media/i{index}.png"), String::new())));
+        let package = graph(&[("worksheet", "worksheets/sheet1.xml")], &more);
+        check_package(&package).unwrap();
+    }
+
+    #[test]
+    fn sheets_must_have_distinct_relationship_ids() {
+        let workbook = r#"<workbook xmlns:r="urn:r"><sheets><sheet name="A" r:id="rId1"/><sheet name="B" r:id="rId2"/><sheet name="C" d3p1:id="rId1"/></sheets></workbook>"#;
+        let package = plain_package(&[
+            (CONTENT_TYPES, OUT_TYPES),
+            (WORKBOOK, workbook),
+            (WORKBOOK_RELS, &rels(&[])),
+        ]);
+        assert_eq!(refused(&package), SHEET_IDS);
+        let workbook = workbook.replace("d3p1:id", "d3p1:other");
+        let package = plain_package(&[
+            (CONTENT_TYPES, OUT_TYPES),
+            (WORKBOOK, &workbook),
+            (WORKBOOK_RELS, &rels(&[])),
+        ]);
+        check_package(&package).unwrap();
+    }
+
+    #[test]
+    fn many_references_to_one_link_part_are_read_once() {
+        let references = r#"<externalReference r:id="rId4"/>"#.repeat(MAX_RELATIONSHIPS);
+        let workbook = format!(
+            r#"<workbook xmlns="urn:m" xmlns:r="urn:r"><sheets/><externalReferences>{references}</externalReferences></workbook>"#
+        );
+        let rels = r#"<Relationships xmlns="urn:r"><Relationship Id="rId4" Type="t" Target="externalLinks/externalLink1.xml"/></Relationships>"#;
+        let link = format!(
+            r#"<externalLink xmlns="urn:m"><externalBook/>{}</externalLink>"#,
+            " ".repeat(8 * 1024 * 1024)
+        );
+        let input = plain_package(&[
+            (WORKBOOK, &workbook),
+            (WORKBOOK_RELS, rels),
+            ("xl/externalLinks/externalLink1.xml", &link),
+        ]);
+        let start = std::time::Instant::now();
+        let out = scrub(&input, &plain_output(OUT_WORKBOOK)).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert!(part(&out, WORKBOOK).contains("<externalReferences>"));
     }
 }
