@@ -28,10 +28,13 @@
 - `src/config.rs` — `files` is an array of one or more globs. A string gives the error `files must be an array, for example files = ["**/*.csv"]`. An empty array is an error.
 - `src/config.rs` — the `init` config uses `files = ["**/*.csv", "**/*.xlsx"]` and shows `# files_excluded = []` with a comment. The comment about the header row describes the search in the first 20 non-empty rows (spec 0015).
 - `src/run.rs` — each glob of `files` and `files_excluded` uses the options of today: case is ignored, and `*` does not match `/`.
+- `src/config.rs`, `src/cells.rs`, `src/xlsx_file.rs`, `src/csv_file.rs` — messages and column keys name a rule by `Rule::label`: the globs of `files`, joined with `, `.
+- `Cargo.lock` — the version of pseudofy.
 - `tests/cli.rs`, `tests/csv.rs`, `tests/xlsx.rs`, `tests/xlsx_fidelity.rs`, `tests/free_text.rs` — the configs of the tests use the array form.
 - `tests/pseudonym_stability.rs` — only the `files` line of its config uses the array form.
 - `Cargo.toml` — version `0.3.0`.
 - `README.md` — the rule settings, a recommended pattern, the risk of a wrong glob in `files_excluded` with `copy_other_files = true`, and release notes for 0.3.0 with the migration of `files`.
+- `docs/adr/0014-copy-excluded-and-other-files-unchanged.md` — new ADR.
 - `docs/adr/0012-copy-other-project-files-unchanged.md` — status `superseded by ADR-0014`.
 - `CLAUDE.md` — the exception names ADR-0014 and excluded files.
 
@@ -48,6 +51,7 @@
 
 - [x] With `copy_other_files = false`, an excluded file produces no file in `--out`.
 - [x] A CSV or XLSX file that no rule excludes is never copied unchanged.
+- [x] An excluded file is an input file: no output overwrites it (spec 0016).
 - [x] A warning or an error names the relative path or the glob, never a cell value.
 - [x] `tests/pseudonym_stability.rs` passes with unchanged golden values and checksums.
 - [x] No new crate. No `unwrap()` or `expect()` outside tests.

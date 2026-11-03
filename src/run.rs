@@ -82,6 +82,7 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
     let mut summary = Summary::default();
     let mut items: Vec<Item> = Vec::new();
     let mut others: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+    let mut excluded: Vec<PathBuf> = Vec::new();
     summary.copied = config.copy_other_files.then_some(0);
 
     for entry in project_walker(&project, &out) {
@@ -118,7 +119,9 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
         }
         let Some(rules) = matching_rules(&matchers, &rel) else {
             // Excluded by each rule whose `files` matches: an other file (ADR-0014).
+            // It stays an input file: no output may overwrite it.
             summary.excluded += 1;
+            excluded.push(entry.path().to_path_buf());
             if config.copy_other_files && !is_lock_file(entry.path()) {
                 others.push((entry.path().to_path_buf(), relative.to_path_buf(), rel));
             }
@@ -158,7 +161,7 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
         ..pass1
     };
 
-    let inputs = input_ids(&items, &others);
+    let inputs = input_ids(&items, &others, &excluded);
 
     // Pass 2: write the copies.
     write_items(
@@ -176,11 +179,16 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
 }
 
 /// Identities of the walked input files: an output path must not be one of them.
-fn input_ids(items: &[Item], others: &[(PathBuf, PathBuf, String)]) -> HashSet<FileId> {
+fn input_ids(
+    items: &[Item],
+    others: &[(PathBuf, PathBuf, String)],
+    excluded: &[PathBuf],
+) -> HashSet<FileId> {
     items
         .iter()
         .map(|item| &item.path)
         .chain(others.iter().map(|(path, _, _)| path))
+        .chain(excluded)
         .filter_map(|path| file_id(path))
         .collect()
 }

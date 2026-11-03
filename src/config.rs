@@ -69,20 +69,21 @@ pub struct Rule {
 /// `files` is an array of one or more globs. The string form of 0.2.0 gives a
 /// migration hint.
 fn glob_list<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    enum Files {
-        Many(Vec<String>),
-        Other(serde::de::IgnoredAny),
-    }
-    match Files::deserialize(deserializer)? {
-        Files::Other(_) => Err(serde::de::Error::custom(
+    use serde::de::Error;
+    match toml::Value::deserialize(deserializer)? {
+        toml::Value::Array(values) if values.is_empty() => {
+            Err(D::Error::custom("files must have one or more globs"))
+        }
+        toml::Value::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                toml::Value::String(glob) => Ok(glob),
+                _ => Err(D::Error::custom("each glob in files must be a string")),
+            })
+            .collect(),
+        _ => Err(D::Error::custom(
             "files must be an array, for example files = [\"**/*.csv\"]",
         )),
-        Files::Many(globs) if globs.is_empty() => Err(serde::de::Error::custom(
-            "files must have one or more globs",
-        )),
-        Files::Many(globs) => Ok(globs),
     }
 }
 
@@ -280,6 +281,11 @@ mod tests {
             "{error}"
         );
         assert!(parse("files_excluded = [\"a\"]").is_err());
+        let error = parse("files = [\"**/*.csv\", 1]").unwrap_err().to_string();
+        assert!(
+            error.contains("each glob in files must be a string"),
+            "{error}"
+        );
     }
 
     #[test]

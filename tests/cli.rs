@@ -695,3 +695,27 @@ fn an_invalid_excluded_glob_fails_and_names_the_glob() {
     let stderr = stderr_of(&output);
     assert!(stderr.contains("invalid glob \"a/[b\""), "{stderr}");
 }
+
+#[cfg(unix)]
+#[test]
+fn an_excluded_file_is_never_overwritten_by_an_output() {
+    // `out/data.csv` is the same file as the excluded `archive/old.csv`.
+    let dir = excluded_project("", "");
+    let out = tempfile::TempDir::new().unwrap();
+    std::fs::hard_link(
+        dir.path().join("archive/old.csv"),
+        out.path().join("data.csv"),
+    )
+    .unwrap();
+    let output = run_output(dir.path(), out.path());
+    assert!(!output.status.success());
+    let stderr = stderr_of(&output);
+    assert!(
+        stderr.contains("data.csv: the output path is an input file"),
+        "{stderr}"
+    );
+    assert_eq!(
+        std::fs::read(dir.path().join("archive/old.csv")).unwrap(),
+        b"name\nTamsorin Velgrad\n"
+    );
+}
