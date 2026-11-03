@@ -2,7 +2,8 @@
 # binary for Apple Silicon, then publish it with a provenance attestation
 # (ADR-0005, specs 0005, 0011 and 0020). No other workflow exists.
 #
-# Three jobs with separate tokens:
+# Three jobs with separate tokens. check and build run at the same time;
+# publish runs only after both pass (spec 0023):
 #   check   - read token, runs the devcontainer checks, needs the tag on main
 #   build   - read token, runs cargo, makes the tarball
 #   publish - write token, runs no cargo and no third-party build step
@@ -40,7 +41,6 @@ jobs:
           push: never
 
   build:
-    needs: check
     runs-on: macos-15
     permissions:
       contents: read
@@ -105,7 +105,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

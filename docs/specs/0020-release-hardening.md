@@ -3,7 +3,7 @@
 **Date:** 2026-11-02
 **Status:** done
 **Author:** Claude (agent)
-**Related:** `docs/adr/0005-build-releases-in-github-actions.md` · `docs/specs/0011-checks-only-on-release-tags.md` · `docs/specs/0008-actionlint-in-the-devcontainer.md`
+**Related:** `docs/specs/0023-faster-release-pipeline.md` (`check` and `build` run at the same time; `publish` needs both) · `docs/adr/0005-build-releases-in-github-actions.md` · `docs/specs/0011-checks-only-on-release-tags.md` · `docs/specs/0008-actionlint-in-the-devcontainer.md`
 
 ---
 

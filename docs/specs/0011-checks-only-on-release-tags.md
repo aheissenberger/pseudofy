@@ -3,7 +3,7 @@
 **Date:** 2026-11-02
 **Status:** active
 **Author:** Claude (agent)
-**Related:** `docs/specs/0020-release-hardening.md` (splits the job `release` into `build` and `publish`) · `docs/specs/0005-ci-and-macos-release.md` · `docs/adr/0005-build-releases-in-github-actions.md` · `docs/adr/0002-develop-in-a-devcontainer.md`
+**Related:** `docs/specs/0023-faster-release-pipeline.md` (`check` and `build` run at the same time; `publish` needs both) · `docs/specs/0020-release-hardening.md` (splits the job `release` into `build` and `publish`) · `docs/specs/0005-ci-and-macos-release.md` · `docs/adr/0005-build-releases-in-github-actions.md` · `docs/adr/0002-develop-in-a-devcontainer.md`
 
 ---
 
