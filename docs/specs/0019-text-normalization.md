@@ -1,7 +1,7 @@
 # Feature Delta Spec: Text normalization and name parsing
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/adr/0013-normalize-text-before-hashing.md` · `docs/adr/0003-derive-pseudonyms-with-a-keyed-hash.md` · `docs/specs/0004-known-names-in-free-text.md`
 
@@ -60,33 +60,33 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] `tests/pseudonym_stability.rs` passes unchanged.
-- [ ] Column pseudonyms and free-text pseudonyms use the same normalization.
-- [ ] No new crate. No `unwrap()` or `expect()` outside tests.
+- [x] `tests/pseudonym_stability.rs` passes unchanged.
+- [x] Column pseudonyms and free-text pseudonyms use the same normalization.
+- [x] No new crate. No `unwrap()` or `expect()` outside tests.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] `O’Brien` and `O'Brien`, `Strauß` and `STRAUSS`, `İlker` and `Ilker` each get one pseudonym, in columns and in free text.
-- [ ] `Mül\u{ad}ler` and `Kes\u{200b}ta` in free text get the pseudonym of `Müller` and `Kesta`.
-- [ ] `Schreib an anna.zorbel@firma.test!` keeps the `!`. The address gets the same pseudonym as without the `!`.
-- [ ] `https://firma.test/x?u=anna.zorbel@firma.test&y=1` stays a valid URL. Only the address changes.
-- [ ] `Preis 3@4.50 EUR` and `Preis 3@Stück` stay unchanged.
-- [ ] Each address is replaced in `https://x.test/a.b@acme.test`, `https://a@acme.test/`, `https://x.test/share?to=a@acme.test,b@acme.test`, a JSON cell, and an HTML cell. The URL keeps its form.
-- [ ] `a.b=work@acme.test`, `z!q@acme.test`, and `a/b@acme.test` in free text leave no part of the real local part.
-- [ ] `Anna Herr`, `Kim Mba`, and the single word `Ing` are replaced as names.
-- [ ] `ΟΔΥΣΣΕΥΣ` and `Οδυσσευς` get one pseudonym.
-- [ ] A cell of 1.4 MB `a@b.cd,` and an `xn--` label of 400 KB take less than 1 second.
-- [ ] `anna.zorbel@localhost` and `"anna zorbel"@firma.test` are replaced.
-- [ ] `@bäckerei.test` and `@xn--bckerei-5wa.test` get one subdomain label.
-- [ ] `Dr. Hans Zorbel` keeps `Dr.`. `Ludwig van Beethoven` gives `van` to the last name. `Zorbel, Hans` keeps the comma order.
-- [ ] `mailto:anna.zorbel@firma.test` in an email column keeps `mailto:`.
-- [ ] 200 different first names with different last names give 0 collisions.
+- [x] `O’Brien` and `O'Brien`, `Strauß` and `STRAUSS`, `İlker` and `Ilker` each get one pseudonym, in columns and in free text.
+- [x] `Mül\u{ad}ler` and `Kes\u{200b}ta` in free text get the pseudonym of `Müller` and `Kesta`.
+- [x] `Schreib an anna.zorbel@firma.test!` keeps the `!`. The address gets the same pseudonym as without the `!`.
+- [x] `https://firma.test/x?u=anna.zorbel@firma.test&y=1` stays a valid URL. Only the address changes.
+- [x] `Preis 3@4.50 EUR` and `Preis 3@Stück` stay unchanged.
+- [x] Each address is replaced in `https://x.test/a.b@acme.test`, `https://a@acme.test/`, `https://x.test/share?to=a@acme.test,b@acme.test`, a JSON cell, and an HTML cell. The URL keeps its form.
+- [x] `a.b=work@acme.test`, `z!q@acme.test`, and `a/b@acme.test` in free text leave no part of the real local part.
+- [x] `Anna Herr`, `Kim Mba`, and the single word `Ing` are replaced as names.
+- [x] `ΟΔΥΣΣΕΥΣ` and `Οδυσσευς` get one pseudonym.
+- [x] A cell of 1.4 MB `a@b.cd,` and an `xn--` label of 400 KB take less than 1 second.
+- [x] `anna.zorbel@localhost` and `"anna zorbel"@firma.test` are replaced.
+- [x] `@bäckerei.test` and `@xn--bckerei-5wa.test` get one subdomain label.
+- [x] `Dr. Hans Zorbel` keeps `Dr.`. `Ludwig van Beethoven` gives `van` to the last name. `Zorbel, Hans` keeps the comma order.
+- [x] `mailto:anna.zorbel@firma.test` in an email column keeps `mailto:`.
+- [x] 200 different first names with different last names give 0 collisions.
 
 **Tests to add/update:**
 
-- [ ] `tests/free_text.rs`, `tests/csv.rs`, and unit tests in `src/text.rs`, `src/pseudonym.rs`, `src/known_names.rs` — the behaviors above.
+- [x] `tests/free_text.rs`, `tests/csv.rs`, and unit tests in `src/text.rs`, `src/pseudonym.rs`, `src/known_names.rs` — the behaviors above.
 
 **Commands that must pass:**
 
@@ -98,3 +98,5 @@ devcontainer exec --workspace-folder . ./scripts/check
 ## 5. Rollback / Notes (optional)
 
 This spec changes pseudonyms of the affected values (ADR-0013). Release it as 0.2.0 with release notes.
+
+Known limit: the collision count pairs first and last names in the order of the calls, not by row. A row with a first name and no last name can pair with the last name of the next row. This changes only the count in the summary line, never a pseudonym.
