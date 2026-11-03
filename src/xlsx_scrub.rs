@@ -1882,6 +1882,13 @@ struct SheetParts {
 /// input package, the warnings on the package that `umya-spreadsheet` wrote
 /// (canonical part names). Error texts never contain part contents.
 pub fn inspect(package: &[u8]) -> anyhow::Result<Inspection> {
+    inspect_with_headers(package, &[])
+}
+
+/// Like `inspect`. `headers` are the configured header texts: a table column
+/// with another name can hold a real value and gets the `tables` warning.
+/// With no headers, each table column is such a name.
+pub fn inspect_with_headers(package: &[u8], headers: &[String]) -> anyhow::Result<Inspection> {
     let bad = || anyhow!("cannot inspect the workbook package");
     let mut archive = ZipArchive::new(Cursor::new(package)).map_err(|_| bad())?;
     let mut comments = false;
@@ -1916,7 +1923,7 @@ pub fn inspect(package: &[u8]) -> anyhow::Result<Inspection> {
             drawings |= drawing_has_text(&xml).map_err(|_| bad())?;
         } else if name.starts_with("xl/tables/") && is_xml(&name) {
             let xml = read_limited(&mut file).map_err(|_| bad())?;
-            tables |= table_has_totals(&xml).map_err(|_| bad())?;
+            tables |= table_has_totals(&xml, headers).map_err(|_| bad())?;
         } else if name == STYLES {
             let xml = read_limited(&mut file).map_err(|_| bad())?;
             formats |= styles_have_literal_text(&xml).map_err(|_| bad())?;
@@ -1951,14 +1958,40 @@ pub fn inspect(package: &[u8]) -> anyhow::Result<Inspection> {
     Ok(Inspection { unsupported, kinds })
 }
 
-/// True if a drawing part has text in an `a:t` element.
-fn drawing_has_text(xml: &[u8]) -> Result<bool, quick_xml::Error> {
+/// True if `name` is a default shape name: one or more letter words and a
+/// number ("Picture 3", "Text Box 12", "Grafik 1").
+fn is_default_shape_name(name: &str) -> bool {
+    let Some((words, number)) = name.trim().rsplit_once(' ') else {
+        return false;
+    };
+    !number.is_empty()
+        && number.bytes().all(|b| b.is_ascii_digit())
+        && !words.is_empty()
+        && words
+            .split(' ')
+            .all(|word| !word.is_empty() && word.chars().all(char::is_alphabetic))
+}
+
+/// True if a drawing part has text in an `a:t` element, or a shape or picture
+/// (`cNvPr`) has alt text (`descr`, `title`) or a name that is not a default.
+fn drawing_has_text(xml: &[u8]) -> Result<bool, Failure> {
     let mut reader = Reader::from_reader(xml);
     let mut buf = Vec::new();
     let mut in_text = false;
     loop {
         match reader.read_event_into(&mut buf)? {
-            Event::Start(start) => in_text = start.local_name().as_ref() == b"t",
+            Event::Start(start) => {
+                in_text = start.local_name().as_ref() == b"t";
+                if cnvpr_has_text(&start)? {
+                    return Ok(true);
+                }
+            }
+            Event::Empty(start) => {
+                in_text = false;
+                if cnvpr_has_text(&start)? {
+                    return Ok(true);
+                }
+            }
             Event::End(_) => in_text = false,
             Event::Text(text) if in_text => {
                 if text.decode().map_or(true, |t| !t.trim().is_empty()) {
@@ -1973,8 +2006,23 @@ fn drawing_has_text(xml: &[u8]) -> Result<bool, quick_xml::Error> {
     }
 }
 
-/// True if a table part has a total label or a total or calculated formula.
-fn table_has_totals(xml: &[u8]) -> Result<bool, Failure> {
+/// True if `start` is a `cNvPr` with alt text or a non-default name.
+fn cnvpr_has_text(start: &BytesStart<'_>) -> Result<bool, Failure> {
+    if start.local_name().as_ref() != b"cNvPr" {
+        return Ok(false);
+    }
+    for key in [&b"descr"[..], b"title"] {
+        if attr(start, key)?.is_some_and(|value| !value.trim().is_empty()) {
+            return Ok(true);
+        }
+    }
+    Ok(attr(start, b"name")?
+        .is_some_and(|name| !name.trim().is_empty() && !is_default_shape_name(&name)))
+}
+
+/// True if a table part has a total label, a total or calculated formula, or
+/// a column name that is not one of the configured `headers`.
+fn table_has_totals(xml: &[u8], headers: &[String]) -> Result<bool, Failure> {
     let mut reader = Reader::from_reader(xml);
     let mut buf = Vec::new();
     loop {
@@ -1990,6 +2038,12 @@ fn table_has_totals(xml: &[u8]) -> Result<bool, Failure> {
                 {
                     return Ok(true);
                 }
+                if local == b"tableColumn"
+                    && attr(&start, b"name")?
+                        .is_some_and(|name| !headers.contains(&name.trim().to_lowercase()))
+                {
+                    return Ok(true);
+                }
             }
             Event::Eof => return Ok(false),
             _ => {}
@@ -1999,7 +2053,8 @@ fn table_has_totals(xml: &[u8]) -> Result<bool, Failure> {
 }
 
 /// True if a number format of the styles part has literal text: quoted text
-/// or a backslash-escaped character.
+/// a backslash-escaped character, or a `[$` block (it can hold any text, for
+/// example `[$Name]0`; each `[$` is flagged).
 fn styles_have_literal_text(xml: &[u8]) -> Result<bool, Failure> {
     let mut reader = Reader::from_reader(xml);
     let mut buf = Vec::new();
@@ -2007,7 +2062,8 @@ fn styles_have_literal_text(xml: &[u8]) -> Result<bool, Failure> {
         match reader.read_event_into(&mut buf)? {
             Event::Start(start) | Event::Empty(start) => {
                 if start.local_name().as_ref() == b"numFmt"
-                    && attr(&start, b"formatCode")?.is_some_and(|code| code.contains(['"', '\\']))
+                    && attr(&start, b"formatCode")?
+                        .is_some_and(|code| code.contains(['"', '\\']) || code.contains("[$"))
                 {
                     return Ok(true);
                 }
@@ -2434,6 +2490,61 @@ mod tests {
         assert_eq!(found.kinds, ["comments", "charts"]);
         let found = inspect(&plain_package(&[("xl/threadedComments/t1.xml", "<t/>")])).unwrap();
         assert_eq!(found.kinds, ["comments"]);
+    }
+
+    #[test]
+    fn drawing_alt_text_and_custom_names_are_detected() {
+        let drawing = |props: &str| {
+            format!(
+                r#"<xdr:wsDr xmlns:xdr="urn:x"><xdr:pic><xdr:nvPicPr><xdr:cNvPr id="2" {props}/></xdr:nvPicPr></xdr:pic></xdr:wsDr>"#
+            )
+        };
+        let kinds = |props: &str| {
+            let xml = drawing(props);
+            inspect(&plain_package(&[("xl/drawings/drawing1.xml", &xml)]))
+                .unwrap()
+                .kinds
+        };
+        for props in [
+            r#"name="Picture 1" descr="Invented alt text""#,
+            r#"name="Picture 1" title="Invented title""#,
+            r#"name="Quenzel-Foto""#,
+            r#"name="Picture""#,
+            r#"name="Picture 1a""#,
+        ] {
+            assert_eq!(kinds(props), ["drawings"], "{props}");
+        }
+        for props in [
+            r#"name="Picture 1""#,
+            "name=\"Text Box 12\" descr=\"\" title=\" \"",
+            r#"name="Grafik 3""#,
+            r#"name="Diagramm 7""#,
+            r#"hidden="0""#,
+        ] {
+            assert!(kinds(props).is_empty(), "{props}");
+        }
+    }
+
+    #[test]
+    fn table_columns_must_be_configured_headers() {
+        let table = r#"<table xmlns="urn:x"><tableColumns count="2"><tableColumn id="1" name="Name"/><tableColumn id="2" name="E-Mail"/></tableColumns></table>"#;
+        let package = plain_package(&[("xl/tables/table1.xml", table)]);
+        let headers = ["name".to_owned(), "e-mail".to_owned()];
+        let found = inspect_with_headers(&package, &headers).unwrap();
+        assert_eq!(found, Inspection::default());
+        let headers = ["name".to_owned()];
+        assert_eq!(
+            inspect_with_headers(&package, &headers).unwrap().kinds,
+            ["tables"]
+        );
+        assert_eq!(inspect(&package).unwrap().kinds, ["tables"]);
+    }
+
+    #[test]
+    fn currency_block_number_format_is_detected() {
+        let styles = r#"<styleSheet xmlns="urn:x"><numFmts count="1"><numFmt numFmtId="164" formatCode="[$Name]0"/></numFmts></styleSheet>"#;
+        let found = inspect(&plain_package(&[("xl/styles.xml", styles)])).unwrap();
+        assert_eq!(found.kinds, ["number formats"]);
     }
 
     #[test]
