@@ -336,18 +336,24 @@ impl Pseudonymizer {
                 Kind::Last => &self.lists.last,
                 _ => &self.lists.first,
             };
-            let candidate = if kind == Kind::First && self.two_first_names && !single {
+            let double = kind == Kind::First && self.two_first_names && !single;
+            let candidate = if double {
                 double_first_name(list, &bytes)
             } else {
                 pick(list, u64_at(&bytes, 0)).to_string()
             };
+            // A double first name must not contain the real name as one part.
+            let same_part = double
+                && candidate
+                    .split('-')
+                    .any(|part| normalize(part) == normalized);
             let same_initial = single
                 && candidate
                     .chars()
                     .next()
                     .and_then(|c| c.to_lowercase().next())
                     == normalized.chars().next();
-            if (candidate.to_lowercase() != normalized && !same_initial)
+            if (candidate.to_lowercase() != normalized && !same_initial && !same_part)
                 || attempt >= 64
                 || list.len() < 2
             {
@@ -454,13 +460,19 @@ fn double_first_name(list: &[&'static str], bytes: &[u8; 32]) -> String {
     format!("{first}-{second}")
 }
 
-/// The entry at `value`, or the next entry with no `-` that is not `avoid`.
-/// After one pass over the list, the entry at `value`.
+/// The first entry from `value` on with no `-` that is not `avoid`; else the
+/// first entry with no `-`; else the entry at `value`.
 fn pick_plain(list: &[&'static str], value: u64, avoid: Option<&str>) -> &'static str {
-    (0..list.len() as u64)
-        .map(|step| pick(list, value.wrapping_add(step)))
+    let len = list.len() as u64;
+    if len == 0 {
+        return "";
+    }
+    let start = value % len;
+    let scan = || (0..len).map(move |step| pick(list, (start + step) % len));
+    scan()
         .find(|name| !name.contains('-') && Some(*name) != avoid)
-        .unwrap_or_else(|| pick(list, value))
+        .or_else(|| scan().find(|name| !name.contains('-')))
+        .unwrap_or_else(|| pick(list, start))
 }
 
 fn label_from(bytes: &[u8; 32]) -> String {
@@ -765,6 +777,20 @@ mod tests {
     }
 
     #[test]
+    fn a_double_first_name_never_contains_the_real_name() {
+        let key = ProjectKey::from_bytes([1; 32]);
+        let mut p = Pseudonymizer::new(&key, Language::De, false).with_two_first_names(true);
+        let lists = names::lists(Language::De);
+        for real in lists.first.iter().filter(|name| !name.contains('-')) {
+            let fake = p.first_name(real);
+            assert!(
+                !fake.split('-').any(|part| part.eq_ignore_ascii_case(real)),
+                "{real}: {fake}"
+            );
+        }
+    }
+
+    #[test]
     fn double_first_names_skip_hyphenated_entries() {
         let list = vec!["Jan-Hendrik", "Anna", "Anna-Lena", "Karl"];
         for seed in 0..20u8 {
@@ -772,6 +798,8 @@ mod tests {
             assert!(fake == "Anna-Karl" || fake == "Karl-Anna", "{fake}");
         }
         assert_eq!(double_first_name(&["Solo"], &[1; 32]), "Solo-Solo");
+        // Near u64::MAX the scan still visits each entry.
+        assert_eq!(double_first_name(&["A-B", "C-D", "E"], &[0xff; 32]), "E-E");
     }
 
     #[test]
