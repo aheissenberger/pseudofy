@@ -1,6 +1,7 @@
 //! Pseudonymize one CSV file.
 
 use std::fs;
+use std::io::Read;
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
@@ -17,6 +18,29 @@ use crate::known_names::KnownNames;
 use crate::pseudonym::Pseudonymizer;
 
 const BOM: &[u8] = b"\xEF\xBB\xBF";
+
+/// The largest CSV file that pseudofy reads (the file is held in memory).
+const MAX_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Read `input`. A file above `MAX_BYTES` is refused before and while it is
+/// read, so a file that grows during the read cannot pass.
+fn read_input(input: &Path, rel: &str) -> anyhow::Result<Vec<u8>> {
+    let unreadable = || format!("cannot read {rel}");
+    let too_large = || anyhow!("{rel}: file is larger than 256 MiB");
+    let file = fs::File::open(input).with_context(unreadable)?;
+    let size = file.metadata().with_context(unreadable)?.len();
+    if size > MAX_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(unreadable)?;
+    if u64::try_from(bytes.len()).is_ok_and(|len| len > MAX_BYTES) {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
 
 /// Result of the transformation of one file.
 struct Transformed {
@@ -44,7 +68,7 @@ pub fn collect(
     cells: &CellFns,
     known: &mut KnownNames,
 ) -> anyhow::Result<()> {
-    let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
+    let bytes = read_input(input, rel)?;
     let columns = collect_columns(rules);
     let mut collector = Collector::default();
     transform_encoded(
@@ -72,7 +96,7 @@ pub fn process(
     pseudonymizer: &mut Pseudonymizer,
     cells: &CellFns,
 ) -> anyhow::Result<CsvStats> {
-    let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
+    let bytes = read_input(input, rel)?;
     let columns = collect_columns(rules);
     let mut replace = |kind: Kind, value: &str| match kind {
         Kind::First => pseudonymizer.first_name(value),
@@ -80,7 +104,7 @@ pub fn process(
         Kind::Email => pseudonymizer.email(value),
     };
     let result = transform_encoded(&bytes, &columns, rules, cells, &mut replace, rel, None)?;
-    write_output(out_root, output, &result.bytes, rel)?;
+    write_output(out_root, output, &result.bytes, rel, input)?;
     Ok(CsvStats {
         replaced: result.replaced,
         free_text: result.free_text,
@@ -984,8 +1008,8 @@ mod tests {
         let root = dir.path().join("out");
         fs::create_dir(&root).unwrap();
         let file = root.join("sub").join("a.csv");
-        write_output(&root, &file, b"one", "sub/a.csv").unwrap();
-        write_output(&root, &file, b"two", "sub/a.csv").unwrap();
+        write_output(&root, &file, b"one", "sub/a.csv", &file).unwrap();
+        write_output(&root, &file, b"two", "sub/a.csv", &file).unwrap();
         assert_eq!(fs::read(&file).unwrap(), b"two");
         assert!(!root.join("sub").join(".a.csv.pseudofy-tmp").exists());
 
@@ -995,7 +1019,7 @@ mod tests {
             fs::write(&victim, b"keep").unwrap();
             let link = root.join("b.csv");
             std::os::unix::fs::symlink(&victim, &link).unwrap();
-            let error = write_output(&root, &link, b"x", "b.csv").unwrap_err();
+            let error = write_output(&root, &link, b"x", "b.csv", &link).unwrap_err();
             assert!(error.to_string().contains("b.csv"));
             assert_eq!(fs::read(&victim).unwrap(), b"keep");
 
@@ -1003,7 +1027,7 @@ mod tests {
             fs::create_dir(&target_dir).unwrap();
             std::os::unix::fs::symlink(&target_dir, root.join("linked")).unwrap();
             let inner = root.join("linked").join("c.csv");
-            assert!(write_output(&root, &inner, b"x", "linked/c.csv").is_err());
+            assert!(write_output(&root, &inner, b"x", "linked/c.csv", &inner).is_err());
             assert!(!target_dir.join("c.csv").exists());
         }
     }

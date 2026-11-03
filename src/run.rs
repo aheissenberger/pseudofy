@@ -9,7 +9,7 @@ use anyhow::{Context, bail};
 use globset::{GlobBuilder, GlobMatcher};
 use walkdir::WalkDir;
 
-use crate::cells::{CellFns, is_not_found, set_input_permissions};
+use crate::cells::{CellFns, is_not_found};
 use crate::config::{self, FreeText, Rule};
 use crate::csv_file;
 use crate::key;
@@ -248,16 +248,12 @@ fn write_item(
     if is_input(&target, inputs) {
         bail!("{rel}: the output path is an input file");
     }
-    // The copy gets the permission bits of the input.
-    set_input_permissions(fs::metadata(path).ok().map(|meta| meta.permissions()));
-    let result = if item.csv {
+    if item.csv {
         csv_file::process(path, out, &target, rel, rules, pseudonymizer, cells)
             .map(|stats| (stats.replaced, stats.free_text))
     } else {
         process_xlsx(path, out, &target, rel, rules, pseudonymizer, cells)
-    };
-    set_input_permissions(None);
-    result
+    }
 }
 
 /// Whether `target` exists and is one of the walked input files.

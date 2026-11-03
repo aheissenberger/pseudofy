@@ -1408,3 +1408,29 @@ fn changed_header_line_keeps_the_quotes_of_unchanged_fields() {
     assert!(header.starts_with("\"name\",\"Kontakt "), "{header}");
     assert!(header.ends_with('"'), "{header}");
 }
+
+// ---- Size limit (spec 0017) ----
+
+#[test]
+fn csv_file_above_256_mib_is_refused_and_the_others_are_written() {
+    let dir = project(KEY_A, None, &[]);
+    write_file(
+        dir.path(),
+        "gut.csv",
+        "name,email\nZorbina Quenzel,zorbina@acme.test\n",
+    );
+    // A sparse file: the size is declared, nothing is allocated.
+    let big = fs::File::create(dir.path().join("gross.csv")).unwrap();
+    big.set_len(256 * 1024 * 1024 + 1).unwrap();
+    drop(big);
+    let out = TempDir::new().unwrap();
+    let assert = run(dir.path(), out.path()).failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr).into_owned();
+    assert!(
+        stderr.contains("gross.csv: file is larger than 256 MiB"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("1 file(s) failed"), "stderr: {stderr}");
+    assert!(!out.path().join("gross.csv").exists());
+    assert!(out.path().join("gut.csv").exists());
+}
