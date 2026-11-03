@@ -1,7 +1,7 @@
 # ADR-0008: Distribute on macOS with the homebrew-tools tap
 
 **Date:** 2026-11-02
-**Status:** proposed
+**Status:** superseded by ADR-0016
 **Deciders:** Andreas Heissenberger
 **Related:** `docs/plan/pseudonymization.md` §2 (14, 17) · `docs/specs/0008-homebrew-formula.md` · `docs/adr/0005-build-releases-in-github-actions.md`
 
