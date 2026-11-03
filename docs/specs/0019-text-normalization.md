@@ -27,10 +27,11 @@
 - `src/text.rs` — a shared `normalize` (ADR-0013), used by `src/pseudonym.rs` and `src/known_names.rs`. Format characters (Cf) are token characters, so they never split a name.
 - `src/text.rs` — the email pattern:
   - The local part is RFC 5322 `atext` and `.`, or a quoted string.
-  - The domain is labels of letters, digits, and `-`, joined by `.`. A single label is allowed (`localhost`).
-  - Characters before or after the address (`!`, `?`, `»`, `«`, `/`, `…`) are not part of it.
-  - In a URL, only `user@host` after `?`, `&`, `=`, or `mailto:` is an address.
-- `src/text.rs` — the full-name parser:
+  - The domain is labels of letters, digits, and `-`, joined by `.`. The last label has a letter. The only single label is `localhost`.
+  - Characters after the address (`!`, `?`, `»`, `«`, `…`, `.`) are not part of it.
+  - pseudofy replaces each address, also in a URL. In a match, only the text after the last `/`, `:`, `;`, `,`, `|`, `?`, `&`, `=`, or quote is the local part, so the rest of the URL stays. A URL userinfo (`https://user@host/`) is an address.
+  - The scan is linear in the length of the text.
+- `src/text.rs` — the full-name parser (a title counts only before the first name, a suffix only after the last name; the last name token is never a title or a suffix):
   - Titles and salutations stay unchanged and are not names: `Dr.`, `Prof.`, `Mag.`, `Ing.`, `DI`, `Herr`, `Frau`, `Mr.`, `Mrs.`, `Ms.`.
   - Suffixes stay unchanged: `Jr.`, `Sr.`, `II`, `III`, `MBA`, `MSc`, `BSc`, `PhD`.
   - Lowercase particles belong to the last name: `von`, `van`, `de`, `der`, `den`, `du`, `la`, `le`, `zu`, `di`, `da`, `ten`, `ter`.
@@ -42,8 +43,9 @@
 ### Modified
 
 - `src/known_names.rs`, `src/pseudonym.rs` — use the shared `normalize`.
-- `src/pseudonym.rs` — convert each `xn--` label of a domain to Unicode before the hash (RFC 3492 decode, no new crate).
-- `tests/free_text.rs`, `tests/csv.rs` — the tests of section 4.
+- `src/pseudonym.rs` — convert each `xn--` label of at most 63 bytes to Unicode before the hash (RFC 3492 decode, no new crate). A domain gets no `ß` to `ss` mapping (IDNA2008).
+- `src/text.rs` — `normalize` lowercases the full string (Greek final sigma). A token with U+200B that does not match a known name is also tried as its parts.
+- `tests/free_text.rs`, `tests/csv.rs` — the tests of section 4. `tests/cli.rs` reads the version from `Cargo.toml`. `Cargo.lock` gets the new version.
 - `Cargo.toml` — version `0.2.0`.
 - `README.md` — release notes for 0.2.0: which pseudonyms change (ADR-0013).
 
@@ -70,7 +72,12 @@
 - [ ] `Mül\u{ad}ler` and `Kes\u{200b}ta` in free text get the pseudonym of `Müller` and `Kesta`.
 - [ ] `Schreib an anna.zorbel@firma.test!` keeps the `!`. The address gets the same pseudonym as without the `!`.
 - [ ] `https://firma.test/x?u=anna.zorbel@firma.test&y=1` stays a valid URL. Only the address changes.
-- [ ] `Preis 3@4.50 EUR` stays unchanged.
+- [ ] `Preis 3@4.50 EUR` and `Preis 3@Stück` stay unchanged.
+- [ ] Each address is replaced in `https://x.test/a.b@acme.test`, `https://a@acme.test/`, `https://x.test/share?to=a@acme.test,b@acme.test`, a JSON cell, and an HTML cell. The URL keeps its form.
+- [ ] `a.b=work@acme.test`, `z!q@acme.test`, and `a/b@acme.test` in free text leave no part of the real local part.
+- [ ] `Anna Herr`, `Kim Mba`, and the single word `Ing` are replaced as names.
+- [ ] `ΟΔΥΣΣΕΥΣ` and `Οδυσσευς` get one pseudonym.
+- [ ] A cell of 1.4 MB `a@b.cd,` and an `xn--` label of 400 KB take less than 1 second.
 - [ ] `anna.zorbel@localhost` and `"anna zorbel"@firma.test` are replaced.
 - [ ] `@bäckerei.test` and `@xn--bckerei-5wa.test` get one subdomain label.
 - [ ] `Dr. Hans Zorbel` keeps `Dr.`. `Ludwig van Beethoven` gives `van` to the last name. `Zorbel, Hans` keeps the comma order.

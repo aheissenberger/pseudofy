@@ -104,7 +104,9 @@ Some pseudonyms change (ADR-0013). Run the project again and replace the old out
   - names with `ß`;
   - names with `İ`;
   - names with an invisible format character, for example a soft hyphen;
-  - emails at a punycode domain (`xn--`).
+  - emails at a punycode domain (`xn--`);
+  - emails with `’`, `ʼ`, or `ß` in the local part;
+  - names in Greek with a final sigma (`ς`).
 
   One spelling now gives one pseudonym in name columns and in free text. `O’Brien` and `O'Brien` give the same pseudonym. `Strauß` and `STRAUSS` give the same pseudonym.
 - In a full name, titles (`Dr.`, `Herr`), suffixes (`Jr.`, `MBA`), and lowercase particles (`van`, `von`) stay unchanged. `Last, First` keeps its order.
