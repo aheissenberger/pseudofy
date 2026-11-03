@@ -90,6 +90,8 @@ pub struct Pseudonymizer {
     email_subdomains: bool,
     /// Each fake first-name token is two first names joined with `-` (spec 0022).
     two_first_names: bool,
+    /// Each fake last-name token is two last names joined with `-` (spec 0024).
+    two_last_names: bool,
     /// Per kind: pseudonym (lowercase) -> normalized real value.
     seen: HashMap<Kind, HashMap<String, String>>,
     /// Real values (per kind) that already count as a collision.
@@ -242,6 +244,13 @@ impl Pseudonymizer {
         self
     }
 
+    /// Give each fake last-name token a second last name (spec 0024).
+    #[must_use]
+    pub fn with_two_last_names(mut self, on: bool) -> Self {
+        self.two_last_names = on;
+        self
+    }
+
     #[cfg(test)]
     fn with_lists(key: &ProjectKey, lists: NameLists, email_subdomains: bool) -> Self {
         Self::build(key, lists, email_subdomains)
@@ -257,6 +266,7 @@ impl Pseudonymizer {
             lists,
             email_subdomains,
             two_first_names: false,
+            two_last_names: false,
             seen: HashMap::new(),
             counted: HashSet::new(),
             person_collisions: 0,
@@ -336,13 +346,18 @@ impl Pseudonymizer {
                 Kind::Last => &self.lists.last,
                 _ => &self.lists.first,
             };
-            let double = kind == Kind::First && self.two_first_names && !single;
+            let double = !single
+                && match kind {
+                    Kind::First => self.two_first_names,
+                    Kind::Last => self.two_last_names,
+                    Kind::Email | Kind::Domain => false,
+                };
             let candidate = if double {
-                double_first_name(list, &bytes)
+                double_name(list, &bytes)
             } else {
                 pick(list, u64_at(&bytes, 0)).to_string()
             };
-            // A double first name must not contain the real name as one part.
+            // A double name must not contain the real name as one part.
             let same_part = double
                 && candidate
                     .split('-')
@@ -453,8 +468,9 @@ impl Pseudonymizer {
 }
 
 /// Two different entries of `list` without `-`, joined with `-`:
-/// `Lukas-Maximilian`. A list without two such entries gives what it has.
-fn double_first_name(list: &[&'static str], bytes: &[u8; 32]) -> String {
+/// `Lukas-Maximilian`, `Berger-Wagner`. A list without two such entries gives
+/// what it has.
+fn double_name(list: &[&'static str], bytes: &[u8; 32]) -> String {
     let first = pick_plain(list, u64_at(bytes, 0), None);
     let second = pick_plain(list, u64_at(bytes, 8), Some(first));
     format!("{first}-{second}")
@@ -791,15 +807,57 @@ mod tests {
     }
 
     #[test]
+    fn two_last_names_are_different_and_never_contain_the_real_name() {
+        let key = ProjectKey::from_bytes([1; 32]);
+        let mut p = Pseudonymizer::new(&key, Language::De, false).with_two_last_names(true);
+        let lists = names::lists(Language::De);
+        for real in lists.last.iter().filter(|name| !name.contains('-')) {
+            let fake = p.last_name(real);
+            let (a, b) = fake.split_once('-').unwrap();
+            assert_ne!(a, b, "{fake}");
+            assert!(!b.contains('-'), "{fake}");
+            assert!(
+                !a.eq_ignore_ascii_case(real) && !b.eq_ignore_ascii_case(real),
+                "{real}: {fake}"
+            );
+        }
+        // The first name and an initial stay one name.
+        assert!(!p.first_name("Zorbina").contains('-'));
+        assert!(!p.last_name("Z").contains('-'));
+    }
+
+    #[test]
+    fn two_last_names_remove_collisions_of_one_first_name() {
+        let surnames: Vec<&str> = names::lists(Language::De)
+            .last
+            .iter()
+            .copied()
+            .take(300)
+            .collect();
+        let run = |two: bool| {
+            let key = ProjectKey::from_bytes([2; 32]);
+            let mut p = Pseudonymizer::new(&key, Language::De, false).with_two_last_names(two);
+            for last in &surnames {
+                p.first_name("Annemarie");
+                p.last_name(last);
+            }
+            p.collision_counts().persons
+        };
+        let without = run(false);
+        assert!(without >= 5, "{without}");
+        assert_eq!(run(true), 0);
+    }
+
+    #[test]
     fn double_first_names_skip_hyphenated_entries() {
         let list = vec!["Jan-Hendrik", "Anna", "Anna-Lena", "Karl"];
         for seed in 0..20u8 {
-            let fake = double_first_name(&list, &[seed; 32]);
+            let fake = double_name(&list, &[seed; 32]);
             assert!(fake == "Anna-Karl" || fake == "Karl-Anna", "{fake}");
         }
-        assert_eq!(double_first_name(&["Solo"], &[1; 32]), "Solo-Solo");
+        assert_eq!(double_name(&["Solo"], &[1; 32]), "Solo-Solo");
         // Near u64::MAX the scan still visits each entry.
-        assert_eq!(double_first_name(&["A-B", "C-D", "E"], &[0xff; 32]), "E-E");
+        assert_eq!(double_name(&["A-B", "C-D", "E"], &[0xff; 32]), "E-E");
     }
 
     #[test]

@@ -15,6 +15,10 @@ pub const CONFIG_FILE: &str = "config/pseudofy.toml";
 
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each bool is one top-level setting of the TOML config file"
+)]
 pub struct Config {
     pub language: Language,
     #[serde(default = "default_email_subdomains")]
@@ -28,6 +32,9 @@ pub struct Config {
     /// Each fake first name is two first names joined with `-` (spec 0022).
     #[serde(default)]
     pub two_first_names: bool,
+    /// Each fake last name is two last names joined with `-` (spec 0024).
+    #[serde(default)]
+    pub two_last_names: bool,
     #[serde(default, rename = "rule")]
     pub rules: Vec<Rule>,
 }
@@ -160,9 +167,16 @@ language = "{}"
 # Fake first names.
 # false: one fake first name, for example "Lukas".
 # true:  two fake first names joined with "-", for example "Lukas-Maximilian".
-#        Two persons then share a fake full name far less often.
-#        A change of this setting changes each fake first name.
+#        Two persons with the same last name then share a fake full name far
+#        less often. A change of this setting changes each fake first name.
 # two_first_names = false
+
+# Fake last names.
+# false: one fake last name, for example "Berger".
+# true:  two fake last names joined with "-", for example "Berger-Wagner".
+#        Two persons with the same first name then share a fake full name far
+#        less often. A change of this setting changes each fake last name.
+# two_last_names = false
 
 # Known names in other text cells (not in the name columns).
 # "tokens": replace full names and single first or last names.
@@ -260,6 +274,7 @@ mod tests {
             free_text: FreeText::Tokens,
             copy_other_files: false,
             two_first_names: false,
+            two_last_names: false,
             rules: vec![Rule {
                 files: vec!["**/*.csv".to_owned(), "**/*.xlsx".to_owned()],
                 files_excluded: Vec::new(),
@@ -324,6 +339,7 @@ mod tests {
             "free_text",
             "copy_other_files",
             "two_first_names",
+            "two_last_names",
             "files",
             "files_excluded",
             "first_name",

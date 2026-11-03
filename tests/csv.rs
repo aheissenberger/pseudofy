@@ -1677,3 +1677,32 @@ fn two_first_names_are_the_same_in_name_columns_and_free_text() {
         "{initial}"
     );
 }
+
+#[test]
+fn two_last_names_are_the_same_in_name_columns_and_free_text() {
+    let dir = TempDir::new().unwrap();
+    write_file(dir.path(), "secrets/pseudofy.key", &format!("{KEY_A}\n"));
+    let config = config(None).replace(
+        "language = \"de\"\n",
+        "language = \"de\"\ntwo_last_names = true\n",
+    );
+    write_file(dir.path(), "config/pseudofy.toml", &config);
+    write_file(
+        dir.path(),
+        "people.csv",
+        "first_name,last_name,name,note\n\
+         Zorbina,Quenzel,Zorbina Quenzel,Termin mit Zorbina Quenzel\n",
+    );
+    let (out, _) = run_ok(dir.path());
+    let table = rows(&read(out.path(), "people.csv"), ',');
+    let first = &column(&table, "first_name")[0];
+    let last = &column(&table, "last_name")[0];
+    assert!(!first.contains('-'), "{first}");
+    let (a, b) = last.split_once('-').unwrap();
+    assert!(a != b && !b.contains('-'), "{last}");
+    assert_eq!(column(&table, "name")[0], format!("{first} {last}"));
+    assert_eq!(
+        column(&table, "note")[0],
+        format!("Termin mit {first} {last}")
+    );
+}
