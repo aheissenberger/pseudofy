@@ -74,6 +74,7 @@ pub fn scrub(input: &[u8], output: &[u8]) -> anyhow::Result<Vec<u8>> {
 const WORKBOOK: &str = "xl/workbook.xml";
 const WORKBOOK_RELS: &str = "xl/_rels/workbook.xml.rels";
 const CONTENT_TYPES: &str = "[Content_Types].xml";
+const STYLES: &str = "xl/styles.xml";
 const REL_NS: &str = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 const PACKAGE_REL_NS: &str = "http://schemas.openxmlformats.org/package/2006/relationships";
 const EXTERNAL_LINK_REL: &str =
@@ -338,7 +339,8 @@ fn sheet_refs(workbook: &[u8]) -> Result<Vec<(String, String)>, Failure> {
         match reader.read_event_into(&mut buf)? {
             Event::Start(start) | Event::Empty(start) if is_name(&start, b"sheet") => {
                 let name = attr(&start, b"name")?.ok_or("missing name")?;
-                let id = attr(&start, b"id")?.ok_or("missing id")?;
+                // The id as the crate reads it (exact `r:id` first).
+                let id = crate_sheet_id(&start).ok_or("missing id")?;
                 sheets.push((name, id));
             }
             Event::Eof => return Ok(sheets),
@@ -821,6 +823,7 @@ fn skip_to_end(reader: &mut Reader<&[u8]>) -> Result<(), Failure> {
 const MAX_ENTRIES: usize = 10_000;
 const MAX_RELATIONSHIPS: usize = 10_000;
 const MAX_DEPTH: usize = 16;
+const MAX_SHEETS: usize = 4_096;
 const MAX_BYTES: u64 = 512 * 1024 * 1024;
 /// Limit for the work of the case-insensitive part lookups of the crate
 /// (name comparisons in total).
@@ -832,6 +835,7 @@ const TOO_LARGE: &str = "workbook is too large";
 const CYCLE: &str = "workbook has a relationship cycle";
 const TOO_DEEP: &str = "workbook has relationships nested too deeply";
 const NAMES: &str = "workbook has ambiguous part names";
+const TOO_MANY_SHEETS: &str = "workbook has too many sheets";
 const SHEET_IDS: &str = "workbook lists one relationship for two sheets";
 
 /// Normalized part name: `\` becomes `/`, ASCII lowercase.
@@ -920,10 +924,12 @@ struct Rel {
 
 /// True if the crate, which reads attribute values without unescaping, reads
 /// the same text as the parser: no character that the written escape changes.
+/// A `>` is refused too: the crate reads an entity of it (`&gt;`) in a part
+/// name as written, so a name could point to two different parts.
 fn plain_text(text: &str) -> bool {
     !text
         .chars()
-        .any(|c| matches!(c, '&' | '<' | '"') || c.is_control())
+        .any(|c| matches!(c, '&' | '<' | '>' | '"') || c.is_control())
 }
 
 /// The values of one `<Relationship>`: only the exact, unprefixed names count
@@ -1012,9 +1018,10 @@ fn rel_entries(xml: &[u8], limit: usize) -> Result<Vec<Rel>, &'static str> {
 }
 
 fn escape_attr(text: &str) -> String {
+    // A bare `>` is legal in an attribute value, and the crate reads the
+    // value as written: no `&gt;` here.
     text.replace('&', "&amp;")
         .replace('<', "&lt;")
-        .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
 
@@ -1069,9 +1076,14 @@ fn sheet_rids(workbook: &[u8]) -> Result<Vec<String>, &'static str> {
     let mut reader = Reader::from_reader(workbook);
     let mut buf = Vec::new();
     let mut ids = Vec::new();
+    let mut count = 0usize;
     loop {
         match reader.read_event_into(&mut buf).map_err(|_| UNREADABLE)? {
             Event::Start(start) | Event::Empty(start) if start.name().as_ref() == b"sheet" => {
+                count += 1;
+                if count > MAX_SHEETS {
+                    return Err(TOO_MANY_SHEETS);
+                }
                 ids.extend(crate_sheet_id(&start));
             }
             Event::Eof => return Ok(ids),
@@ -1292,6 +1304,60 @@ impl<'a> Package<'a> {
         self.walk(&child, depth, on_path)
     }
 
+    /// Estimate the memory of the crate for the shared strings, the styles,
+    /// and the sheets that it reads. Refuses more than `MAX_MEMORY`. The
+    /// sheets were counted by the walk of the relationships already.
+    fn estimate(&mut self) -> Result<(), &'static str> {
+        let Some(workbook) = self.find(WORKBOOK)? else {
+            return Ok(());
+        };
+        let xml = self.read(workbook)?;
+        let ids = sheet_rids(&xml)?;
+        drop(xml);
+        let rels_index = self.find(WORKBOOK_RELS)?.ok_or(UNREADABLE)?;
+        let rels = self.rels_of(rels_index)?;
+
+        let strings = match self.find(SHARED_STRINGS)? {
+            Some(index) => {
+                let xml = self.read(index)?;
+                shared_string_sizes(&xml)?
+            }
+            None => Vec::new(),
+        };
+        let styles = match self.find(STYLES)? {
+            Some(index) => {
+                let xml = self.read(index)?;
+                style_cost(&xml)?
+            }
+            None => StyleCost {
+                formats: Vec::new(),
+                shared: 0,
+            },
+        };
+        // The table, the style lists, and the expanded cell formats.
+        let mut total = u64::try_from(strings.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(SHARED_ITEM_OVERHEAD)
+            .saturating_add(strings.iter().map(|size| u64::from(*size)).sum::<u64>())
+            .saturating_add(styles.shared)
+            .saturating_add(styles.formats.iter().sum::<u64>());
+        if total > MAX_MEMORY {
+            return Err(TOO_LARGE);
+        }
+        let by_id: HashMap<&str, &Rel> = rels.iter().map(|rel| (rel.id.as_str(), rel)).collect();
+        for id in ids {
+            // The crate reads the target of the relationship with the id.
+            if let Some(rel) = by_id.get(id.as_str()) {
+                let target = rel.target.strip_prefix("/xl/").unwrap_or(&rel.target);
+                if let Some(index) = self.find(&join_paths("xl", target))? {
+                    let xml = self.read(index)?;
+                    sheet_cost(&xml, &strings, &styles, &mut total)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The package again, with each `.rels` part in its canonical form.
     fn canonical(&mut self) -> Result<Vec<u8>, &'static str> {
         let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
@@ -1313,6 +1379,381 @@ impl<'a> Package<'a> {
         }
         let cursor = writer.finish().map_err(|_| UNREADABLE)?;
         Ok(cursor.into_inner())
+    }
+}
+
+// ---- Memory estimate (spec 0017) ----
+//
+// `umya-spreadsheet` copies a shared string into every `t="s"` cell and the
+// whole expanded style (font, fill, border, number format) into every cell,
+// row, and column with an `s` attribute, and into every cell format. A small
+// package can need gigabytes. The estimate walks the same data as the crate:
+// it streams the shared strings, the styles, and each sheet that the crate
+// reads, and sums the bytes of the copies plus a constant per copy.
+//
+// The constants are measured on a release build of pseudofy (peak RSS of a
+// whole run, difference between a workbook with and without the copies;
+// invented workbooks with 100 000 to 500 000 objects):
+// - 5 000 `t="s"` cells of one 30 000 character string: 157 MB, so the copy
+//   costs its bytes (factor 1);
+// - 500 000 `t="s"` cells of a 10 character string: +17 MB, 34 bytes a cell;
+// - 100 000 cells with `s` (font name of 5 or 31 characters): +45 MB, 450
+//   bytes a cell, almost independent of the font name;
+// - 90 000 more cell formats: +119 MB, 1.3 KB a cell format;
+// - 480 000 more shared string items: +75 MB, 156 bytes an item.
+// The copied bytes (raw XML of font, fill, border, and number format; the
+// text of the string) are added with factor 1 to the overhead of the object.
+
+/// Refuse a package whose estimate is above 1 GiB.
+const MAX_MEMORY: u64 = 1 << 30;
+/// Limits of Excel.
+const MAX_SHARED_CHARS: usize = 32_767;
+const MAX_FONT_NAME: usize = 31;
+const MAX_FORMAT_CHARS: usize = 255;
+/// Items of one list of the styles (fonts, fills, borders, formats, cell formats).
+const MAX_STYLE_ITEMS: usize = 1 << 20;
+/// Bytes of the crate per shared string item in the table.
+const SHARED_ITEM_OVERHEAD: u64 = 128;
+/// Bytes of the crate per cell with a shared string.
+const STRING_COPY_OVERHEAD: u64 = 48;
+/// Bytes of the crate per cell, row, or column with a copy of a style.
+const STYLE_COPY_OVERHEAD: u64 = 480;
+/// Bytes of the crate per expanded cell format.
+const STYLE_OVERHEAD: u64 = 1280;
+const LONG_TEXT: &str = "workbook has a text longer than Excel allows";
+
+/// The value of the attribute `key` (exact name, raw value), if any.
+fn exact_attr(start: &BytesStart<'_>, key: &[u8]) -> Option<String> {
+    start
+        .attributes()
+        .with_checks(false)
+        .flatten()
+        .find(|item| item.key.into_inner() == key)
+        .map(|item| String::from_utf8_lossy(&item.value).into_owned())
+}
+
+/// The size of an event in bytes, as a `u32`.
+fn span(from: u64, to: u64) -> u32 {
+    u32::try_from(to.saturating_sub(from)).unwrap_or(u32::MAX)
+}
+
+/// The bytes of each `<si>` of the shared strings. Refuses an item above
+/// 32 767 characters, and a table whose items alone are above the limit. A
+/// parse error ends the scan (the crate fails on it as well).
+fn shared_string_sizes(xml: &[u8]) -> Result<Vec<u32>, &'static str> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut sizes: Vec<u32> = Vec::new();
+    let mut depth = 0usize;
+    let mut begin = 0u64;
+    let mut in_text = false;
+    let mut chars = 0usize;
+    loop {
+        let before = reader.buffer_position();
+        let Ok(event) = reader.read_event_into(&mut buf) else {
+            return Ok(sizes);
+        };
+        let after = reader.buffer_position();
+        match &event {
+            Event::Start(start) => {
+                if depth == 1 && is_name(start, b"si") {
+                    begin = before;
+                    chars = 0;
+                } else if depth >= 2 && is_name(start, b"t") {
+                    in_text = true;
+                }
+                depth += 1;
+            }
+            Event::Empty(start) if depth == 1 && is_name(start, b"si") => {
+                sizes.push(span(before, after));
+            }
+            Event::End(end) => {
+                depth = depth.saturating_sub(1);
+                if depth == 1 && end.local_name().as_ref() == b"si" {
+                    sizes.push(span(begin, after));
+                }
+                if end.local_name().as_ref() == b"t" {
+                    in_text = false;
+                }
+            }
+            Event::Text(text) if in_text => {
+                chars += text.decode().map_or(text.len(), |s| s.chars().count());
+            }
+            Event::CData(data) if in_text => chars += data.len(),
+            Event::GeneralRef(_) if in_text => chars += 1,
+            Event::Eof => return Ok(sizes),
+            _ => {}
+        }
+        if chars > MAX_SHARED_CHARS {
+            return Err(LONG_TEXT);
+        }
+        if u64::try_from(sizes.len())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(SHARED_ITEM_OVERHEAD)
+            > MAX_MEMORY
+        {
+            return Err(TOO_LARGE);
+        }
+        buf.clear();
+    }
+}
+
+/// What the styles cost in the crate.
+struct StyleCost {
+    /// The expanded size of each cell format (a copy per cell with `s`).
+    formats: Vec<u64>,
+    /// The bytes of the fonts, fills, borders, and number formats, once.
+    shared: u64,
+}
+
+/// Which list of the styles an element belongs to.
+#[derive(Clone, Copy, PartialEq)]
+enum Section {
+    None,
+    NumFmts,
+    Fonts,
+    Fills,
+    Borders,
+    CellXfs,
+}
+
+/// The id of `key` in `start`, 0 if missing or not a number.
+fn style_id(start: &BytesStart<'_>, key: &[u8]) -> usize {
+    exact_attr(start, key)
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
+/// The lists of the styles with the bytes of each item.
+#[derive(Default)]
+struct StyleLists {
+    section: Option<Section>,
+    /// Start of the font, fill, or border that is open.
+    begin: u64,
+    formats: HashMap<usize, u64>,
+    fonts: Vec<u64>,
+    fills: Vec<u64>,
+    borders: Vec<u64>,
+    xfs: Vec<[usize; 4]>,
+}
+
+impl StyleLists {
+    fn list(&mut self) -> Option<&mut Vec<u64>> {
+        match self.section? {
+            Section::Fonts => Some(&mut self.fonts),
+            Section::Fills => Some(&mut self.fills),
+            Section::Borders => Some(&mut self.borders),
+            _ => None,
+        }
+    }
+
+    /// An element at `depth` (the number of open elements); `size` is its
+    /// start tag in bytes, `before` its offset.
+    fn element(
+        &mut self,
+        depth: usize,
+        start: &BytesStart<'_>,
+        (before, size, empty): (u64, u64, bool),
+    ) -> Result<(), &'static str> {
+        let name = start.local_name();
+        let name = name.as_ref();
+        match (depth, self.section) {
+            (1, _) => {
+                self.section = Some(match name {
+                    b"numFmts" => Section::NumFmts,
+                    b"fonts" => Section::Fonts,
+                    b"fills" => Section::Fills,
+                    b"borders" => Section::Borders,
+                    b"cellXfs" => Section::CellXfs,
+                    _ => Section::None,
+                });
+            }
+            (2, Some(Section::NumFmts)) if name == b"numFmt" => {
+                let code = exact_attr(start, b"formatCode").unwrap_or_default();
+                if code.chars().count() > MAX_FORMAT_CHARS {
+                    return Err(LONG_TEXT);
+                }
+                self.formats.insert(style_id(start, b"numFmtId"), size);
+            }
+            (2, Some(Section::CellXfs)) if name == b"xf" => {
+                self.xfs.push([
+                    style_id(start, b"numFmtId"),
+                    style_id(start, b"fontId"),
+                    style_id(start, b"fillId"),
+                    style_id(start, b"borderId"),
+                ]);
+            }
+            (2, Some(Section::Fonts | Section::Fills | Section::Borders)) => {
+                self.begin = before;
+                if empty && let Some(list) = self.list() {
+                    list.push(size);
+                }
+            }
+            (3, Some(Section::Fonts)) if name == b"name" => {
+                let value = exact_attr(start, b"val").unwrap_or_default();
+                if value.chars().count() > MAX_FONT_NAME {
+                    return Err(LONG_TEXT);
+                }
+            }
+            _ => {}
+        }
+        if empty && depth == 1 {
+            self.section = None;
+        }
+        Ok(())
+    }
+
+    /// An end tag; `depth` is the number of elements that stay open.
+    fn close(&mut self, depth: usize, after: u64) {
+        let size = after.saturating_sub(self.begin);
+        if depth == 2 {
+            if let Some(list) = self.list() {
+                list.push(size);
+            }
+        } else if depth == 1 {
+            self.section = None;
+        }
+    }
+
+    fn too_long(&self) -> bool {
+        [
+            self.fonts.len(),
+            self.fills.len(),
+            self.borders.len(),
+            self.xfs.len(),
+            self.formats.len(),
+        ]
+        .iter()
+        .any(|len| *len > MAX_STYLE_ITEMS)
+    }
+
+    fn finish(self) -> StyleCost {
+        let at = |list: &[u64], index: usize| list.get(index).copied().unwrap_or(0);
+        let shared = [&self.fonts, &self.fills, &self.borders]
+            .iter()
+            .flat_map(|list| list.iter())
+            .sum::<u64>()
+            + self.formats.values().sum::<u64>();
+        let formats = self
+            .xfs
+            .iter()
+            .map(|[format, font, fill, border]| {
+                STYLE_OVERHEAD
+                    + self.formats.get(format).copied().unwrap_or(0)
+                    + at(&self.fonts, *font)
+                    + at(&self.fills, *fill)
+                    + at(&self.borders, *border)
+            })
+            .collect();
+        StyleCost { formats, shared }
+    }
+}
+
+/// Estimate the styles. Refuses a font name above 31 characters and a number
+/// format above 255 characters. A parse error ends the scan.
+fn style_cost(xml: &[u8]) -> Result<StyleCost, &'static str> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut lists = StyleLists::default();
+    let mut depth = 0usize;
+    loop {
+        let before = reader.buffer_position();
+        let Ok(event) = reader.read_event_into(&mut buf) else {
+            break;
+        };
+        let after = reader.buffer_position();
+        match &event {
+            Event::Start(start) | Event::Empty(start) => {
+                let empty = matches!(event, Event::Empty(_));
+                lists.element(depth, start, (before, after.saturating_sub(before), empty))?;
+                if !empty {
+                    depth += 1;
+                }
+            }
+            Event::End(_) => {
+                depth = depth.saturating_sub(1);
+                lists.close(depth, after);
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        if lists.too_long() {
+            return Err(TOO_LARGE);
+        }
+        buf.clear();
+    }
+    Ok(lists.finish())
+}
+
+/// Add the copies that the crate makes for the cells, rows, and columns of
+/// one sheet to `total`. A parse error ends the scan.
+fn sheet_cost(
+    xml: &[u8],
+    strings: &[u32],
+    styles: &StyleCost,
+    total: &mut u64,
+) -> Result<(), &'static str> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut shared_cell = false;
+    let mut in_value = false;
+    let add = |bytes: u64, total: &mut u64| -> Result<(), &'static str> {
+        *total = total.saturating_add(bytes);
+        if *total > MAX_MEMORY {
+            return Err(TOO_LARGE);
+        }
+        Ok(())
+    };
+    let style_of = |start: &BytesStart<'_>, key: &[u8]| -> Option<u64> {
+        let index = exact_attr(start, key)?.trim().parse::<usize>().ok()?;
+        Some(styles.formats.get(index).copied().unwrap_or(0))
+    };
+    loop {
+        let Ok(event) = reader.read_event_into(&mut buf) else {
+            return Ok(());
+        };
+        match &event {
+            Event::Start(start) | Event::Empty(start) => {
+                let opens = matches!(event, Event::Start(_));
+                let key: &[u8] = match start.name().as_ref() {
+                    b"c" | b"row" => b"s",
+                    b"col" => b"style",
+                    b"v" => {
+                        in_value = opens;
+                        buf.clear();
+                        continue;
+                    }
+                    _ => {
+                        buf.clear();
+                        continue;
+                    }
+                };
+                if let Some(bytes) = style_of(start, key) {
+                    add(STYLE_COPY_OVERHEAD + bytes, total)?;
+                }
+                if start.name().as_ref() == b"c" {
+                    shared_cell = opens && exact_attr(start, b"t").as_deref() == Some("s");
+                }
+            }
+            Event::End(end) => {
+                in_value = false;
+                if end.name().as_ref() == b"c" {
+                    shared_cell = false;
+                }
+            }
+            Event::Text(text) if in_value && shared_cell => {
+                let index = text
+                    .decode()
+                    .ok()
+                    .and_then(|text| text.trim().parse::<usize>().ok());
+                if let Some(bytes) = index.and_then(|index| strings.get(index)) {
+                    add(STRING_COPY_OVERHEAD + u64::from(*bytes), total)?;
+                }
+            }
+            Event::Eof => return Ok(()),
+            _ => {}
+        }
+        buf.clear();
     }
 }
 
@@ -1360,6 +1801,7 @@ fn check(package: &[u8]) -> Result<Vec<u8>, &'static str> {
             pkg.visit("xl", target, 1, &mut on_path)?;
         }
     }
+    pkg.estimate()?;
     pkg.canonical()
 }
 
@@ -1375,8 +1817,9 @@ pub fn check_package(package: &[u8]) -> anyhow::Result<Vec<u8>> {
 }
 
 /// The normalized part names of the sheets that the workbook lists.
-/// Empty if the workbook or its relationships cannot be read.
-fn listed_sheets(archive: &mut ZipArchive<Cursor<&[u8]>>) -> HashSet<String> {
+/// Empty if the workbook or its relationships are missing. `None` if they
+/// cannot be parsed.
+fn listed_sheets(archive: &mut ZipArchive<Cursor<&[u8]>>) -> Option<HashSet<String>> {
     let mut workbook = None;
     let mut rels = None;
     for index in 0..archive.len() {
@@ -1393,7 +1836,7 @@ fn listed_sheets(archive: &mut ZipArchive<Cursor<&[u8]>>) -> HashSet<String> {
         read_limited(archive.by_index(index?).ok()?).ok()
     };
     let (Some(workbook), Some(rels)) = (read(workbook), read(rels)) else {
-        return HashSet::new();
+        return Some(HashSet::new());
     };
     let listed = || -> Result<HashSet<String>, Failure> {
         let targets = rel_map(&rels)?;
@@ -1406,7 +1849,7 @@ fn listed_sheets(archive: &mut ZipArchive<Cursor<&[u8]>>) -> HashSet<String> {
         }
         Ok(parts)
     };
-    listed().unwrap_or_default()
+    listed().ok()
 }
 
 /// What `inspect` finds in an input package.
@@ -1433,11 +1876,15 @@ struct SheetFlags {
 pub fn inspect(package: &[u8]) -> anyhow::Result<Inspection> {
     let bad = || anyhow!("cannot inspect the workbook package");
     let mut archive = ZipArchive::new(Cursor::new(package)).map_err(|_| bad())?;
-    let listed = listed_sheets(&mut archive);
     let mut comments = false;
     let mut charts = false;
     let mut flags = SheetFlags::default();
+    // A workbook that cannot be parsed hides its sheets: unsupported.
     let mut unsupported = false;
+    let listed = listed_sheets(&mut archive).unwrap_or_else(|| {
+        unsupported = true;
+        HashSet::new()
+    });
     for index in 0..archive.len() {
         let mut file = archive.by_index(index).map_err(|_| bad())?;
         let name = fold(file.name());
