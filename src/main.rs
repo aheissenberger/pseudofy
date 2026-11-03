@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 use crate::config::CONFIG_FILE;
 use crate::key::KEY_FILE;
 use crate::locale::Language;
+use crate::pseudonym::Collisions;
 
 /// Stable pseudonymization of names and email addresses in CSV and XLSX files.
 #[derive(Parser)]
@@ -93,6 +94,20 @@ fn init(project: &Path, language: Option<Language>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The warning for the collisions of a run, by kind (spec 0022).
+fn collision_warning(c: Collisions) -> Option<String> {
+    (c.total() > 0).then(|| {
+        format!(
+            "warning: {} collisions (persons: {}, emails: {}, email domains: {}): \
+             different real values got one pseudonym by chance",
+            c.total(),
+            c.persons,
+            c.emails,
+            c.domains
+        )
+    })
+}
+
 fn run(project: &Path, out: &Path) -> anyhow::Result<()> {
     let summary = run::run(project, out)?;
     let copied = summary
@@ -106,13 +121,35 @@ fn run(project: &Path, out: &Path) -> anyhow::Result<()> {
     };
     println!(
         "files: {}, replaced values: {}, collisions: {}{copied}{excluded}",
-        summary.files, summary.replaced, summary.collisions
+        summary.files,
+        summary.replaced,
+        summary.collisions.total()
     );
-    if summary.collisions > 0 {
-        eprintln!("warning: two or more real values share one pseudonym");
+    if let Some(warning) = collision_warning(summary.collisions) {
+        eprintln!("{warning}");
     }
     if summary.failed > 0 {
         bail!("{} file(s) failed; see the messages above", summary.failed);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn collision_warning_gives_each_kind_and_the_cause() {
+        assert_eq!(collision_warning(Collisions::default()), None);
+        let c = Collisions {
+            persons: 16,
+            emails: 1,
+            domains: 0,
+        };
+        assert_eq!(
+            collision_warning(c).unwrap(),
+            "warning: 17 collisions (persons: 16, emails: 1, email domains: 0): \
+             different real values got one pseudonym by chance"
+        );
+    }
 }

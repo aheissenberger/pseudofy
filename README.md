@@ -129,6 +129,20 @@ Make `files` broad and `files_excluded` narrow. Use `name/**` to exclude a direc
 Add one `[[rule]]` for each group of files with other header texts.
 With `copy_other_files = true`, a glob in `files_excluded` that is too broad copies real data files unchanged. Check the `copied unchanged` lines after each run.
 
+Collisions:
+
+pseudofy picks each fake value from the project key and the real value. Two different real values can get the same fake value by chance.
+The summary counts these collisions. The warning gives the count for each kind:
+
+```
+warning: 17 collisions (persons: 16, emails: 1, email domains: 0): different real values got one pseudonym by chance
+```
+
+- A collision does not reveal a real value. In the output, two persons look like one person. A count of persons or a join on the name can then be wrong.
+- With the German name lists (about 3.1 million full names), 10 000 persons give about 16 person collisions. 10 000 emails in one domain give about 0.2 email collisions.
+- `two_first_names = true` reduces person collisions to about 0.01 for 10 000 persons. Each fake first name then has two names, for example `Lukas-Maximilian`. A change of this setting changes each fake first name of the project.
+- Use the email column to tell persons apart in an analysis of the output.
+
 Rules for `--out`:
 
 - `--out` must not be inside `secrets/` or `config/` of the project.
@@ -146,6 +160,9 @@ The config format changes. A config from 0.2.0 fails with an error.
 - New: `files_excluded` in each rule (spec 0021).
 - An excluded CSV or XLSX file is handled like an other file (ADR-0014).
 - The warning for a file that no rule matches names the `files` setting.
+- Each fake email changes: the local part ends with two digits, for example `sophie.wagner42@` (ADR-0015). The fake names do not change. Run the project again and replace the old output.
+- New: `two_first_names` gives each fake first name a second first name, for example `Lukas-Maximilian` (spec 0022).
+- The collision warning gives the count for each kind: persons, emails, email domains.
 
 ### 0.2.0
 

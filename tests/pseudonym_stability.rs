@@ -111,7 +111,7 @@ fn german_pseudonyms_with_email_subdomains_are_stable() {
     check(
         "de",
         true,
-        "first_name,last_name,name,email\nNora,Wuest,Burkhart Herde,juli.langer@vuralahego.example.com\nBurkhart,Herde,Rolf G.,jan-hendrik.link@datosizazu.example.com\nNora,Herde,Nora Wuest,jean.grossmann@vuralahego.example.com\n",
+        "first_name,last_name,name,email\nNora,Wuest,Burkhart Herde,juli.langer42@vuralahego.example.com\nBurkhart,Herde,Rolf G.,jan-hendrik.link67@datosizazu.example.com\nNora,Herde,Nora Wuest,jean.grossmann46@vuralahego.example.com\n",
     );
 }
 
@@ -120,7 +120,7 @@ fn german_pseudonyms_without_email_subdomains_are_stable() {
     check(
         "de",
         false,
-        "first_name,last_name,name,email\nNora,Wuest,Burkhart Herde,juli.langer@example.com\nBurkhart,Herde,Rolf G.,jan-hendrik.link@example.com\nNora,Herde,Nora Wuest,jean.grossmann@example.com\n",
+        "first_name,last_name,name,email\nNora,Wuest,Burkhart Herde,juli.langer42@example.com\nBurkhart,Herde,Rolf G.,jan-hendrik.link67@example.com\nNora,Herde,Nora Wuest,jean.grossmann46@example.com\n",
     );
 }
 
@@ -129,7 +129,7 @@ fn english_pseudonyms_with_email_subdomains_are_stable() {
     check(
         "en",
         true,
-        "first_name,last_name,name,email\nMona,Salter,Bradley Vaughn,booker.rader@vuralahego.example.com\nBradley,Vaughn,Orville G.,jerome.cameron@datosizazu.example.com\nMona,Vaughn,Mona Salter,shelley.donnelly@vuralahego.example.com\n",
+        "first_name,last_name,name,email\nMona,Salter,Bradley Vaughn,booker.rader42@vuralahego.example.com\nBradley,Vaughn,Orville G.,jerome.cameron67@datosizazu.example.com\nMona,Vaughn,Mona Salter,shelley.donnelly46@vuralahego.example.com\n",
     );
 }
 
@@ -138,6 +138,6 @@ fn english_pseudonyms_without_email_subdomains_are_stable() {
     check(
         "en",
         false,
-        "first_name,last_name,name,email\nMona,Salter,Bradley Vaughn,booker.rader@example.com\nBradley,Vaughn,Orville G.,jerome.cameron@example.com\nMona,Vaughn,Mona Salter,shelley.donnelly@example.com\n",
+        "first_name,last_name,name,email\nMona,Salter,Bradley Vaughn,booker.rader42@example.com\nBradley,Vaughn,Orville G.,jerome.cameron67@example.com\nMona,Vaughn,Mona Salter,shelley.donnelly46@example.com\n",
     );
 }

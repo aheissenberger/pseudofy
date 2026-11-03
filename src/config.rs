@@ -25,6 +25,9 @@ pub struct Config {
     /// Copy other files (not CSV or XLSX) unchanged to the output (spec 0014).
     #[serde(default)]
     pub copy_other_files: bool,
+    /// Each fake first name is two first names joined with `-` (spec 0022).
+    #[serde(default)]
+    pub two_first_names: bool,
     #[serde(default, rename = "rule")]
     pub rules: Vec<Rule>,
 }
@@ -154,6 +157,13 @@ language = "{}"
 # false: each fake email uses example.com.
 # email_subdomains = true
 
+# Fake first names.
+# false: one fake first name, for example "Lukas".
+# true:  two fake first names joined with "-", for example "Lukas-Maximilian".
+#        Two persons then share a fake full name far less often.
+#        A change of this setting changes each fake first name.
+# two_first_names = false
+
 # Known names in other text cells (not in the name columns).
 # "tokens": replace full names and single first or last names.
 # "full":   replace only complete full names.
@@ -249,6 +259,7 @@ mod tests {
             email_subdomains: true,
             free_text: FreeText::Tokens,
             copy_other_files: false,
+            two_first_names: false,
             rules: vec![Rule {
                 files: vec!["**/*.csv".to_owned(), "**/*.xlsx".to_owned()],
                 files_excluded: Vec::new(),
@@ -312,6 +323,7 @@ mod tests {
             "email_subdomains",
             "free_text",
             "copy_other_files",
+            "two_first_names",
             "files",
             "files_excluded",
             "first_name",
