@@ -1,7 +1,7 @@
 # Feature Delta Spec: Two last names
 
 **Date:** 2026-11-03
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/specs/0022-fewer-pseudonym-collisions.md` · `docs/adr/0003-derive-pseudonyms-with-a-keyed-hash.md`
 
