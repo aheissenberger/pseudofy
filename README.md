@@ -50,7 +50,7 @@ Homebrew checks the SHA256 of the download and adds no quarantine attribute.
 Download the binary from the GitHub release:
 
 ```sh
-version=0.1.0
+version=0.2.0
 asset="pseudofy-${version}-aarch64-apple-darwin.tar.gz"
 curl -LO "https://github.com/aheissenberger/pseudofy/releases/download/v${version}/${asset}"
 curl -LO "https://github.com/aheissenberger/pseudofy/releases/download/v${version}/${asset}.sha256"
