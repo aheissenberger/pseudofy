@@ -2210,3 +2210,282 @@ fn package_with_one_600_mib_entry_fails_at_once() {
     assert!(start.elapsed() < std::time::Duration::from_secs(10));
     assert!(stderr.contains("too large"), "{stderr}");
 }
+
+// ---- Third review (spec 0017, 2026-11-03) ----
+
+/// The valid book with `edit` applied to the text of its parts.
+fn edited_book(edit: impl Fn(&str, &str) -> Option<String>) -> Vec<u8> {
+    repackage(&real_book_bytes(), str::to_owned, edit, &[])
+}
+
+/// `run_hostile`, and the run must end within `seconds`.
+fn run_hostile_within(hostile: &[u8], seconds: u64) -> String {
+    let start = std::time::Instant::now();
+    let stderr = run_hostile(hostile);
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(seconds),
+        "took {:?}",
+        start.elapsed()
+    );
+    stderr
+}
+
+#[test]
+fn greater_than_in_a_target_cannot_hide_a_cycle() {
+    // The sheet is `s&gt;1.xml` in the archive. The package writer escaped
+    // `>` as `&gt;` and the crate read it raw: it walked another graph than
+    // the check and overflowed its stack on the loop of this sheet.
+    for (part, rels_part) in [
+        (
+            "xl/worksheets/s&gt;1.xml",
+            "xl/worksheets/_rels/s&gt;1.xml.rels",
+        ),
+        ("xl/worksheets/s>1.xml", "xl/worksheets/_rels/s>1.xml.rels"),
+    ] {
+        let bytes = repackage(
+            &real_book_bytes(),
+            |name| {
+                if name == "xl/worksheets/sheet1.xml" {
+                    part.to_owned()
+                } else {
+                    name.to_owned()
+                }
+            },
+            |name, text| {
+                (name == "xl/_rels/workbook.xml.rels")
+                    .then(|| text.replace("worksheets/sheet1.xml", "worksheets/s>1.xml"))
+            },
+            &[(
+                rels_part.to_owned(),
+                rels_xml(&[("drawing", "s>1.xml".to_owned())]),
+            )],
+        );
+        let stderr = run_hostile_within(&bytes, 10);
+        assert!(!stderr.contains("overflow"), "{part}: {stderr}");
+    }
+}
+
+/// The book with the shared strings `sst`, the styles `styles` and the rows
+/// `rows` (the content of `<sheetData>`).
+fn custom_book(sst: &str, styles: &str, rows: &str) -> Vec<u8> {
+    edited_book(|name, text| match name {
+        "xl/sharedStrings.xml" => Some(sst.to_owned()),
+        "xl/styles.xml" => Some(styles.to_owned()),
+        "xl/worksheets/sheet1.xml" => {
+            let start = text.find("<sheetData>")? + "<sheetData>".len();
+            let end = text.find("</sheetData>")?;
+            Some(format!("{}{rows}{}", &text[..start], &text[end..]))
+        }
+        _ => None,
+    })
+}
+
+const STYLES_HEAD: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><styleSheet xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\">";
+
+fn sst_of(text: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><sst xmlns=\"http://schemas.openxmlformats.org/spreadsheetml/2006/main\"><si><t>{text}</t></si></sst>"
+    )
+}
+
+/// Styles with one font, `fill`, one border, and `xfs` cell formats; format 1
+/// uses the fill 1.
+fn styles_of(font_name: &str, fill: &str, format_code: &str, xfs: usize) -> String {
+    let formats = if format_code.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<numFmts count=\"1\"><numFmt numFmtId=\"164\" formatCode=\"{format_code}\"/></numFmts>"
+        )
+    };
+    format!(
+        "{STYLES_HEAD}{formats}<fonts count=\"1\"><font><sz val=\"11\"/><name val=\"{font_name}\"/></font></fonts>\
+         <fills count=\"2\"><fill><patternFill patternType=\"none\"/></fill><fill>{fill}</fill></fills>\
+         <borders count=\"1\"><border><left/><right/><top/><bottom/><diagonal/></border></borders>\
+         <cellXfs count=\"{xfs}\">{}</cellXfs></styleSheet>",
+        "<xf numFmtId=\"0\" fontId=\"0\" fillId=\"1\" borderId=\"0\" xfId=\"0\"/>".repeat(xfs)
+    )
+}
+
+/// `count` rows with one cell each; `attrs` goes into the cell.
+fn cell_rows(count: usize, attrs: &str, value: &str) -> String {
+    use std::fmt::Write as _;
+    (1..=count).fold(String::new(), |mut text, row| {
+        write!(
+            text,
+            "<row r=\"{row}\"><c r=\"A{row}\"{attrs}><v>{value}</v></c></row>"
+        )
+        .unwrap();
+        text
+    })
+}
+
+const PLAIN_FILL: &str = "<patternFill patternType=\"gray125\"/>";
+
+/// A header row and a data row (inline strings), then `extra` cells in row 3.
+fn valid_rows(extra: &str) -> String {
+    format!(
+        "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>name</t></is></c><c r=\"B1\" t=\"inlineStr\"><is><t>email</t></is></c></row>\
+         <row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><t>Zorbina Quenzel</t></is></c><c r=\"B2\" t=\"inlineStr\"><is><t>zorbina@acme.test</t></is></c></row>\
+         <row r=\"3\">{extra}</row>"
+    )
+}
+
+#[test]
+fn four_mib_shared_string_in_2000_cells_is_refused_without_an_abort() {
+    // The crate copies the text into each cell: 8 GB.
+    let text = "q".repeat(4 * 1024 * 1024);
+    let bytes = custom_book(
+        &sst_of(&text),
+        &styles_of("Calibri", PLAIN_FILL, "", 2),
+        &cell_rows(2_000, " t=\"s\"", "0"),
+    );
+    let stderr = run_hostile_within(&bytes, 10);
+    assert!(stderr.contains("longer than Excel allows"), "{stderr}");
+}
+
+#[test]
+fn shared_string_above_32767_characters_is_refused_and_32767_is_not() {
+    let rows = cell_rows(1, " t=\"s\"", "0");
+    let styles = styles_of("Calibri", PLAIN_FILL, "", 2);
+    let bytes = custom_book(&sst_of(&"q".repeat(32_768)), &styles, &rows);
+    let stderr = run_hostile(&bytes);
+    assert!(stderr.contains("longer than Excel allows"), "{stderr}");
+
+    // A character that the text writes as an entity counts once.
+    let entities = "&amp;".repeat(32_768);
+    let bytes = custom_book(&sst_of(&entities), &styles, &rows);
+    let stderr = run_hostile(&bytes);
+    assert!(stderr.contains("longer than Excel allows"), "{stderr}");
+
+    let dir = project(None);
+    fs::write(
+        dir.path().join("mappe.xlsx"),
+        custom_book(
+            &sst_of(&"q".repeat(32_767)),
+            &styles,
+            &valid_rows("<c r=\"C3\" t=\"s\"><v>0</v></c>"),
+        ),
+    )
+    .unwrap();
+    let (out, _, _) = run_ok(dir.path());
+    assert!(out.path().join("mappe.xlsx").exists());
+}
+
+#[test]
+fn shared_string_copies_above_one_gib_are_refused() {
+    // 40 000 cells with a 32 000 character string: 1.3 GB of copies, from a
+    // package of a few hundred KiB.
+    let bytes = custom_book(
+        &sst_of(&"q".repeat(32_000)),
+        &styles_of("Calibri", PLAIN_FILL, "", 2),
+        &cell_rows(40_000, " t=\"s\"", "0"),
+    );
+    assert!(bytes.len() < 1024 * 1024, "{}", bytes.len());
+    let stderr = run_hostile_within(&bytes, 10);
+    assert!(stderr.contains("workbook is too large"), "{stderr}");
+}
+
+#[test]
+fn four_mib_font_name_in_2000_cell_formats_is_refused_without_an_abort() {
+    let text = "f".repeat(4 * 1024 * 1024);
+    let bytes = custom_book(
+        &sst_of("x"),
+        &styles_of(&text, PLAIN_FILL, "", 2_000),
+        &cell_rows(2_000, " s=\"1\"", "1"),
+    );
+    let stderr = run_hostile_within(&bytes, 10);
+    assert!(stderr.contains("longer than Excel allows"), "{stderr}");
+}
+
+#[test]
+fn font_name_and_number_format_limits_of_excel_are_refused() {
+    let rows = cell_rows(1, " s=\"1\"", "1");
+    for (font, format_code) in [
+        ("f".repeat(32), String::new()),
+        ("Calibri".to_owned(), "0".repeat(256)),
+    ] {
+        let bytes = custom_book(
+            &sst_of("x"),
+            &styles_of(&font, PLAIN_FILL, &format_code, 2),
+            &rows,
+        );
+        let stderr = run_hostile(&bytes);
+        assert!(stderr.contains("longer than Excel allows"), "{stderr}");
+    }
+    // The limits themselves are valid.
+    let dir = project(None);
+    fs::write(
+        dir.path().join("mappe.xlsx"),
+        custom_book(
+            &sst_of("x"),
+            &styles_of(&"f".repeat(31), PLAIN_FILL, &"0".repeat(255), 2),
+            &valid_rows("<c r=\"C3\" s=\"1\"><v>1</v></c>"),
+        ),
+    )
+    .unwrap();
+    let (out, _, _) = run_ok(dir.path());
+    assert!(out.path().join("mappe.xlsx").exists());
+}
+
+#[test]
+fn cell_formats_that_expand_above_one_gib_are_refused() {
+    // A 1 MiB fill in the format of 1 200 cells: 1.2 GB of copies.
+    let fill = format!(
+        "<patternFill patternType=\"gray125\"/><!--{}-->",
+        "a".repeat(1 << 20)
+    );
+    let bytes = custom_book(
+        &sst_of("x"),
+        &styles_of("Calibri", &fill, "", 2),
+        &cell_rows(1_200, " s=\"1\"", "1"),
+    );
+    assert!(bytes.len() < 1024 * 1024, "{}", bytes.len());
+    let stderr = run_hostile_within(&bytes, 10);
+    assert!(stderr.contains("workbook is too large"), "{stderr}");
+}
+
+#[test]
+fn many_sheet_elements_fail_fast() {
+    use std::fmt::Write as _;
+    let sheets = (0..100_000).fold(String::new(), |mut text, index| {
+        write!(
+            text,
+            "<sheet name=\"S{index}\" sheetId=\"{}\" r:id=\"x{index}\"/>",
+            index + 2
+        )
+        .unwrap();
+        text
+    });
+    let bytes = edited_book(|name, text| {
+        (name == "xl/workbook.xml")
+            .then(|| text.replace("</sheets>", &format!("{sheets}</sheets>")))
+    });
+    let stderr = run_hostile_within(&bytes, 10);
+    assert!(stderr.contains("workbook has too many sheets"), "{stderr}");
+}
+
+#[test]
+fn decoy_id_attribute_does_not_hide_a_sheet_from_the_layout_check() {
+    // The crate reads `r:id`; `id="rId9"` before it must not change which
+    // sheet pseudofy scans for the two-run inline string.
+    let sheet = sheet_with(concat!(
+        "<row r=\"1\"><c r=\"A1\" t=\"inlineStr\"><is><t>name</t></is></c></row>",
+        "<row r=\"2\"><c r=\"A2\" t=\"inlineStr\"><is><r><t>Zorbina</t></r><r><t> Quenzel</t></r></is></c></row>"
+    ));
+    for decoy in ["", " id=\"rId9\""] {
+        let moved = moved_sheet("xl/data/s.xml", "data/s.xml", &sheet);
+        let bytes = repackage(
+            &moved,
+            str::to_owned,
+            |name, text| {
+                (name == "xl/workbook.xml")
+                    .then(|| text.replace("r:id=\"rId1\"", &format!("{decoy} r:id=\"rId1\"")))
+            },
+            &[],
+        );
+        let dir = project(None);
+        fs::write(dir.path().join("mappe.xlsx"), bytes).unwrap();
+        run_refused(&dir, "mappe.xlsx");
+    }
+}
