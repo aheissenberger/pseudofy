@@ -1,7 +1,7 @@
 # Feature Delta Spec: Fewer pseudonym collisions
 
 **Date:** 2026-11-03
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/adr/0003-derive-pseudonyms-with-a-keyed-hash.md` · `docs/adr/0015-add-two-digits-to-fake-emails.md` · `docs/specs/0019-text-normalization.md` · `docs/specs/0021-rule-file-lists-and-exclusions.md`
 
