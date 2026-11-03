@@ -380,11 +380,12 @@ fn formula_and_number_cells_stay_and_run_reports_the_formula_count() {
     sheet.cell_mut("C3").set_value_number(2);
     sheet.cell_mut("C4").set_formula("SUM(C2:C3)");
     save(&book, dir.path(), "mappe.xlsx");
-    let (out, stdout, _) = run_ok(dir.path());
+    let (out, stdout, stderr) = run_ok(dir.path());
     assert!(
-        stdout.contains("mappe.xlsx: 1 formula cells unchanged"),
-        "stdout: {stdout}"
+        stderr.contains("warning: mappe.xlsx: 1 formula cells unchanged"),
+        "stderr: {stderr}"
     );
+    assert!(!stdout.contains("formula cells"), "stdout: {stdout}");
     let copy = open(out.path(), "mappe.xlsx");
     let sheet = copy.sheet_by_name("Daten").unwrap();
     assert_eq!(sheet.cell("C4").unwrap().formula(), "SUM(C2:C3)");
@@ -2487,5 +2488,222 @@ fn decoy_id_attribute_does_not_hide_a_sheet_from_the_layout_check() {
         let dir = project(None);
         fs::write(dir.path().join("mappe.xlsx"), bytes).unwrap();
         run_refused(&dir, "mappe.xlsx");
+    }
+}
+
+// ---- Spec 0018: warnings for parts that keep text, and hyperlink targets ----
+
+/// The `not pseudonymized` warning line of a run.
+fn kinds_line(stderr: &str) -> String {
+    stderr
+        .lines()
+        .find(|line| line.contains("not pseudonymized"))
+        .unwrap_or_default()
+        .to_owned()
+}
+
+/// Runs a project with `mappe.xlsx` made from `book`; returns the output
+/// directory and the warning line.
+fn warning_of(book: &Workbook) -> (TempDir, String) {
+    let dir = project(None);
+    save(book, dir.path(), "mappe.xlsx");
+    let (out, _, stderr) = run_ok(dir.path());
+    assert_no_leak(&stderr, "stderr");
+    assert_well_formed(&out.path().join("mappe.xlsx"));
+    (out, kinds_line(&stderr))
+}
+
+#[test]
+fn formula_with_text_gets_the_formulas_warning() {
+    let mut book = simple_book("Zorbina Quenzel", "zorbina@acme.test");
+    book.sheet_by_name_mut("Daten")
+        .unwrap()
+        .cell_mut("C2")
+        .set_formula("\"Tamsorin \"&\"Velgrad\"");
+    let (out, line) = warning_of(&book);
+    assert!(line.contains("mappe.xlsx"), "line: {line}");
+    assert!(line.contains("formulas"), "line: {line}");
+    // The formula text stays (out of scope); the warning is the only note.
+    let copy = open(out.path(), "mappe.xlsx");
+    let sheet = copy.sheet_by_name("Daten").unwrap();
+    assert!(sheet.cell("C2").unwrap().formula().contains("Velgrad"));
+}
+
+#[test]
+fn text_box_in_a_drawing_gets_the_drawings_warning() {
+    let bytes = real_book_bytes();
+    let drawing = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\" xmlns:a=\"http://schemas.openxmlformats.org/drawingml/2006/main\"><xdr:twoCellAnchor><xdr:from><xdr:col>3</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>1</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:from><xdr:to><xdr:col>6</xdr:col><xdr:colOff>0</xdr:colOff><xdr:row>5</xdr:row><xdr:rowOff>0</xdr:rowOff></xdr:to><xdr:sp macro=\"\" textlink=\"\"><xdr:nvSpPr><xdr:cNvPr id=\"2\" name=\"Box 1\"/><xdr:cNvSpPr txBox=\"1\"/></xdr:nvSpPr><xdr:spPr><a:xfrm><a:off x=\"0\" y=\"0\"/><a:ext cx=\"0\" cy=\"0\"/></a:xfrm><a:prstGeom prst=\"rect\"><a:avLst/></a:prstGeom></xdr:spPr><xdr:txBody><a:bodyPr/><a:lstStyle/><a:p><a:r><a:rPr lang=\"de-DE\"/><a:t>Ansprechpartner Tamsorin Velgrad</a:t></a:r></a:p></xdr:txBody></xdr:sp><xdr:clientData/></xdr:twoCellAnchor></xdr:wsDr>".to_owned();
+    let rels = rels_xml(&[("drawing", "../drawings/drawing1.xml".to_owned())]);
+    let types = "<Override PartName=\"/xl/drawings/drawing1.xml\" ContentType=\"application/vnd.openxmlformats-officedocument.drawing+xml\"/></Types>";
+    let edited = repackage(
+        &bytes,
+        str::to_owned,
+        |name, text| {
+            match name {
+            "[Content_Types].xml" => Some(text.replacen("</Types>", types, 1)),
+            "xl/worksheets/sheet1.xml" => Some(text.replacen(
+                "</worksheet>",
+                "<drawing xmlns:r=\"http://schemas.openxmlformats.org/officeDocument/2006/relationships\" r:id=\"rId1\"/></worksheet>",
+                1,
+            )),
+            _ => None,
+        }
+        },
+        &[
+            ("xl/drawings/drawing1.xml".to_owned(), drawing),
+            ("xl/worksheets/_rels/sheet1.xml.rels".to_owned(), rels),
+        ],
+    );
+    let dir = project(None);
+    fs::write(dir.path().join("mappe.xlsx"), edited).unwrap();
+    let (out, _, stderr) = run_ok(dir.path());
+    assert_well_formed(&out.path().join("mappe.xlsx"));
+    let line = kinds_line(&stderr);
+    assert!(line.contains("drawings"), "stderr: {stderr}");
+    assert_no_leak(&stderr, "stderr");
+}
+
+#[test]
+fn table_with_a_total_label_gets_the_tables_warning() {
+    let mut book = simple_book("Zorbina Quenzel", "zorbina@acme.test");
+    let sheet = book.sheet_by_name_mut("Daten").unwrap();
+    let mut table = umya_spreadsheet::Table::new("Tabelle1", ("A1", "B3"));
+    let mut name = umya_spreadsheet::TableColumn::new("name");
+    name.set_totals_row_label("Summe Quenzel");
+    table.add_column(name);
+    table.add_column(umya_spreadsheet::TableColumn::new("email"));
+    table.set_totals_row_count(1);
+    sheet.add_table(table);
+    let (_out, line) = warning_of(&book);
+    assert!(line.contains("tables"), "line: {line}");
+}
+
+#[test]
+fn number_format_with_literal_text_gets_the_number_formats_warning() {
+    let mut book = simple_book("Zorbina Quenzel", "zorbina@acme.test");
+    let sheet = book.sheet_by_name_mut("Daten").unwrap();
+    sheet.cell_mut("C2").set_value_number(5);
+    sheet
+        .cell_mut("C2")
+        .style_mut()
+        .number_format_mut()
+        .set_format_code("\"Quenzel-Format \"0");
+    let (_out, line) = warning_of(&book);
+    assert!(line.contains("number formats"), "line: {line}");
+}
+
+#[test]
+fn plain_number_format_gives_no_number_formats_warning() {
+    let mut book = simple_book("Zorbina Quenzel", "zorbina@acme.test");
+    let sheet = book.sheet_by_name_mut("Daten").unwrap();
+    sheet.cell_mut("C2").set_value_number(5);
+    sheet
+        .cell_mut("C2")
+        .style_mut()
+        .number_format_mut()
+        .set_format_code("#,##0.00");
+    let (_out, line) = warning_of(&book);
+    assert!(!line.contains("number formats"), "line: {line}");
+}
+
+#[test]
+fn embedded_object_gets_the_embedded_objects_warning() {
+    let mut book = simple_book("Zorbina Quenzel", "zorbina@acme.test");
+    let sheet = book.sheet_by_name_mut("Daten").unwrap();
+    let mut object = umya_spreadsheet::OleObject::default();
+    object.set_prog_id("Package");
+    object.set_object_extension("bin");
+    object.set_object_data(b"Tamsorin Velgrad".to_vec());
+    sheet.ole_objects_mut().set_ole_object(object);
+    let dir = project(None);
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, stderr) = run_ok(dir.path());
+    let parts = package_parts(&fs::read(out.path().join("mappe.xlsx")).unwrap());
+    let kept = parts
+        .iter()
+        .any(|(name, _)| name.starts_with("xl/embeddings/"));
+    // The warning follows the written package: it names the kind exactly
+    // when the copy still holds the object.
+    let line = kinds_line(&stderr);
+    assert_eq!(line.contains("embedded objects"), kept, "stderr: {stderr}");
+    assert!(kept, "umya dropped the embedded object");
+}
+
+/// Runs a workbook whose cell B2 has the hyperlink `url`; returns the url of
+/// the copy and the text of the cell.
+fn hyperlink_copy(url: &str) -> (String, String) {
+    let dir = project(None);
+    let mut book = simple_book("Zorbina Quenzel", "zorbina.quenzel@acme.test");
+    let mut link = umya_spreadsheet::Hyperlink::default();
+    link.set_url(url);
+    book.sheet_by_name_mut("Daten")
+        .unwrap()
+        .cell_mut("B2")
+        .set_hyperlink(link);
+    save(&book, dir.path(), "mappe.xlsx");
+    let (out, _, stderr) = run_ok(dir.path());
+    assert_no_leak(&stderr, "stderr");
+    assert_well_formed(&out.path().join("mappe.xlsx"));
+    let copy = open(out.path(), "mappe.xlsx");
+    let cell = copy.sheet_by_name("Daten").unwrap().cell("B2").unwrap();
+    let target = cell
+        .hyperlink()
+        .map(|link| link.url().to_string())
+        .unwrap_or_default();
+    (target, cell.value().to_string())
+}
+
+fn assert_valid_url(url: &str) {
+    assert!(
+        url.bytes().all(|b| b.is_ascii_graphic()) && !url.contains(['"', '<', '>']),
+        "url: {url}"
+    );
+}
+
+#[test]
+fn mailto_with_display_name_gets_a_fake_name_and_address() {
+    for url in [
+        "mailto:\"Zorbina Quenzel\" <zorbina.quenzel@acme.test>",
+        "mailto:%22Zorbina%20Quenzel%22%20%3Czorbina.quenzel%40acme.test%3E",
+    ] {
+        let (target, fake) = hyperlink_copy(url);
+        assert_valid_url(&target);
+        assert_no_leak(&target, "url");
+        assert!(target.starts_with("mailto:%22"), "url: {target}");
+        assert!(target.contains("%3C"), "url: {target}");
+        assert!(target.contains(&fake), "url: {target}");
+    }
+}
+
+#[test]
+fn url_with_a_name_in_the_query_gets_the_known_name_replaced() {
+    let (target, _) =
+        hyperlink_copy("https://intranet.acme.test/people/zorbina-quenzel?u=Zorbina%20Quenzel");
+    assert_valid_url(&target);
+    assert!(
+        target.starts_with("https://intranet.acme.test/people/"),
+        "url: {target}"
+    );
+    assert!(target.contains("?u="), "url: {target}");
+    assert!(!target.contains("Quenzel"), "url: {target}");
+    assert!(!target.contains("Zorbina"), "url: {target}");
+}
+
+#[test]
+fn url_with_an_email_in_the_path_gets_the_address_replaced() {
+    let (target, fake) = hyperlink_copy("https://x.example.org/user/zorbina.quenzel%40acme.test/");
+    assert_valid_url(&target);
+    assert!(target.contains(&fake), "url: {target}");
+    assert!(target.ends_with('/'), "url: {target}");
+}
+
+#[test]
+fn url_without_a_name_or_email_stays_byte_identical() {
+    for url in [
+        "https://example.org/a%20b/c?x=1&y=%C3%A4#frag",
+        "https://example.org/plain",
+    ] {
+        let (target, _) = hyperlink_copy(url);
+        assert_eq!(target, url);
     }
 }

@@ -286,7 +286,7 @@ fn process_xlsx(
 ) -> anyhow::Result<(usize, usize)> {
     let stats = xlsx_file::process(input, out, target, rel, rules, pseudonymizer, cells)?;
     if stats.formulas > 0 {
-        println!("{rel}: {} formula cells unchanged", stats.formulas);
+        eprintln!("warning: {rel}: {} formula cells unchanged", stats.formulas);
     }
     if stats.rich_text > 0 {
         eprintln!(

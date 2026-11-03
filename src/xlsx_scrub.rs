@@ -1867,6 +1867,14 @@ struct SheetFlags {
     validations: bool,
     headers: bool,
     conditional: bool,
+    parts: SheetParts,
+}
+
+/// Cell formulas and embedded objects of a worksheet.
+#[derive(Default)]
+struct SheetParts {
+    formulas: bool,
+    ole: bool,
 }
 
 /// Inspect a package: unsupported layouts and unprocessed parts. Part names
@@ -1878,6 +1886,10 @@ pub fn inspect(package: &[u8]) -> anyhow::Result<Inspection> {
     let mut archive = ZipArchive::new(Cursor::new(package)).map_err(|_| bad())?;
     let mut comments = false;
     let mut charts = false;
+    let mut drawings = false;
+    let mut tables = false;
+    let mut formats = false;
+    let mut embedded = false;
     let mut flags = SheetFlags::default();
     // A workbook that cannot be parsed hides its sheets: unsupported.
     let mut unsupported = false;
@@ -1896,6 +1908,19 @@ pub fn inspect(package: &[u8]) -> anyhow::Result<Inspection> {
         if name.starts_with("xl/charts/") {
             charts = true;
         }
+        if name.starts_with("xl/embeddings/") {
+            embedded = true;
+        }
+        if name.starts_with("xl/drawings/") && is_xml(&name) {
+            let xml = read_limited(&mut file).map_err(|_| bad())?;
+            drawings |= drawing_has_text(&xml).map_err(|_| bad())?;
+        } else if name.starts_with("xl/tables/") && is_xml(&name) {
+            let xml = read_limited(&mut file).map_err(|_| bad())?;
+            tables |= table_has_totals(&xml).map_err(|_| bad())?;
+        } else if name == STYLES {
+            let xml = read_limited(&mut file).map_err(|_| bad())?;
+            formats |= styles_have_literal_text(&xml).map_err(|_| bad())?;
+        }
         if name == SHARED_STRINGS.to_ascii_lowercase() {
             let xml = read_limited(&mut file).map_err(|_| bad())?;
             if root_has_prefix(&xml).map_err(|_| bad())? {
@@ -1913,12 +1938,85 @@ pub fn inspect(package: &[u8]) -> anyhow::Result<Inspection> {
         (flags.validations, "data validations"),
         (flags.headers, "headers/footers"),
         (flags.conditional, "conditional formatting"),
+        (flags.parts.formulas, "formulas"),
+        (drawings, "drawings"),
+        (tables, "tables"),
+        (formats, "number formats"),
+        (embedded || flags.parts.ole, "embedded objects"),
     ] {
         if present {
             kinds.push(kind);
         }
     }
     Ok(Inspection { unsupported, kinds })
+}
+
+/// True if a drawing part has text in an `a:t` element.
+fn drawing_has_text(xml: &[u8]) -> Result<bool, quick_xml::Error> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    let mut in_text = false;
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(start) => in_text = start.local_name().as_ref() == b"t",
+            Event::End(_) => in_text = false,
+            Event::Text(text) if in_text => {
+                if text.decode().map_or(true, |t| !t.trim().is_empty()) {
+                    return Ok(true);
+                }
+            }
+            Event::CData(_) if in_text => return Ok(true),
+            Event::Eof => return Ok(false),
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
+/// True if a table part has a total label or a total or calculated formula.
+fn table_has_totals(xml: &[u8]) -> Result<bool, Failure> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(start) | Event::Empty(start) => {
+                let local = start.local_name();
+                let local = local.as_ref();
+                if local == b"totalsRowFormula" || local == b"calculatedColumnFormula" {
+                    return Ok(true);
+                }
+                if local == b"tableColumn"
+                    && attr(&start, b"totalsRowLabel")?.is_some_and(|label| !label.is_empty())
+                {
+                    return Ok(true);
+                }
+            }
+            Event::Eof => return Ok(false),
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
+/// True if a number format of the styles part has literal text: quoted text
+/// or a backslash-escaped character.
+fn styles_have_literal_text(xml: &[u8]) -> Result<bool, Failure> {
+    let mut reader = Reader::from_reader(xml);
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf)? {
+            Event::Start(start) | Event::Empty(start) => {
+                if start.local_name().as_ref() == b"numFmt"
+                    && attr(&start, b"formatCode")?.is_some_and(|code| code.contains(['"', '\\']))
+                {
+                    return Ok(true);
+                }
+            }
+            Event::Eof => return Ok(false),
+            _ => {}
+        }
+        buf.clear();
+    }
 }
 
 /// True if the root element has a namespace prefix.
@@ -1964,6 +2062,10 @@ fn scan_sheet(xml: &[u8], flags: &mut SheetFlags) -> Result<bool, quick_xml::Err
                     flags.validations = true;
                 } else if local == b"cfRule" {
                     flags.conditional = true;
+                } else if local == b"f" {
+                    flags.parts.formulas = true;
+                } else if local == b"oleObject" {
+                    flags.parts.ole = true;
                 } else if local == b"is" {
                     in_inline = true;
                     runs = 0;
@@ -1981,6 +2083,10 @@ fn scan_sheet(xml: &[u8], flags: &mut SheetFlags) -> Result<bool, quick_xml::Err
                     flags.validations = true;
                 } else if local == b"cfRule" {
                     flags.conditional = true;
+                } else if local == b"f" {
+                    flags.parts.formulas = true;
+                } else if local == b"oleObject" {
+                    flags.parts.ole = true;
                 } else if local == b"r" && in_inline {
                     runs += 1;
                     multi_run |= runs > 1;

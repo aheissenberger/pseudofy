@@ -7,18 +7,18 @@ use std::path::Path;
 
 use anyhow::{Context, anyhow};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
-use regex::Regex;
 use umya_spreadsheet::{CellRawValue, Workbook, reader, writer};
 
 use crate::cells::{
-    CellFns, ColRole, Collector, Columns, EmailFn, HEADER_SEARCH_ROWS, HeaderPick, Kind,
-    collect_columns, failing_rule, header_count, pick_header, role_of, transform_cell,
+    CellFns, ColRole, Collector, Columns, HEADER_SEARCH_ROWS, HeaderPick, Kind, collect_columns,
+    failing_rule, header_count, pick_header, replace_spans, role_of, transform_cell,
     transform_text_cell, write_output,
 };
 use crate::config::Rule;
 use crate::known_names::KnownNames;
 use crate::panic_guard;
 use crate::pseudonym::Pseudonymizer;
+use crate::text::{self, NameRole};
 use crate::xlsx_scrub;
 
 /// Counts for one processed workbook.
@@ -147,18 +147,6 @@ pub fn process(
     Ok(result.stats)
 }
 
-/// Replace each email in `value` through the email pseudonym.
-fn replace_in_text(
-    value: &str,
-    email_regex: &Regex,
-    emails: EmailFn,
-    replace: &mut dyn FnMut(Kind, &str) -> String,
-) -> String {
-    emails(value, email_regex, &mut |address| {
-        replace(Kind::Email, address)
-    })
-}
-
 /// Percent-decode `text` as UTF-8. An invalid escape stays as it is; if the
 /// result is not UTF-8, `text` is returned unchanged.
 fn percent_decode(text: &str) -> String {
@@ -185,42 +173,95 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8(out).unwrap_or_else(|_| text.to_owned())
 }
 
-/// The new url of a hyperlink. A `mailto:` url is decoded, cut at the first
-/// `?`, and its addresses are replaced; other urls only get the replacement.
-fn new_url(
+/// Percent-encode `text`. Letters, digits, and the characters that a url
+/// keeps in a path, a query, or a mailto address stay as they are.
+fn percent_encode(text: &str) -> String {
+    const KEEP: &str = "-._~!$'()*+,;:@";
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(text.len());
+    for &byte in text.as_bytes() {
+        if byte.is_ascii_alphanumeric() || KEEP.as_bytes().contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push('%');
+            out.push(char::from(HEX[usize::from(byte >> 4)]));
+            out.push(char::from(HEX[usize::from(byte & 15)]));
+        }
+    }
+    out
+}
+
+/// A `mailto:` url: decoded, cut at the first `?`. The display name gets the
+/// full-name pseudonym, the addresses the email pseudonym; the result is encoded.
+fn new_mailto(rest: &str, fns: &CellFns, replace: &mut dyn FnMut(Kind, &str) -> String) -> String {
+    let decoded = percent_decode(rest);
+    let address = decoded.split('?').next().unwrap_or_default();
+    let spans = text::email_spans(address, fns.email_regex);
+    let new = replace_spans(address, &spans, fns.names, NameRole::Full, replace);
+    format!("mailto:{}", percent_encode(&new))
+}
+
+/// Any other url: each segment (between `/ ? & = # ;`) is decoded and gets the
+/// free-text replacement. A changed segment is encoded again; an unchanged
+/// one stays byte for byte.
+fn new_plain_url(
     url: &str,
-    email_regex: &Regex,
-    emails: EmailFn,
+    fns: &CellFns,
     replace: &mut dyn FnMut(Kind, &str) -> String,
 ) -> String {
+    let is_delimiter = |c: char| matches!(c, '/' | '?' | '&' | '=' | '#' | ';');
+    let mut out = String::with_capacity(url.len());
+    let mut segment = String::new();
+    let mut flush = |segment: &mut String, out: &mut String| {
+        if segment.is_empty() {
+            return;
+        }
+        let decoded = percent_decode(segment);
+        let mut free = 0;
+        let new = transform_cell(&decoded, None, fns, replace, &mut free);
+        if new == decoded {
+            out.push_str(segment);
+        } else {
+            out.push_str(&percent_encode(&new));
+        }
+        segment.clear();
+    };
+    for c in url.chars() {
+        if is_delimiter(c) {
+            flush(&mut segment, &mut out);
+            out.push(c);
+        } else {
+            segment.push(c);
+        }
+    }
+    flush(&mut segment, &mut out);
+    out
+}
+
+/// The new url of a hyperlink.
+fn new_url(url: &str, fns: &CellFns, replace: &mut dyn FnMut(Kind, &str) -> String) -> String {
     const SCHEME: &str = "mailto:";
     if url.len() >= SCHEME.len()
         && url.is_char_boundary(SCHEME.len())
         && url[..SCHEME.len()].eq_ignore_ascii_case(SCHEME)
     {
-        let decoded = percent_decode(&url[SCHEME.len()..]);
-        let address = decoded.split('?').next().unwrap_or_default();
-        format!(
-            "{SCHEME}{}",
-            replace_in_text(address, email_regex, emails, replace)
-        )
+        new_mailto(&url[SCHEME.len()..], fns, replace)
     } else {
-        replace_in_text(url, email_regex, emails, replace)
+        new_plain_url(url, fns, replace)
     }
 }
 
-/// Replace the emails in the url of the hyperlink of `cell` and clear its
-/// tooltip.
+/// Replace the names and emails in the url of the hyperlink of `cell` and
+/// clear its tooltip.
 fn scrub_hyperlink(
     cell: &mut umya_spreadsheet::Cell,
-    email_regex: &Regex,
-    emails: EmailFn,
+    fns: &CellFns,
     replace: &mut dyn FnMut(Kind, &str) -> String,
 ) {
     let Some(link) = cell.hyperlink() else {
         return;
     };
-    let url = new_url(link.url(), email_regex, emails, replace);
+    let url = new_url(link.url(), fns, replace);
     if url != link.url() || !link.tooltip().is_empty() {
         let link = cell.hyperlink_mut();
         link.set_url(url);
@@ -286,7 +327,6 @@ fn transform(
     mut collect: Option<&mut Collector>,
     rel: &str,
 ) -> anyhow::Result<Transformed> {
-    let (email_regex, emails) = (fns.email_regex, fns.emails);
     let matchers = sheet_rules(rules)?;
     let mut stats = XlsxStats::default();
     let names: Vec<String> = book
@@ -342,7 +382,7 @@ fn transform(
                 }
                 continue;
             }
-            scrub_hyperlink(cell, email_regex, emails, replace);
+            scrub_hyperlink(cell, fns, replace);
             if cell.is_formula() {
                 if header_row.is_none_or(|header| row > header) {
                     stats.formulas += 1;
