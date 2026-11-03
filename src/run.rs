@@ -79,7 +79,8 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
 
     let email_regex = text::email_regex()?;
     let mut pseudonymizer = Pseudonymizer::new(&key, config.language, config.email_subdomains)
-        .with_two_first_names(config.two_first_names);
+        .with_two_first_names(config.two_first_names)
+        .with_two_last_names(config.two_last_names);
     let mut summary = Summary::default();
     let mut items: Vec<Item> = Vec::new();
     let mut others: Vec<(PathBuf, PathBuf, String)> = Vec::new();

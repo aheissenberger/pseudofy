@@ -139,8 +139,14 @@ warning: 17 collisions (persons: 16, emails: 1, email domains: 0): different rea
 ```
 
 - A collision does not reveal a real value. In the output, two persons look like one person. A count of persons or a join on the name can then be wrong.
-- With the German name lists (about 3.1 million full names), 10 000 persons give about 16 person collisions. 10 000 emails in one domain give about 0.2 email collisions.
-- `two_first_names = true` reduces person collisions to about 0.01 for 10 000 persons. Each fake first name then has two names, for example `Lukas-Maximilian`. A change of this setting changes each fake first name of the project.
+- pseudofy replaces each name part on its own. One real first name always gets one fake first name. Thus a person collision has three causes:
+  - Two persons with the same first name, if their two different last names get one fake last name. The German list has 1 887 last names.
+  - Two persons with the same last name, if their two different first names get one fake first name. The German list has 1 644 first names.
+  - Two persons with different first names and different last names, if both fake parts match.
+- With the German lists, 10 000 persons give about 45 person collisions, about 15 for each cause. 10 000 emails in one domain give about 0.2 email collisions.
+- `two_last_names = true` removes almost all collisions of the first and the third cause. Each fake last name then has two names, for example `Berger-Wagner`.
+- `two_first_names = true` removes almost all collisions of the second and the third cause. Each fake first name then has two names, for example `Lukas-Maximilian`.
+- One setting alone leaves about 15 person collisions for 10 000 persons. With both settings, about 0.02 remain. A change of a setting changes each fake first name or each fake last name of the project.
 - Use the email column to tell persons apart in an analysis of the output.
 
 Rules for `--out`:
@@ -151,6 +157,12 @@ Rules for `--out`:
 - Each copy keeps the permission bits of its input file. pseudofy warns if other users can write to `--out`. Use an output directory that only you can write to.
 
 ## Release notes
+
+### 0.4.0
+
+- New: `two_last_names` gives each fake last name a second last name, for example `Berger-Wagner` (spec 0024). With `two_first_names`, almost no person collisions remain.
+- Correction: `two_first_names` alone leaves about 15 person collisions for 10 000 persons, not about 0.01. The README of 0.3.0 gave a wrong number. Use `two_first_names` and `two_last_names` together.
+- `[profile.dev.package."*"]` optimizes the dependencies in test builds. The checks run faster (spec 0023).
 
 ### 0.3.0
 

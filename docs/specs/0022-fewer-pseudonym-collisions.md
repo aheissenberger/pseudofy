@@ -3,7 +3,7 @@
 **Date:** 2026-11-03
 **Status:** done
 **Author:** Claude (agent)
-**Related:** `docs/adr/0003-derive-pseudonyms-with-a-keyed-hash.md` · `docs/adr/0015-add-two-digits-to-fake-emails.md` · `docs/specs/0019-text-normalization.md` · `docs/specs/0021-rule-file-lists-and-exclusions.md`
+**Related:** `docs/specs/0024-two-last-names.md` (corrected collision numbers) · `docs/adr/0003-derive-pseudonyms-with-a-keyed-hash.md` · `docs/adr/0015-add-two-digits-to-fake-emails.md` · `docs/specs/0019-text-normalization.md` · `docs/specs/0021-rule-file-lists-and-exclusions.md`
 
 ---
 
@@ -70,5 +70,6 @@ devcontainer exec --workspace-folder . ./scripts/check
 
 ## 5. Rollback / Notes (optional)
 
-Expected collisions for 10 000 persons: emails about 16 to about 0.2. Persons with `two_first_names = true`: about 16 to about 0.01.
+Expected collisions for 10 000 persons: emails about 16 to about 0.2.
+The estimate "persons with `two_first_names = true`: about 0.01" is wrong. `two_first_names` alone leaves about 15 person collisions for 10 000 persons. Spec 0024 gives the corrected numbers and adds `two_last_names`.
 A change of `two_first_names` changes each fake first name of the project.
