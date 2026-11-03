@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, bail};
-use globset::{GlobBuilder, GlobMatcher};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use walkdir::WalkDir;
 
 use crate::cells::{CellFns, is_not_found};
@@ -29,6 +29,8 @@ pub struct Summary {
     pub failed: usize,
     /// Other files copied unchanged. `None` if `copy_other_files` is off (spec 0014).
     pub copied: Option<usize>,
+    /// CSV and XLSX files that the rules exclude (spec 0021).
+    pub excluded: usize,
 }
 
 /// Name of the marker file in an output directory inside the project.
@@ -80,24 +82,10 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
     let mut summary = Summary::default();
     let mut items: Vec<Item> = Vec::new();
     let mut others: Vec<(PathBuf, PathBuf, String)> = Vec::new();
+    let mut excluded: Vec<PathBuf> = Vec::new();
     summary.copied = config.copy_other_files.then_some(0);
 
-    // `secrets/` and `config/` are compared without case: on a case-insensitive
-    // file system (the macOS default), `Secrets/` is the same directory.
-    let walker = WalkDir::new(&project)
-        .follow_links(false)
-        .sort_by_file_name()
-        .into_iter()
-        .filter_entry(|entry| {
-            let top_dir = entry.depth() == 1
-                && ["secrets", "config"]
-                    .iter()
-                    .any(|dir| entry.file_name().eq_ignore_ascii_case(dir));
-            // A path with a component that starts with `.` is hidden: skipped.
-            let hidden = entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.');
-            !top_dir && !hidden && entry.path() != out
-        });
-    for entry in walker {
+    for entry in project_walker(&project, &out) {
         let entry = match entry {
             Ok(entry) => entry,
             Err(error) => {
@@ -129,11 +117,16 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
             }
             continue;
         }
-        let rules: Vec<&Rule> = matchers
-            .iter()
-            .filter(|(matcher, _)| matcher.is_match(&rel))
-            .map(|(_, rule)| *rule)
-            .collect();
+        let Some(rules) = matching_rules(&matchers, &rel) else {
+            // Excluded by each rule whose `files` matches: an other file (ADR-0014).
+            // It stays an input file: no output may overwrite it.
+            summary.excluded += 1;
+            excluded.push(entry.path().to_path_buf());
+            if config.copy_other_files && !is_lock_file(entry.path()) {
+                others.push((entry.path().to_path_buf(), relative.to_path_buf(), rel));
+            }
+            continue;
+        };
         if rules.is_empty() {
             eprintln!(
                 "warning: {rel}: no rule matches this path (check \"files\" in the config); only emails are replaced"
@@ -168,7 +161,7 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
         ..pass1
     };
 
-    let inputs = input_ids(&items, &others);
+    let inputs = input_ids(&items, &others, &excluded);
 
     // Pass 2: write the copies.
     write_items(
@@ -186,11 +179,16 @@ pub fn run(project: &Path, out: &Path) -> anyhow::Result<Summary> {
 }
 
 /// Identities of the walked input files: an output path must not be one of them.
-fn input_ids(items: &[Item], others: &[(PathBuf, PathBuf, String)]) -> HashSet<FileId> {
+fn input_ids(
+    items: &[Item],
+    others: &[(PathBuf, PathBuf, String)],
+    excluded: &[PathBuf],
+) -> HashSet<FileId> {
     items
         .iter()
         .map(|item| &item.path)
         .chain(others.iter().map(|(path, _, _)| path))
+        .chain(excluded)
         .filter_map(|path| file_id(path))
         .collect()
 }
@@ -222,19 +220,81 @@ fn write_items(
     }
 }
 
-/// The compiled file glob of each rule.
-fn rule_matchers(rules: &[Rule]) -> anyhow::Result<Vec<(GlobMatcher, &Rule)>> {
+/// The entries of `project` in name order, without `secrets/`, `config/`,
+/// hidden paths, and `out`. Symlinks are not followed.
+fn project_walker<'a>(
+    project: &Path,
+    out: &'a Path,
+) -> impl Iterator<Item = walkdir::Result<walkdir::DirEntry>> + 'a {
+    // `secrets/` and `config/` are compared without case: on a case-insensitive
+    // file system (the macOS default), `Secrets/` is the same directory.
+    WalkDir::new(project)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter()
+        .filter_entry(move |entry| {
+            let top_dir = entry.depth() == 1
+                && ["secrets", "config"]
+                    .iter()
+                    .any(|dir| entry.file_name().eq_ignore_ascii_case(dir));
+            // A path with a component that starts with `.` is hidden: skipped.
+            let hidden = entry.depth() > 0 && entry.file_name().to_string_lossy().starts_with('.');
+            !top_dir && !hidden && entry.path() != out
+        })
+}
+
+/// The compiled `files` and `files_excluded` globs of one rule.
+struct RuleMatcher<'a> {
+    files: GlobSet,
+    excluded: GlobSet,
+    rule: &'a Rule,
+}
+
+/// The compiled globs of each rule.
+fn rule_matchers(rules: &[Rule]) -> anyhow::Result<Vec<RuleMatcher<'_>>> {
     rules
         .iter()
         .map(|rule| {
-            let glob = GlobBuilder::new(&rule.files)
-                .case_insensitive(true)
-                .literal_separator(true)
-                .build()
-                .with_context(|| format!("invalid glob \"{}\" in the config", rule.files))?;
-            Ok((glob.compile_matcher(), rule))
+            Ok(RuleMatcher {
+                files: glob_set(&rule.files)?,
+                excluded: glob_set(&rule.files_excluded)?,
+                rule,
+            })
         })
         .collect()
+}
+
+/// One set of path globs: case is ignored, and `*` does not match `/`.
+fn glob_set(patterns: &[String]) -> anyhow::Result<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = GlobBuilder::new(pattern)
+            .case_insensitive(true)
+            .literal_separator(true)
+            .build()
+            .with_context(|| format!("invalid glob \"{pattern}\" in the config"))?;
+        builder.add(glob);
+    }
+    builder.build().context("invalid globs in the config")
+}
+
+/// The rules for `rel`: a `files` glob matches and no `files_excluded` glob
+/// matches. `None` if one or more rules have a matching `files` glob and each
+/// of them excludes `rel` (spec 0021).
+fn matching_rules<'a>(matchers: &[RuleMatcher<'a>], rel: &str) -> Option<Vec<&'a Rule>> {
+    let mut selected = false;
+    let mut rules = Vec::new();
+    for matcher in matchers.iter().filter(|m| m.files.is_match(rel)) {
+        selected = true;
+        if !matcher.excluded.is_match(rel) {
+            rules.push(matcher.rule);
+        }
+    }
+    if selected && rules.is_empty() {
+        None
+    } else {
+        Some(rules)
+    }
 }
 
 /// Pass 2 for one file. Returns the replaced values and the free-text replacements.
@@ -690,6 +750,51 @@ mod tests {
         assert!(matcher("*.csv").is_match("People.CSV"));
         assert!(!matcher("*.csv").is_match("a/people.csv"));
         assert!(matcher("**/*.csv").is_match("a/People.Csv"));
+    }
+
+    fn rule(files: &[&str], excluded: &[&str]) -> Rule {
+        let list = |globs: &[&str]| globs.iter().map(|g| (*g).to_owned()).collect();
+        Rule {
+            files: list(files),
+            files_excluded: list(excluded),
+            first_name: Vec::new(),
+            last_name: Vec::new(),
+            full_name: vec!["name".to_owned()],
+            email: Vec::new(),
+            sheets: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn file_lists_match_each_depth_and_exclusions_skip_a_rule() {
+        let rules = [
+            rule(&["**/*.csv", "**/*.xlsx"], &["archive/**", "**/*_pseudo.*"]),
+            rule(&["archive/keep/*.csv"], &[]),
+        ];
+        let matchers = rule_matchers(&rules).unwrap();
+        let count = |rel: &str| matching_rules(&matchers, rel).map(|r| r.len());
+        assert_eq!(count("a.csv"), Some(1));
+        assert_eq!(count("x/a.CSV"), Some(1));
+        assert_eq!(count("x/y/a.xlsx"), Some(1));
+        assert_eq!(count("archive/a.csv"), None);
+        assert_eq!(count("archive/old/a.xlsx"), None);
+        assert_eq!(count("x/list_pseudo.csv"), None);
+        // Rule 1 excludes it, rule 2 matches it.
+        let rules_for = matching_rules(&matchers, "archive/keep/a.csv").unwrap();
+        assert_eq!(rules_for.len(), 1);
+        assert_eq!(rules_for[0].files, ["archive/keep/*.csv"]);
+        // No `files` glob matches: no rule, not excluded.
+        assert_eq!(count("a.txt"), Some(0));
+    }
+
+    #[test]
+    fn an_invalid_excluded_glob_names_the_glob() {
+        let rules = [rule(&["**/*.csv"], &["a/[b"])];
+        let error = rule_matchers(&rules).err().unwrap();
+        assert!(
+            format!("{error:#}").contains("invalid glob \"a/[b\""),
+            "{error:#}"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # ADR-0012: Copy other project files unchanged
 
 **Date:** 2026-11-02
-**Status:** accepted
+**Status:** superseded by ADR-0014
 **Deciders:** Andreas Heissenberger
 **Related:** `docs/plan/pseudonymization.md` §2 · `docs/specs/0014-copy-other-files.md`
 

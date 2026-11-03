@@ -43,13 +43,13 @@ fn project(free_text: Option<&str>) -> TempDir {
         text.push_str(mode);
         text.push_str("\"\n");
     }
-    text.push_str("\n[[rule]]\nfiles = \"**/*.csv\"\n");
+    text.push_str("\n[[rule]]\nfiles = [\"**/*.csv\"]\n");
     text.push_str(fields);
-    text.push_str("\n[[rule]]\nfiles = \"**/people*.xlsx\"\n");
+    text.push_str("\n[[rule]]\nfiles = [\"**/people*.xlsx\"]\n");
     text.push_str(fields);
     // Notes workbooks have no person columns: a rule without header texts
     // never fails (spec 0015) and still gets the free-text replacement.
-    text.push_str("\n[[rule]]\nfiles = \"**/notes*.xlsx\"\n");
+    text.push_str("\n[[rule]]\nfiles = [\"**/notes*.xlsx\"]\n");
     write_file(dir.path(), "config/pseudofy.toml", &text);
     dir
 }
@@ -340,7 +340,7 @@ fn project_with_rule(free_text: &str, rule_lines: &str) -> TempDir {
     let dir = TempDir::new().unwrap();
     write_file(dir.path(), "secrets/pseudofy.key", &format!("{KEY}\n"));
     let text = format!(
-        "language = \"de\"\nfree_text = \"{free_text}\"\n\n[[rule]]\nfiles = \"**/*.csv\"\n{rule_lines}"
+        "language = \"de\"\nfree_text = \"{free_text}\"\n\n[[rule]]\nfiles = [\"**/*.csv\"]\n{rule_lines}"
     );
     write_file(dir.path(), "config/pseudofy.toml", &text);
     dir

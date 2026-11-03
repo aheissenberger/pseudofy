@@ -102,6 +102,33 @@ With `copy_other_files = true` in the config, `run` also copies each other file 
 pseudofy does not check these files. They can contain real names. Check each copied file before you share it.
 pseudofy skips hidden files and directories (names that start with `.`). It does not process or copy them.
 
+Rules in `config/pseudofy.toml`:
+
+- `files` is an array of globs. A rule applies to a CSV or XLSX file if one glob matches its path, relative to the project directory.
+- `files_excluded` is an array of globs. A rule does not apply to a file that one of these globs matches.
+- Case is ignored. `*` does not match `/`. `**/` matches zero or more directories, so `**/*.csv` also matches `a.csv`.
+- If each rule whose `files` matches a file also excludes it, pseudofy does not pseudonymize the file. pseudofy handles it like an other file: with `copy_other_files = true`, pseudofy copies it unchanged with its real values (ADR-0014). The summary gives the number of excluded files.
+- A file that no glob of `files` matches gets a copy with emails replaced and a warning.
+
+Recommended pattern:
+
+```toml
+[[rule]]
+files = ["**/*.csv", "**/*.xlsx"]
+files_excluded = [
+  "archive/**",     # old exports
+  "templates/**",   # empty templates
+  "**/*_pseudo.*",  # files that are already pseudonymized
+]
+first_name = ["Vorname"]
+last_name = ["Nachname"]
+email = ["E-Mail"]
+```
+
+Make `files` broad and `files_excluded` narrow. Use `name/**` to exclude a directory with its subdirectories.
+Add one `[[rule]]` for each group of files with other header texts.
+With `copy_other_files = true`, a glob in `files_excluded` that is too broad copies real data files unchanged. Check the `copied unchanged` lines after each run.
+
 Rules for `--out`:
 
 - `--out` must not be inside `secrets/` or `config/` of the project.
@@ -110,6 +137,15 @@ Rules for `--out`:
 - Each copy keeps the permission bits of its input file. pseudofy warns if other users can write to `--out`. Use an output directory that only you can write to.
 
 ## Release notes
+
+### 0.3.0
+
+The config format changes. A config from 0.2.0 fails with an error.
+
+- `files` is an array. Change `files = "**/*.csv"` to `files = ["**/*.csv"]`.
+- New: `files_excluded` in each rule (spec 0021).
+- An excluded CSV or XLSX file is handled like an other file (ADR-0014).
+- The warning for a file that no rule matches names the `files` setting.
 
 ### 0.2.0
 

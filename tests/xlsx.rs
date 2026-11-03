@@ -36,9 +36,9 @@ fn project(sheets: Option<&str>) -> TempDir {
     let fields = "first_name = [\"first_name\"]\nlast_name = [\"last_name\"]\n\
                   full_name = [\"name\"]\nemail = [\"email\"]\n";
     let mut text = String::from("language = \"de\"\n");
-    text.push_str("\n[[rule]]\nfiles = \"**/*.csv\"\n");
+    text.push_str("\n[[rule]]\nfiles = [\"**/*.csv\"]\n");
     text.push_str(fields);
-    text.push_str("\n[[rule]]\nfiles = \"**/*.xlsx\"\n");
+    text.push_str("\n[[rule]]\nfiles = [\"**/*.xlsx\"]\n");
     if let Some(sheets) = sheets {
         text.push_str("sheets = ");
         text.push_str(sheets);
@@ -916,7 +916,7 @@ fn copy_parts(bytes: &[u8]) -> Vec<(String, String)> {
     write_file(
         dir.path(),
         "config/pseudofy.toml",
-        "language = \"de\"\n\n[[rule]]\nfiles = \"*.xlsx\"\n\
+        "language = \"de\"\n\n[[rule]]\nfiles = [\"*.xlsx\"]\n\
          first_name = [\"First Name\"]\nlast_name = [\"Last Name\"]\n\
          full_name = [\"name\"]\nemail = [\"Email\", \"email\"]\n",
     );

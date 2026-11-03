@@ -56,7 +56,7 @@ fn project() -> TempDir {
     fs::create_dir_all(dir.path().join("config")).unwrap();
     fs::write(
         dir.path().join("config/pseudofy.toml"),
-        "language = \"de\"\n\n[[rule]]\nfiles = \"*.xlsx\"\n\
+        "language = \"de\"\n\n[[rule]]\nfiles = [\"*.xlsx\"]\n\
          first_name = [\"First Name\"]\nlast_name = [\"Last Name\"]\nemail = [\"Email\"]\n",
     )
     .unwrap();

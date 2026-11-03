@@ -80,7 +80,7 @@ fn pseudonymize(language: &str, email_subdomains: bool) -> String {
         "config/pseudofy.toml",
         &format!(
             "language = \"{language}\"\nemail_subdomains = {email_subdomains}\n\n\
-             [[rule]]\nfiles = \"**/*.csv\"\nfirst_name = [\"first_name\"]\n\
+             [[rule]]\nfiles = [\"**/*.csv\"]\nfirst_name = [\"first_name\"]\n\
              last_name = [\"last_name\"]\nfull_name = [\"name\"]\nemail = [\"email\"]\n"
         ),
     );
