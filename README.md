@@ -109,6 +109,28 @@ Rules for `--out`:
 - pseudofy never overwrites an input file.
 - Each copy keeps the permission bits of its input file. pseudofy warns if other users can write to `--out`. Use an output directory that only you can write to.
 
+## Release notes
+
+### 0.2.0
+
+Some pseudonyms change (ADR-0013). Run the project again and replace the old output.
+
+- These values get a new pseudonym:
+  - names with `’` or `ʼ`;
+  - names with `ß`;
+  - names with `İ`;
+  - names with an invisible format character, for example a soft hyphen;
+  - emails at a punycode domain (`xn--`);
+  - emails with `’`, `ʼ`, or `ß` in the local part;
+  - names in Greek with a final sigma (`ς`).
+
+  One spelling now gives one pseudonym in name columns and in free text. `O’Brien` and `O'Brien` give the same pseudonym. `Strauß` and `STRAUSS` give the same pseudonym.
+- In a full name, titles (`Dr.`, `Herr`), suffixes (`Jr.`, `MBA`), and lowercase particles (`van`, `von`) stay unchanged. `Last, First` keeps its order.
+- An email address does not take in the characters around it. In a URL, only an address after `?`, `&`, `=`, or `mailto:` changes.
+- A file fails if a rule finds none of its headers (spec 0015).
+- pseudofy refuses an output directory inside the project that holds other files (spec 0016).
+- pseudofy refuses hostile or very large workbooks (spec 0017).
+
 ## Development
 
 Development runs in a devcontainer. The host needs Docker and an editor.

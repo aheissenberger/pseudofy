@@ -7,6 +7,7 @@
 )]
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -1433,4 +1434,205 @@ fn csv_file_above_256_mib_is_refused_and_the_others_are_written() {
     assert!(stderr.contains("1 file(s) failed"), "stderr: {stderr}");
     assert!(!out.path().join("gross.csv").exists());
     assert!(out.path().join("gut.csv").exists());
+}
+
+// ---- Text normalization (spec 0019, ADR-0013) ----
+
+/// Writes `people.csv` with `content`, runs, and returns the output cells
+/// with stdout.
+fn run_cells(content: &str) -> (Vec<Vec<String>>, String) {
+    let dir = project(KEY_A, None, &[]);
+    write_file(dir.path(), "people.csv", content);
+    let (out, stdout) = run_ok(dir.path());
+    let mut reader = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .flexible(true)
+        .from_path(out.path().join("people.csv"))
+        .unwrap();
+    let table = reader
+        .records()
+        .map(|record| record.unwrap().iter().map(str::to_string).collect())
+        .collect();
+    (table, stdout)
+}
+
+fn same_ignoring_case(a: &str, b: &str) -> bool {
+    a.to_lowercase() == b.to_lowercase()
+}
+
+#[test]
+fn apostrophe_sharp_s_and_dotted_i_get_one_pseudonym_in_columns() {
+    let (t, _) = run_cells(
+        "first_name,last_name\n\
+         \u{130}lker,O\u{2019}Brien\n\
+         Ilker,O'Brien\n\
+         ilker,Strau\u{df}\n\
+         ILKER,STRAUSS\n\
+         \u{130}LKER,Strauss\n\
+         I\u{307}lker,O\u{2bc}Brien\n",
+    );
+    for row in 2..=6 {
+        assert!(same_ignoring_case(&t[1][0], &t[row][0]), "first {row}");
+    }
+    assert_eq!(t[1][1], t[2][1]);
+    assert_eq!(t[1][1], t[6][1]);
+    assert!(same_ignoring_case(&t[3][1], &t[4][1]));
+    assert!(same_ignoring_case(&t[3][1], &t[5][1]));
+    assert_ne!(t[1][1], t[3][1]);
+}
+
+#[test]
+fn full_name_apostrophe_forms_get_one_pseudonym() {
+    let (t, _) = run_cells(
+        "name\nTamsorin O\u{2019}Brien\ntamsorin O'BRIEN\nTamsorin Strau\u{df}\nTAMSORIN STRAUSS\n",
+    );
+    assert!(same_ignoring_case(&t[1][0], &t[2][0]));
+    assert!(same_ignoring_case(&t[3][0], &t[4][0]));
+    assert_ne!(t[1][0].to_lowercase(), t[3][0].to_lowercase());
+}
+
+#[test]
+fn format_characters_do_not_split_or_change_a_name_in_columns() {
+    let (t, _) = run_cells(
+        "first_name,last_name\n\
+         Kes\u{200b}ta,M\u{fc}\u{ad}ller\n\
+         Kesta,M\u{fc}ller\n\
+         \u{feff}Kesta,M\u{fc}l\u{2060}ler\n",
+    );
+    assert_eq!(t[1], t[2]);
+    assert_eq!(t[1], t[3]);
+    for cell in t.iter().flatten() {
+        assert!(
+            !cell.contains(['\u{ad}', '\u{200b}', '\u{feff}', '\u{2060}']),
+            "{cell:?}"
+        );
+    }
+}
+
+#[test]
+fn titles_particles_suffixes_and_comma_order_in_full_name() {
+    let (t, _) = run_cells(
+        "first_name,last_name,name\n\
+         Hans,Zorbel,Dr. Hans Zorbel\n\
+         Hans,Zorbel,\"Zorbel, Hans\"\n\
+         Ludwig,van Beethoven,Ludwig van Beethoven\n\
+         Hans,Zorbel,Prof. Dr. Hans Zorbel Jr.\n\
+         Hans,Zorbel,Hans Zorbel MBA\n\
+         Hans,Zorbel,Frau Mag. Hans Zorbel\n",
+    );
+    let (first, last) = (&t[1][0], &t[1][1]);
+    assert_eq!(t[1][2], format!("Dr. {first} {last}"));
+    assert_eq!(t[2][2], format!("{last}, {first}"));
+    // The particle stays in the last-name column and in the full name.
+    let core = t[3][1].strip_prefix("van ").unwrap();
+    assert_eq!(t[3][2], format!("{} van {core}", t[3][0]));
+    assert_eq!(t[4][2], format!("Prof. Dr. {first} {last} Jr."));
+    assert_eq!(t[5][2], format!("{first} {last} MBA"));
+    assert_eq!(t[6][2], format!("Frau Mag. {first} {last}"));
+}
+
+#[test]
+fn mailto_prefix_stays_in_an_email_column() {
+    let (t, _) = run_cells(
+        "email\n\
+         anna.zorbel@firma.test\n\
+         mailto:anna.zorbel@firma.test\n\
+         MAILTO:anna.zorbel@firma.test\n\
+         mailto:anna.zorbel@localhost\n",
+    );
+    assert_eq!(t[2][0], format!("mailto:{}", t[1][0]));
+    assert_eq!(t[3][0], format!("MAILTO:{}", t[1][0]));
+    assert!(t[4][0].starts_with("mailto:"), "{}", t[4][0]);
+    assert!(!t[4][0].contains("localhost"));
+}
+
+#[test]
+fn idn_and_punycode_domains_get_one_subdomain_label() {
+    let (t, _) = run_cells(
+        "email\n\
+         anna@b\u{e4}ckerei.test\n\
+         anna@xn--bckerei-5wa.test\n\
+         bernd@B\u{c4}CKEREI.test\n\
+         anna@other.test\n",
+    );
+    assert_eq!(t[1][0], t[2][0]);
+    let domain = |row: usize| t[row][0].split_once('@').unwrap().1.to_string();
+    assert_eq!(domain(1), domain(3));
+    assert_ne!(domain(1), domain(4));
+}
+
+#[test]
+fn email_column_address_with_punctuation_is_one_address() {
+    let (t, _) = run_cells(
+        "email\n\
+         anna.zorbel@firma.test\n\
+         anna.zorbel@firma.test!\n\
+         \"\"\"anna zorbel\"\"@firma.test\"\n\
+         anna.zorbel@localhost\n",
+    );
+    assert_eq!(format!("{}!", t[1][0]), t[2][0]);
+    for row in t.iter().skip(1) {
+        assert!(!row[0].contains("zorbel"), "{}", row[0]);
+    }
+}
+
+#[test]
+fn two_hundred_different_persons_give_no_collision() {
+    let letters = |mut n: usize| {
+        let mut s = String::new();
+        loop {
+            s.push(char::from(b'a' + u8::try_from(n % 26).unwrap()));
+            n /= 26;
+            if n == 0 {
+                break s;
+            }
+        }
+    };
+    let mut content = String::from("first_name,last_name\n");
+    for i in 0..200 {
+        writeln!(content, "vor{},nach{}", letters(i), letters(i)).unwrap();
+    }
+    let (_, stdout) = run_cells(&content);
+    assert!(stdout.contains("collisions: 0"), "{stdout}");
+}
+
+#[test]
+fn title_words_count_only_at_the_ends_of_a_full_name() {
+    let (t, _) = run_cells(
+        "first_name,last_name,name\n\
+         Anna,Herr,Anna Herr\n\
+         Kim,Mba,Kim Mba\n\
+         Lena,Ing,Lena Ing\n\
+         Zorbina,Frau,Zorbina Frau\n\
+         ,Ing,Ing\n",
+    );
+    for (row, cells) in t.iter().enumerate().take(5).skip(1) {
+        assert_eq!(cells[2], format!("{} {}", cells[0], cells[1]), "row {row}");
+    }
+    assert_eq!(t[5][2], t[5][1]);
+    for (row, real) in [(1, "Herr"), (2, "Mba"), (3, "Ing"), (4, "Frau")] {
+        assert_ne!(t[row][1], real);
+        assert_ne!(t[row][2], format!("{} {real}", t[row][0]));
+    }
+}
+
+#[test]
+fn greek_final_sigma_and_domain_sharp_s() {
+    let (t, _) = run_cells(
+        "first_name,last_name,email\n\
+         A,\u{39f}\u{394}\u{3a5}\u{3a3}\u{3a3}\u{395}\u{3a5}\u{3a3},a@stra\u{df}e.test\n\
+         A,\u{39f}\u{3b4}\u{3c5}\u{3c3}\u{3c3}\u{3b5}\u{3c5}\u{3c2},a@strasse.test\n",
+    );
+    assert!(same_ignoring_case(&t[1][1], &t[2][1]));
+    // A domain keeps `\u{df}` (IDNA2008): two domains, two labels.
+    assert_ne!(t[1][2], t[2][2]);
+}
+
+#[test]
+fn xn_label_of_400_kb_takes_less_than_a_second() {
+    let label = format!("xn--{}", "a".repeat(400_000));
+    let start = std::time::Instant::now();
+    let (t, _) = run_cells(&format!("first_name,last_name,email\nA,B,a@{label}.test\n"));
+    assert!(start.elapsed() < std::time::Duration::from_secs(30));
+    assert!(!t[1][2].contains(&label));
 }

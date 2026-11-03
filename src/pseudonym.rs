@@ -4,12 +4,11 @@ use std::collections::{HashMap, HashSet};
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
-use unicode_normalization::UnicodeNormalization;
 
 use crate::key::ProjectKey;
 use crate::locale::Language;
 use crate::names::{self, NameLists};
-use crate::text::ascii_local_part;
+use crate::text::{ascii_local_part, normalize, normalize_domain};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -40,7 +39,51 @@ impl Kind {
     }
 }
 
+/// The name tokens of the person that the last calls belong to.
+///
+/// The engine sees tokens, not rows. Calls for one person come together
+/// (`Hans Peter Meier`: first, first, last), so a new group starts when a
+/// token follows a group that has first and last tokens and the kind changes.
+#[derive(Default)]
+struct Group {
+    /// (normalized real, fake) per token. An initial is recorded under its
+    /// letter: real `j` and fake `b`.
+    firsts: Vec<(String, String)>,
+    lasts: Vec<(String, String)>,
+    last_kind: Option<Kind>,
+}
+
+impl Group {
+    /// (real key, fake key) of the person; `None` without first or last name.
+    fn keys(&self) -> Option<(String, String)> {
+        if self.firsts.is_empty() || self.lasts.is_empty() {
+            return None;
+        }
+        let join = |parts: &[(String, String)], real: bool| {
+            let words: Vec<&str> = parts
+                .iter()
+                .map(|(r, f)| if real { r.as_str() } else { f.as_str() })
+                .collect();
+            words.join(" ")
+        };
+        let key = |real: bool| {
+            format!(
+                "{}{}{}",
+                join(&self.firsts, real),
+                char::from(SEP),
+                join(&self.lasts, real)
+            )
+        };
+        Some((key(true), key(false)))
+    }
+}
+
 /// Maps real values to pseudonyms and counts the collisions of one run.
+///
+/// A collision is two different real persons (first and last name together)
+/// with one fake full name, or two different real emails (domains) with one
+/// fake email (label). Two first names with one fake first name are no
+/// collision: the output shows the fake full name.
 pub struct Pseudonymizer {
     key: [u8; BLOCK],
     lists: NameLists,
@@ -50,11 +93,103 @@ pub struct Pseudonymizer {
     /// Real values (per kind) that already count as a collision.
     counted: HashSet<(Kind, String)>,
     collisions: usize,
+    group: Group,
+    /// Fake full name (lowercase) -> the real persons that got it.
+    persons: HashMap<String, HashSet<String>>,
 }
 
-/// NFC, trim, lowercase.
-fn normalize(real: &str) -> String {
-    real.nfc().collect::<String>().trim().to_lowercase()
+/// `normalize` of an email address, with each `xn--` label of the domain
+/// converted to Unicode (`bäckerei.test` = `xn--bckerei-5wa.test`).
+fn normalize_email(real: &str) -> String {
+    let Some((local, domain)) = real.rsplit_once('@') else {
+        return normalize(real);
+    };
+    let labels: Vec<String> = normalize_domain(domain)
+        .split('.')
+        .map(|label| {
+            match label
+                .get(..4)
+                .filter(|head| head.eq_ignore_ascii_case("xn--"))
+                .and(label.get(4..))
+                .filter(|_| label.len() <= MAX_LABEL)
+                .and_then(punycode_decode)
+                .filter(|decoded| !decoded.is_empty())
+            {
+                Some(decoded) => normalize_domain(&decoded),
+                None => label.to_string(),
+            }
+        })
+        .collect();
+    format!("{}@{}", normalize(local), labels.join("."))
+}
+
+/// Longest label (in bytes) whose `xn--` form is decoded (RFC 1035). A longer
+/// label stays as it is, so the decoding costs little.
+const MAX_LABEL: usize = 63;
+
+/// Value of a punycode digit: `a`-`z` are 0-25, `0`-`9` are 26-35.
+fn punycode_digit(byte: u8) -> Option<u32> {
+    match byte {
+        b'a'..=b'z' => Some(u32::from(byte - b'a')),
+        b'A'..=b'Z' => Some(u32::from(byte - b'A')),
+        b'0'..=b'9' => Some(u32::from(byte - b'0') + 26),
+        _ => None,
+    }
+}
+
+/// Bias adaptation of RFC 3492 section 6.1.
+fn punycode_adapt(delta: u32, count: u32, first: bool) -> u32 {
+    let mut delta = if first { delta / 700 } else { delta / 2 };
+    delta += delta / count.max(1);
+    let mut k = 0;
+    while delta > 455 {
+        delta /= 35;
+        k += 36;
+    }
+    k + 36 * delta / (delta + 38)
+}
+
+/// Decode the punycode of a label without the `xn--` prefix (RFC 3492).
+/// `None` for an invalid or too large input.
+fn punycode_decode(input: &str) -> Option<String> {
+    let (basic, extended) = input.rsplit_once('-').unwrap_or(("", input));
+    if !basic.is_ascii() {
+        return None;
+    }
+    let mut out: Vec<char> = basic.chars().collect();
+    let (mut code, mut pos, mut bias) = (128u32, 0u32, 72u32);
+    let mut digits = extended.bytes().peekable();
+    while digits.peek().is_some() {
+        let old_pos = pos;
+        let (mut weight, mut step) = (1u32, 36u32);
+        loop {
+            let digit = punycode_digit(digits.next()?)?;
+            pos = pos.checked_add(digit.checked_mul(weight)?)?;
+            let limit = if step <= bias {
+                1
+            } else if step >= bias + 26 {
+                26
+            } else {
+                step - bias
+            };
+            if digit < limit {
+                break;
+            }
+            weight = weight.checked_mul(36 - limit)?;
+            step = step.checked_add(36)?;
+        }
+        let len = u32::try_from(out.len()).ok()?.checked_add(1)?;
+        bias = punycode_adapt(pos - old_pos, len, old_pos == 0);
+        code = code.checked_add(pos / len)?;
+        pos %= len;
+        let at = usize::try_from(pos).ok()?;
+        if at > out.len() {
+            return None;
+        }
+        out.insert(at, char::from_u32(code)?);
+        pos += 1;
+    }
+    Some(out.into_iter().collect())
 }
 
 /// Big-endian u64 from 8 bytes of `bytes`, starting at `offset`.
@@ -97,6 +232,8 @@ impl Pseudonymizer {
             seen: HashMap::new(),
             counted: HashSet::new(),
             collisions: 0,
+            group: Group::default(),
+            persons: HashMap::new(),
         }
     }
 
@@ -111,6 +248,32 @@ impl Pseudonymizer {
             mac.update(attempt.to_string().as_bytes());
         }
         mac.finalize().into_bytes().into()
+    }
+
+    /// Add a name token to the current person; a finished person is recorded.
+    fn note_token(&mut self, kind: Kind, real: String, fake: String) {
+        let complete = !self.group.firsts.is_empty() && !self.group.lasts.is_empty();
+        if complete && self.group.last_kind != Some(kind) {
+            self.commit_group();
+        }
+        let list = if kind == Kind::Last {
+            &mut self.group.lasts
+        } else {
+            &mut self.group.firsts
+        };
+        list.push((real, fake));
+        self.group.last_kind = Some(kind);
+    }
+
+    /// Record the current person and count a collision with another person.
+    fn commit_group(&mut self) {
+        if let Some((real, fake)) = std::mem::take(&mut self.group).keys() {
+            let set = self.persons.entry(fake).or_default();
+            if !set.is_empty() && !set.contains(&real) {
+                self.collisions += 1;
+            }
+            set.insert(real);
+        }
     }
 
     /// Record the pseudonym and count a collision with another real value.
@@ -154,7 +317,12 @@ impl Pseudonymizer {
             }
             attempt += 1;
         };
-        self.record(kind, result, &normalized);
+        let fake = if single {
+            result.chars().take(1).collect::<String>().to_lowercase()
+        } else {
+            result.to_lowercase()
+        };
+        self.note_token(kind, normalized, fake);
         result.to_string()
     }
 
@@ -170,7 +338,7 @@ impl Pseudonymizer {
 
     /// Fake email address for one real email address.
     pub fn email(&mut self, real: &str) -> String {
-        let normalized = normalize(real);
+        let normalized = normalize_email(real);
         let domain_part = normalized
             .rsplit_once('@')
             .map_or(normalized.as_str(), |(_, d)| d)
@@ -219,7 +387,12 @@ impl Pseudonymizer {
 
     /// Number of collisions detected so far.
     pub fn collisions(&self) -> usize {
-        self.collisions
+        let open = self.group.keys().map_or(0, |(real, fake)| {
+            self.persons.get(&fake).map_or(0, |set| {
+                usize::from(!set.is_empty() && !set.contains(&real))
+            })
+        });
+        self.collisions + open
     }
 }
 
@@ -382,20 +555,189 @@ mod tests {
     }
 
     #[test]
-    fn collisions_are_counted_once_per_real_value() {
+    fn collisions_count_persons_once() {
         let mut p = engine(9, false);
-        // Only 5 first names exist: 30 distinct reals must collide.
-        for i in 0..30 {
+        // 5 first and 5 last names give 25 fake full names: 60 distinct
+        // persons must collide.
+        for i in 0..60 {
             let real = format!("person{i}");
             p.first_name(&real);
+            p.last_name(&real);
             p.first_name(&real);
+            p.last_name(&real);
         }
         let c = p.collisions();
-        assert!(c >= 25, "{c}");
-        assert!(c <= 29, "{c}");
+        assert!((35..=59).contains(&c), "{c}");
         let before = p.collisions();
         p.first_name("person0");
+        p.last_name("person0");
         assert_eq!(p.collisions(), before);
+    }
+
+    #[test]
+    fn first_name_only_collisions_are_not_counted() {
+        let mut p = engine(9, false);
+        for i in 0..60 {
+            p.first_name(&format!("person{i}"));
+        }
+        for i in 0..60 {
+            p.last_name(&format!("person{i}"));
+        }
+        assert_eq!(p.collisions(), 0);
+    }
+
+    #[test]
+    fn initial_is_recorded_under_its_letter() {
+        let mut p = engine(9, false);
+        // `J` and `K` may get fake names with one letter; the person is
+        // recorded as the letter and the last name.
+        p.first_name("j");
+        p.last_name("meier");
+        p.first_name("k");
+        p.last_name("meier");
+        p.first_name("j");
+        p.last_name("meier");
+        assert!(p.collisions() <= 1);
+        let mut q = engine(9, false);
+        q.first_name("j");
+        q.last_name("meier");
+        q.first_name("j");
+        q.last_name("meier");
+        assert_eq!(q.collisions(), 0);
+    }
+
+    #[test]
+    fn two_hundred_persons_do_not_collide() {
+        let mut p = Pseudonymizer::new(&ProjectKey::from_bytes([11; 32]), Language::De, false);
+        let letters = |mut n: usize| {
+            let mut s = String::new();
+            loop {
+                s.push(char::from(b'a' + u8::try_from(n % 26).unwrap_or(0)));
+                n /= 26;
+                if n == 0 {
+                    break s;
+                }
+            }
+        };
+        for i in 0..200 {
+            p.first_name(&format!("vor{}", letters(i)));
+            p.last_name(&format!("nach{}", letters(i)));
+        }
+        assert_eq!(p.collisions(), 0);
+    }
+
+    #[test]
+    fn colliding_emails_are_counted() {
+        let mut p = Pseudonymizer::with_lists(
+            &ProjectKey::from_bytes([1; 32]),
+            NameLists {
+                first: vec!["Anton"],
+                last: vec!["Bauer"],
+            },
+            false,
+        );
+        p.email("a@x.test");
+        assert_eq!(p.collisions(), 0);
+        p.email("b@x.test");
+        assert_eq!(p.collisions(), 1);
+        p.email("b@x.test");
+        assert_eq!(p.collisions(), 1);
+    }
+
+    #[test]
+    fn normalization_pairs_get_one_pseudonym() {
+        let mut p = engine(1, true);
+        for (a, b) in [
+            ("O\u{2019}Brien", "O'Brien"),
+            ("O\u{2bc}Brien", "o'brien"),
+            ("Strau\u{df}", "STRAUSS"),
+            ("Strau\u{df}", "Strauss"),
+            ("\u{130}lker", "Ilker"),
+            ("\u{130}lker", "ilker"),
+            ("I\u{307}lker", "ILKER"),
+            ("M\u{fc}\u{ad}ller", "M\u{fc}ller"),
+            ("Kes\u{200b}ta", "Kesta"),
+            ("\u{feff}Kesta", "kesta"),
+        ] {
+            assert_eq!(p.first_name(a), p.first_name(b), "{a} {b}");
+            assert_eq!(p.last_name(a), p.last_name(b), "{a} {b}");
+        }
+        // A domain keeps `ß` (IDNA2008).
+        assert_ne!(p.email("a@Stra\u{df}e.test"), p.email("a@STRASSE.test"));
+        assert_eq!(p.email("a@Stra\u{df}e.test"), p.email("a@STRA\u{df}E.test"));
+        assert_eq!(p.email("Stra\u{df}e@x.test"), p.email("STRASSE@x.test"));
+        assert_eq!(
+            p.last_name("\u{39f}\u{394}\u{3a5}\u{3a3}\u{3a3}\u{395}\u{3a5}\u{3a3}"),
+            p.last_name("\u{39f}\u{3b4}\u{3c5}\u{3c3}\u{3c3}\u{3b5}\u{3c5}\u{3c2}")
+        );
+    }
+
+    #[test]
+    fn idn_domains_get_one_label() {
+        let mut p = engine(1, true);
+        assert_eq!(
+            p.email("anna@b\u{e4}ckerei.test"),
+            p.email("anna@xn--bckerei-5wa.test")
+        );
+        assert_eq!(
+            p.email("anna@B\u{c4}CKEREI.test"),
+            p.email("anna@XN--bckerei-5wa.test")
+        );
+        assert_ne!(
+            p.email("anna@xn--bckerei-5wa.test"),
+            p.email("anna@other.test")
+        );
+    }
+
+    #[test]
+    fn punycode_decodes_rfc_samples() {
+        assert_eq!(
+            punycode_decode("bckerei-5wa").as_deref(),
+            Some("b\u{e4}ckerei")
+        );
+        assert_eq!(
+            punycode_decode("mnchen-3ya").as_deref(),
+            Some("m\u{fc}nchen")
+        );
+        assert_eq!(punycode_decode("maana-pta").as_deref(), Some("ma\u{f1}ana"));
+        // RFC 3492 7.1 (A) Arabic (Egyptian).
+        assert_eq!(
+            punycode_decode("egbpdaj6bu4bxfgehfvwxn").as_deref(),
+            Some(
+                "\u{644}\u{64a}\u{647}\u{645}\u{627}\u{628}\u{62a}\u{643}\u{644}\u{645}\u{648}\u{634}\u{639}\u{631}\u{628}\u{64a}\u{61f}"
+            )
+        );
+        // RFC 3492 7.1 (L) 3<nen>B<gumi><kinpachi><sensei>.
+        assert_eq!(
+            punycode_decode("3B-ww4c5e180e575a65lsy2b").as_deref(),
+            Some("3\u{5e74}B\u{7d44}\u{91d1}\u{516b}\u{5148}\u{751f}")
+        );
+
+        assert_eq!(punycode_decode("-").as_deref(), Some(""));
+        assert_eq!(punycode_decode("a-").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn invalid_punycode_stays_as_it_is() {
+        assert_eq!(punycode_decode("!!"), None);
+        assert_eq!(punycode_decode("zzzzzzzzzzzzzzzzzzzzzzzz"), None);
+        assert_eq!(punycode_decode("\u{e4}-abc"), None);
+        assert_eq!(normalize_email("a@xn--!!.test"), "a@xn--!!.test");
+        assert_eq!(normalize_email("a@xn--.test"), "a@xn--.test");
+    }
+
+    #[test]
+    fn long_xn_labels_stay_as_they_are_and_cost_little() {
+        let label = format!("xn--{}", "a".repeat(400_000));
+        let email = format!("a@{label}.test");
+        let start = std::time::Instant::now();
+        assert_eq!(normalize_email(&email), email);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        // A label of 63 bytes is still decoded.
+        assert_eq!(
+            normalize_email("a@xn--bckerei-5wa.test"),
+            "a@b\u{e4}ckerei.test"
+        );
     }
 
     #[test]

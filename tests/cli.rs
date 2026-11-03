@@ -17,7 +17,7 @@ fn version_prints_name_and_version() {
         .arg("--version")
         .assert()
         .success()
-        .stdout("pseudofy 0.1.0\n");
+        .stdout(format!("pseudofy {}\n", env!("CARGO_PKG_VERSION")));
 }
 
 #[test]
