@@ -8,7 +8,7 @@ use sha2::Sha256;
 use crate::key::ProjectKey;
 use crate::locale::Language;
 use crate::names::{self, NameLists};
-use crate::text::{ascii_local_part, normalize};
+use crate::text::{ascii_local_part, normalize, normalize_domain};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -101,25 +101,31 @@ pub struct Pseudonymizer {
 /// `normalize` of an email address, with each `xn--` label of the domain
 /// converted to Unicode (`bäckerei.test` = `xn--bckerei-5wa.test`).
 fn normalize_email(real: &str) -> String {
-    let normalized = normalize(real);
-    let Some((local, domain)) = normalized.rsplit_once('@') else {
-        return normalized;
+    let Some((local, domain)) = real.rsplit_once('@') else {
+        return normalize(real);
     };
-    let labels: Vec<String> = domain
+    let labels: Vec<String> = normalize_domain(domain)
         .split('.')
         .map(|label| {
             match label
-                .strip_prefix("xn--")
+                .get(..4)
+                .filter(|head| head.eq_ignore_ascii_case("xn--"))
+                .and(label.get(4..))
+                .filter(|_| label.len() <= MAX_LABEL)
                 .and_then(punycode_decode)
                 .filter(|decoded| !decoded.is_empty())
             {
-                Some(decoded) => normalize(&decoded),
+                Some(decoded) => normalize_domain(&decoded),
                 None => label.to_string(),
             }
         })
         .collect();
-    format!("{local}@{}", labels.join("."))
+    format!("{}@{}", normalize(local), labels.join("."))
 }
+
+/// Longest label (in bytes) whose `xn--` form is decoded (RFC 1035). A longer
+/// label stays as it is, so the decoding costs little.
+const MAX_LABEL: usize = 63;
 
 /// Value of a punycode digit: `a`-`z` are 0-25, `0`-`9` are 26-35.
 fn punycode_digit(byte: u8) -> Option<u32> {
@@ -656,7 +662,14 @@ mod tests {
             assert_eq!(p.first_name(a), p.first_name(b), "{a} {b}");
             assert_eq!(p.last_name(a), p.last_name(b), "{a} {b}");
         }
-        assert_eq!(p.email("a@Stra\u{df}e.test"), p.email("a@STRASSE.test"));
+        // A domain keeps `ß` (IDNA2008).
+        assert_ne!(p.email("a@Stra\u{df}e.test"), p.email("a@STRASSE.test"));
+        assert_eq!(p.email("a@Stra\u{df}e.test"), p.email("a@STRA\u{df}E.test"));
+        assert_eq!(p.email("Stra\u{df}e@x.test"), p.email("STRASSE@x.test"));
+        assert_eq!(
+            p.last_name("\u{39f}\u{394}\u{3a5}\u{3a3}\u{3a3}\u{395}\u{3a5}\u{3a3}"),
+            p.last_name("\u{39f}\u{3b4}\u{3c5}\u{3c3}\u{3c3}\u{3b5}\u{3c5}\u{3c2}")
+        );
     }
 
     #[test]
@@ -711,6 +724,20 @@ mod tests {
         assert_eq!(punycode_decode("\u{e4}-abc"), None);
         assert_eq!(normalize_email("a@xn--!!.test"), "a@xn--!!.test");
         assert_eq!(normalize_email("a@xn--.test"), "a@xn--.test");
+    }
+
+    #[test]
+    fn long_xn_labels_stay_as_they_are_and_cost_little() {
+        let label = format!("xn--{}", "a".repeat(400_000));
+        let email = format!("a@{label}.test");
+        let start = std::time::Instant::now();
+        assert_eq!(normalize_email(&email), email);
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        // A label of 63 bytes is still decoded.
+        assert_eq!(
+            normalize_email("a@xn--bckerei-5wa.test"),
+            "a@b\u{e4}ckerei.test"
+        );
     }
 
     #[test]
