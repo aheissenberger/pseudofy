@@ -7,8 +7,24 @@ pseudofy pseudonymizes direct identifiers. It does not anonymize the data.
 The output can still be personal data (GDPR Art. 4(5)).
 Other columns can identify a person, and the holder of the project key can test real names.
 pseudofy does not change file and directory names. Rename a file before you share it if its name contains a real name.
-In XLSX files, pseudofy does not change comments, charts, data validations, headers and footers, conditional formatting, sheet names, defined names, and document properties.
+In XLSX files, pseudofy does not change these parts:
+
+- comments, charts, data validations, headers and footers, conditional formatting;
+- formulas (also text inside a formula, for example `="Max "&"Muster"`);
+- text in drawing shapes and text boxes;
+- table total labels and table formulas;
+- number formats with literal text;
+- embedded objects;
+- sheet names, defined names, and document properties.
+
 pseudofy prints a warning for each workbook that has one of these parts, except sheet names, defined names, and document properties. Check these parts before you share the file.
+In a hyperlink target, pseudofy replaces emails, the display name of a `mailto:` link, and known names in the decoded text.
+
+The replacement of known names in free text has limits:
+
+- A name is known only if it is in a name column of a file of the project.
+- A single all-lowercase word is not replaced (for example `mueller`).
+- Spelling variants are not replaced: `Mueller` for `Müller`, `Zorbinas` for `Zorbina`, or `zorbina-quenzel` in a URL.
 pseudofy refuses workbooks with pivot tables.
 pseudofy refuses a workbook with more than 10 000 parts or relationships, more than 512 MiB of uncompressed content, or a relationship cycle. It refuses a CSV file larger than 256 MiB and an XLSX file larger than 512 MiB.
 It also refuses a workbook with an unusual package structure: two part names that differ only in letter case, or a relationship target with `&`.
