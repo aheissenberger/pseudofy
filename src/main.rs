@@ -99,8 +99,13 @@ fn run(project: &Path, out: &Path) -> anyhow::Result<()> {
         .copied
         .map(|n| format!(", copied unchanged: {n}"))
         .unwrap_or_default();
+    let excluded = if summary.excluded > 0 {
+        format!(", excluded: {}", summary.excluded)
+    } else {
+        String::new()
+    };
     println!(
-        "files: {}, replaced values: {}, collisions: {}{copied}",
+        "files: {}, replaced values: {}, collisions: {}{copied}{excluded}",
         summary.files, summary.replaced, summary.collisions
     );
     if summary.collisions > 0 {

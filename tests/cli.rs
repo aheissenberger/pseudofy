@@ -62,6 +62,8 @@ fn init_with_language_de_ignores_the_system_language() {
         "# copy_other_files = false",
         "# free_text = \"tokens\"",
         "[[rule]]",
+        "files = [\"**/*.csv\", \"**/*.xlsx\"]",
+        "# files_excluded = []",
     ] {
         assert!(config.lines().any(|l| l == line), "{line}: {config}");
     }
@@ -157,7 +159,7 @@ fn other_files_project(setting: &str) -> tempfile::TempDir {
     write_at(root, "secrets/pseudofy.key", format!("{KEY}\n").as_bytes());
     write_at(root, "secrets/extra.txt", b"extra secret file");
     let config = format!(
-        "language = \"en\"\n{setting}\n[[rule]]\nfiles = \"**/*.csv\"\nfull_name = [\"name\"]\n"
+        "language = \"en\"\n{setting}\n[[rule]]\nfiles = [\"**/*.csv\"]\nfull_name = [\"name\"]\n"
     );
     write_at(root, "config/pseudofy.toml", config.as_bytes());
     write_at(root, "config/other.toml", b"other config");
@@ -595,4 +597,101 @@ fn run_warns_if_out_is_writable_by_other_users() {
     std::fs::set_permissions(out.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let output = run_output(dir.path(), out.path());
     assert!(!stderr_of(&output).contains("writable by other users"));
+}
+
+/// A project with `data.csv`, `archive/old.csv`, and `archive/keep/a.csv`.
+/// Rule 1 excludes `archive/**`; `rules` adds more rule lines.
+fn excluded_project(setting: &str, rules: &str) -> tempfile::TempDir {
+    let dir = tempfile::TempDir::new().unwrap();
+    let root = dir.path();
+    write_at(root, "secrets/pseudofy.key", format!("{KEY}\n").as_bytes());
+    let config = format!(
+        "language = \"en\"\n{setting}\n[[rule]]\nfiles = [\"**/*.csv\", \"**/*.xlsx\"]\n\
+         files_excluded = [\"archive/**\"]\nfull_name = [\"name\"]\n{rules}"
+    );
+    write_at(root, "config/pseudofy.toml", config.as_bytes());
+    write_at(root, "data.csv", b"name\nZorbina Quenzel\n");
+    write_at(root, "archive/old.csv", b"name\nTamsorin Velgrad\n");
+    write_at(root, "archive/keep/a.csv", b"label\nQuorvan Brindle\n");
+    dir
+}
+
+#[test]
+fn excluded_files_get_no_copy_by_default_and_are_counted() {
+    let dir = excluded_project("", "");
+    let out = tempfile::TempDir::new().unwrap();
+    let output = run_output(dir.path(), out.path());
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("excluded: 2"), "{stdout}");
+    assert!(!out.path().join("archive").exists());
+    let csv = std::fs::read_to_string(out.path().join("data.csv")).unwrap();
+    assert!(!csv.contains("Zorbina"), "{csv}");
+}
+
+#[test]
+fn excluded_files_are_copied_unchanged_with_copy_other_files() {
+    let dir = excluded_project("copy_other_files = true\n", "");
+    let out = tempfile::TempDir::new().unwrap();
+    let output = run_output(dir.path(), out.path());
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("archive/old.csv: copied unchanged"),
+        "{stdout}"
+    );
+    assert!(stdout.contains("excluded: 2"), "{stdout}");
+    assert_eq!(
+        std::fs::read(out.path().join("archive/old.csv")).unwrap(),
+        b"name\nTamsorin Velgrad\n"
+    );
+    let csv = std::fs::read_to_string(out.path().join("data.csv")).unwrap();
+    assert!(!csv.contains("Zorbina"), "{csv}");
+}
+
+#[test]
+fn a_file_excluded_by_one_rule_gets_the_columns_of_another_rule() {
+    let rule = "[[rule]]\nfiles = [\"archive/keep/*.csv\"]\nfull_name = [\"label\"]\n";
+    let dir = excluded_project("", rule);
+    let out = tempfile::TempDir::new().unwrap();
+    let output = run_output(dir.path(), out.path());
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("excluded: 1"), "{stdout}");
+    let csv = std::fs::read_to_string(out.path().join("archive/keep/a.csv")).unwrap();
+    assert!(csv.starts_with("label\n"), "{csv}");
+    assert!(!csv.contains("Quorvan"), "{csv}");
+}
+
+#[test]
+fn files_as_a_string_or_an_empty_array_fails_with_a_hint() {
+    for (files, message) in [
+        (
+            "\"**/*.csv\"",
+            "files must be an array, for example files = [\"**/*.csv\"]",
+        ),
+        ("[]", "files must have one or more globs"),
+    ] {
+        let dir = other_files_project("");
+        let config =
+            format!("language = \"en\"\n[[rule]]\nfiles = {files}\nfull_name = [\"name\"]\n");
+        write_at(dir.path(), "config/pseudofy.toml", config.as_bytes());
+        let out = tempfile::TempDir::new().unwrap();
+        let output = run_output(dir.path(), out.path());
+        assert!(!output.status.success());
+        let stderr = stderr_of(&output);
+        assert!(stderr.contains(message), "{stderr}");
+    }
+}
+
+#[test]
+fn an_invalid_excluded_glob_fails_and_names_the_glob() {
+    let dir = other_files_project("");
+    let config = "language = \"en\"\n[[rule]]\nfiles = [\"**/*.csv\"]\nfiles_excluded = [\"a/[b\"]\nfull_name = [\"name\"]\n";
+    write_at(dir.path(), "config/pseudofy.toml", config.as_bytes());
+    let out = tempfile::TempDir::new().unwrap();
+    let output = run_output(dir.path(), out.path());
+    assert!(!output.status.success());
+    let stderr = stderr_of(&output);
+    assert!(stderr.contains("invalid glob \"a/[b\""), "{stderr}");
 }

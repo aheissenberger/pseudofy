@@ -47,7 +47,12 @@ pub enum FreeText {
 #[derive(Debug, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Rule {
-    pub files: String,
+    /// File globs of the rule (spec 0021). One or more.
+    #[serde(deserialize_with = "glob_list")]
+    pub files: Vec<String>,
+    /// Globs of files that the rule excludes (spec 0021).
+    #[serde(default)]
+    pub files_excluded: Vec<String>,
     #[serde(default)]
     pub first_name: Vec<String>,
     #[serde(default)]
@@ -59,6 +64,33 @@ pub struct Rule {
     /// Sheet-name globs for XLSX files. Empty: the rule applies to each sheet.
     #[serde(default)]
     pub sheets: Vec<String>,
+}
+
+/// `files` is an array of one or more globs. The string form of 0.2.0 gives a
+/// migration hint.
+fn glob_list<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Files {
+        Many(Vec<String>),
+        Other(serde::de::IgnoredAny),
+    }
+    match Files::deserialize(deserializer)? {
+        Files::Other(_) => Err(serde::de::Error::custom(
+            "files must be an array, for example files = [\"**/*.csv\"]",
+        )),
+        Files::Many(globs) if globs.is_empty() => Err(serde::de::Error::custom(
+            "files must have one or more globs",
+        )),
+        Files::Many(globs) => Ok(globs),
+    }
+}
+
+impl Rule {
+    /// The globs of `files`, joined with ", ". Messages name a rule by it.
+    pub fn label(&self) -> String {
+        self.files.join(", ")
+    }
 }
 
 fn default_email_subdomains() -> bool {
@@ -137,16 +169,23 @@ language = "{}"
 # Rules. Each rule selects files and names the header texts of the name
 # and email columns. Add one [[rule]] block for each group of files.
 #
-# files:      glob relative to the project directory (case is ignored).
-# first_name: header texts of first-name columns.
-# last_name:  header texts of last-name columns.
-# full_name:  header texts of full-name columns ("First Last").
-# email:      header texts of email columns.
-# sheets:     XLSX only. Sheet-name globs. Default: each sheet.
+# files:          globs relative to the project directory. Case is ignored.
+#                 "*" does not match "/". "**/" matches zero or more
+#                 directories, so "**/*.csv" also matches "a.csv".
+# files_excluded: globs of files that this rule does not pseudonymize.
+#                 An excluded file is handled like an other file (see
+#                 copy_other_files). Example: ["archive/**", "**/*_pseudo.*"]
+# first_name:     header texts of first-name columns.
+# last_name:      header texts of last-name columns.
+# full_name:      header texts of full-name columns ("First Last").
+# email:          header texts of email columns.
+# sheets:         XLSX only. Sheet-name globs. Default: each sheet.
 #
-# In XLSX files, each sheet uses its first non-empty row as the header.
+# pseudofy finds the header row in the first 20 non-empty rows of a CSV file
+# or a sheet.
 [[rule]]
-files = "**/*.{{csv,xlsx}}"
+files = ["**/*.csv", "**/*.xlsx"]
+# files_excluded = []
 first_name = ["first_name"]
 last_name = ["last_name"]
 full_name = ["name"]
@@ -193,7 +232,7 @@ mod tests {
         assert_eq!(config.language, Language::De);
         assert!(config.email_subdomains);
         assert_eq!(config.rules.len(), 1);
-        assert_eq!(config.rules[0].files, "**/*.{csv,xlsx}");
+        assert_eq!(config.rules[0].files, ["**/*.csv", "**/*.xlsx"]);
         assert!(create(dir.path(), Language::En).is_err());
     }
 
@@ -210,7 +249,8 @@ mod tests {
             free_text: FreeText::Tokens,
             copy_other_files: false,
             rules: vec![Rule {
-                files: "**/*.{csv,xlsx}".to_owned(),
+                files: vec!["**/*.csv".to_owned(), "**/*.xlsx".to_owned()],
+                files_excluded: Vec::new(),
                 first_name: vec!["first_name".to_owned()],
                 last_name: vec!["last_name".to_owned()],
                 full_name: vec!["name".to_owned()],
@@ -218,6 +258,28 @@ mod tests {
                 sheets: Vec::new(),
             }],
         }
+    }
+
+    #[test]
+    fn files_is_a_non_empty_array() {
+        let parse =
+            |rule: &str| toml::from_str::<Config>(&format!("language = \"en\"\n[[rule]]\n{rule}"));
+        let config = parse("files = [\"**/*.csv\"]\nfiles_excluded = [\"archive/**\"]").unwrap();
+        assert_eq!(config.rules[0].files, ["**/*.csv"]);
+        assert_eq!(config.rules[0].files_excluded, ["archive/**"]);
+        let config = parse("files = [\"**/*.csv\"]").unwrap();
+        assert_eq!(config.rules[0].files_excluded, Vec::<String>::new());
+        let error = parse("files = \"**/*.csv\"").unwrap_err().to_string();
+        assert!(
+            error.contains("files must be an array, for example files = [\"**/*.csv\"]"),
+            "{error}"
+        );
+        let error = parse("files = []").unwrap_err().to_string();
+        assert!(
+            error.contains("files must have one or more globs"),
+            "{error}"
+        );
+        assert!(parse("files_excluded = [\"a\"]").is_err());
     }
 
     #[test]
@@ -245,6 +307,7 @@ mod tests {
             "free_text",
             "copy_other_files",
             "files",
+            "files_excluded",
             "first_name",
             "last_name",
             "full_name",

@@ -21,7 +21,7 @@ Read `docs/plan/pseudonymization.md` for the requirements.
 ## Code rules
 
 - pseudofy never prints, logs, or writes a real value or the project key. This includes error and panic messages.
-  Exception: with `copy_other_files = true`, pseudofy copies other files unchanged (ADR-0012).
+  Exception: with `copy_other_files = true`, pseudofy copies other files and excluded CSV and XLSX files unchanged (ADR-0014).
 - Do not use `unwrap()` or `expect()` outside tests (ADR-0006).
 - Do not add `#[allow]`. If a lint exception is necessary, use `#[expect(lint, reason = "...")]`.
 - Do not add a runtime crate without a new ADR (ADR-0004). Pin each version with `=`.

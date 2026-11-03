@@ -41,7 +41,7 @@ fn config(email_subdomains: Option<bool>) -> String {
         text.push('\n');
     }
     text.push_str(
-        "\n[[rule]]\nfiles = \"**/*.csv\"\nfirst_name = [\"first_name\"]\n\
+        "\n[[rule]]\nfiles = [\"**/*.csv\"]\nfirst_name = [\"first_name\"]\n\
          last_name = [\"last_name\"]\nfull_name = [\"name\"]\nemail = [\"email\"]\n",
     );
     text
@@ -725,7 +725,7 @@ fn file_without_a_matching_rule_warns_and_still_replaces_emails() {
     write_file(
         dir.path(),
         "config/pseudofy.toml",
-        "language = \"de\"\n\n[[rule]]\nfiles = \"only/*.csv\"\nfirst_name = [\"first_name\"]\n",
+        "language = \"de\"\n\n[[rule]]\nfiles = [\"only/*.csv\"]\nfirst_name = [\"first_name\"]\n",
     );
     write_file(
         dir.path(),
@@ -1297,7 +1297,7 @@ fn file_without_a_matching_rule_gets_emails_replaced_in_its_first_line() {
     write_file(
         dir.path(),
         "config/pseudofy.toml",
-        "language = \"de\"\n\n[[rule]]\nfiles = \"only/*.csv\"\nfirst_name = [\"first_name\"]\n",
+        "language = \"de\"\n\n[[rule]]\nfiles = [\"only/*.csv\"]\nfirst_name = [\"first_name\"]\n",
     );
     write_file(
         dir.path(),

@@ -45,10 +45,7 @@ pub(crate) struct Columns {
 
 /// Globs of the rules that name at least one header and find none of them
 /// in the file. A rule that finds some of its headers gives no warning.
-pub(crate) fn rules_without_headers<'a>(
-    rules: &[&'a Rule],
-    missing: &[(String, String)],
-) -> Vec<&'a str> {
+pub(crate) fn rules_without_headers(rules: &[&Rule], missing: &[(String, String)]) -> Vec<String> {
     rules
         .iter()
         .filter(|rule| {
@@ -64,10 +61,10 @@ pub(crate) fn rules_without_headers<'a>(
                     let header = header.trim().to_lowercase();
                     missing
                         .iter()
-                        .any(|(glob, miss)| *glob == rule.files && *miss == header)
+                        .any(|(glob, miss)| *glob == rule.label() && *miss == header)
                 })
         })
-        .map(|rule| rule.files.as_str())
+        .map(|rule| rule.label())
         .collect()
 }
 
@@ -150,7 +147,7 @@ pub(crate) fn collect_columns(rules: &[&Rule]) -> Columns {
     for rule in rules {
         let add = |target: &mut Vec<(String, String)>, headers: &[String]| {
             for header in headers {
-                target.push((rule.files.clone(), header.trim().to_lowercase()));
+                target.push((rule.label(), header.trim().to_lowercase()));
             }
         };
         add(&mut columns.first, &rule.first_name);
@@ -466,11 +463,11 @@ pub(crate) fn transform_text_cell(
 
 /// Glob of the first rule that names headers and has none of them in the
 /// header row. `header` is `None` if the search found no header row.
-pub(crate) fn failing_rule<'a>(
-    rules: &[&'a Rule],
+pub(crate) fn failing_rule(
+    rules: &[&Rule],
     header: Option<&[String]>,
     columns: &Columns,
-) -> Option<&'a str> {
+) -> Option<String> {
     let missing = missing_headers(header.unwrap_or(&[]), columns);
     rules_without_headers(rules, &missing).into_iter().next()
 }
@@ -570,7 +567,8 @@ mod tests {
 
     fn rule() -> Rule {
         Rule {
-            files: "*.csv".to_owned(),
+            files: vec!["*.csv".to_owned()],
+            files_excluded: Vec::new(),
             first_name: vec![],
             last_name: vec![],
             full_name: vec!["Name".to_owned()],
@@ -608,8 +606,14 @@ mod tests {
         let rules = [&rule];
         let columns = collect_columns(&rules);
         let none = vec!["x".to_owned()];
-        assert_eq!(failing_rule(&rules, Some(&none), &columns), Some("*.csv"));
-        assert_eq!(failing_rule(&rules, None, &columns), Some("*.csv"));
+        assert_eq!(
+            failing_rule(&rules, Some(&none), &columns).as_deref(),
+            Some("*.csv")
+        );
+        assert_eq!(
+            failing_rule(&rules, None, &columns).as_deref(),
+            Some("*.csv")
+        );
         let some = vec!["x".to_owned(), "name".to_owned()];
         assert_eq!(failing_rule(&rules, Some(&some), &columns), None);
         let empty = Columns::default();

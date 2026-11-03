@@ -606,14 +606,14 @@ fn string_value(cell: &umya_spreadsheet::Cell) -> Option<(String, bool)> {
 }
 
 /// Glob of the first rule with `sheets` that matches none of the sheet `names`.
-fn unmatched_sheet_rule<'a>(matchers: &[SheetRule<'a>], names: &[String]) -> Option<&'a str> {
+fn unmatched_sheet_rule(matchers: &[SheetRule<'_>], names: &[String]) -> Option<String> {
     matchers
         .iter()
         .find(|(set, _)| {
             set.as_ref()
                 .is_some_and(|set| !names.iter().any(|name| set.is_match(name)))
         })
-        .map(|(_, rule)| rule.files.as_str())
+        .map(|(_, rule)| rule.label())
 }
 
 #[cfg(test)]
@@ -623,7 +623,8 @@ mod tests {
 
     fn rule(sheets: &[&str]) -> Rule {
         Rule {
-            files: "*.xlsx".to_owned(),
+            files: vec!["*.xlsx".to_owned()],
+            files_excluded: Vec::new(),
             first_name: vec![],
             last_name: vec![],
             full_name: vec!["Name".to_owned()],

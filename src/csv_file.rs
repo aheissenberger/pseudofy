@@ -863,7 +863,8 @@ mod tests {
 
     fn rule(files: &str, first: &[&str], email: &[&str]) -> Rule {
         Rule {
-            files: files.to_string(),
+            files: vec![files.to_string()],
+            files_excluded: Vec::new(),
             first_name: first.iter().map(|s| (*s).to_string()).collect(),
             last_name: Vec::new(),
             full_name: Vec::new(),
