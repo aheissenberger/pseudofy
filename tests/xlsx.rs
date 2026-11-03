@@ -1555,6 +1555,11 @@ fn real_book_bytes() -> Vec<u8> {
 fn run_hostile(hostile: &[u8]) -> String {
     let dir = project(None);
     fs::write(dir.path().join("mappe.xlsx"), hostile).unwrap();
+    run_hostile_project(&dir)
+}
+
+/// `run_hostile` for a project that has `mappe.xlsx` already.
+fn run_hostile_project(dir: &TempDir) -> String {
     save(
         &simple_book("Tamsorin Velgrad", "tamsorin@acme.test"),
         dir.path(),
@@ -1669,7 +1674,6 @@ fn header_in_a_sheet_with_another_name_gets_the_warning() {
     let sheet = sheet_with_header();
     let cases = [
         ("xl/Worksheets/sheet1.xml", "worksheets/sheet1.xml"),
-        ("xl\\worksheets\\sheet1.xml", "worksheets/sheet1.xml"),
         ("xl/data/s.xml", "data/s.xml"),
     ];
     for (part, target) in cases {
@@ -1872,4 +1876,337 @@ fn shared_references_to_one_big_part_count_each_time() {
     fs::write(dir.path().join("mappe.xlsx"), bytes).unwrap();
     let (out, _, _) = run_ok(dir.path());
     assert!(out.path().join("mappe.xlsx").exists());
+}
+
+// ---- Canonical package (spec 0017, review of 2026-11-03) ----
+
+/// A `.rels` part with `body` as the text between the root tags.
+fn rels_body(body: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Relationships xmlns=\"{RELS_NS}\">{body}</Relationships>"
+    )
+}
+
+fn external_rel(id: &str) -> String {
+    format!(
+        "<Relationship Id=\"{id}\" Type=\"{REL_BASE}/hyperlink\" Target=\"https://example.test/\" TargetMode=\"External\"/>"
+    )
+}
+
+/// The package with `rels` as the relationships of `sheet1` and `extra` parts.
+fn with_sheet_rels_text(rels: &str) -> Vec<u8> {
+    repackage(
+        &real_book_bytes(),
+        str::to_owned,
+        |_, _| None,
+        &[(
+            "xl/worksheets/_rels/sheet1.xml.rels".to_owned(),
+            rels_body(rels),
+        )],
+    )
+}
+
+#[test]
+fn external_loops_through_the_root_rels_name_are_refused() {
+    // The crate looks up `/_rels/.rels` for an External relationship.
+    for root in ["/_rels/.rels", "\\_rels\\.rels"] {
+        let rels = rels_body(&external_rel("rId1"));
+        let bytes = repackage(
+            &real_book_bytes(),
+            str::to_owned,
+            |_, _| None,
+            &[
+                (
+                    "xl/worksheets/_rels/sheet1.xml.rels".to_owned(),
+                    rels.clone(),
+                ),
+                (root.to_owned(), rels),
+            ],
+        );
+        let stderr = run_hostile(&bytes);
+        assert!(stderr.contains("ambiguous part names"), "{root}: {stderr}");
+    }
+}
+
+#[test]
+fn backslash_and_case_variant_names_are_refused() {
+    let sheet = sheet_with_header();
+    let bytes = moved_sheet(
+        "xl\\worksheets\\sheet1.xml",
+        "worksheets/sheet1.xml",
+        &sheet,
+    );
+    let stderr = run_hostile(&bytes);
+    assert!(stderr.contains("ambiguous part names"), "{stderr}");
+
+    // Two names that differ only in ASCII case.
+    let bytes = repackage(
+        &real_book_bytes(),
+        str::to_owned,
+        |_, _| None,
+        &[("xl/Workbook.xml".to_owned(), "<workbook/>".to_owned())],
+    );
+    let stderr = run_hostile(&bytes);
+    assert!(stderr.contains("ambiguous part names"), "{stderr}");
+}
+
+#[test]
+fn two_entry_names_that_decode_to_the_same_text_are_refused() {
+    // `sX` is patched to the CP437 byte 0x82 (e acute): the same text as the
+    // UTF-8 name of the other entry, so the crate cannot tell them apart.
+    let cyclic = rels_xml(&[("worksheet", "s\u{e9}.xml".to_owned())]);
+    let mut bytes = repackage(
+        &real_book_bytes(),
+        |name| {
+            if name == "xl/worksheets/sheet1.xml" {
+                "xl/worksheets/s\u{e9}.xml".to_owned()
+            } else {
+                name.to_owned()
+            }
+        },
+        |name, text| {
+            (name == "xl/_rels/workbook.xml.rels")
+                .then(|| text.replace("worksheets/sheet1.xml", "worksheets/s\u{e9}.xml"))
+        },
+        &[
+            ("xl/worksheets/_rels/sX.xml.rels".to_owned(), rels_body("")),
+            ("xl/worksheets/_rels/s\u{e9}.xml.rels".to_owned(), cyclic),
+        ],
+    );
+    let from = b"_rels/sX.xml.rels";
+    let to = b"_rels/s\x82.xml.rels";
+    let mut at = 0;
+    while let Some(found) = bytes[at..].windows(from.len()).position(|w| w == from) {
+        let start = at + found;
+        bytes[start..start + to.len()].copy_from_slice(to);
+        at = start + to.len();
+    }
+    let stderr = run_hostile(&bytes);
+    assert!(stderr.contains("ambiguous part names"), "{stderr}");
+}
+
+#[test]
+fn unusual_relationship_parts_are_refused() {
+    let worksheet = format!("Type=\"{REL_BASE}/worksheet\"");
+    let cases = [
+        // An entity in the mode or in an internal target.
+        format!(
+            "<Relationship Id=\"rId1\" {worksheet} Target=\"sheet1.xml\" TargetMode=\"&#69;xternal\"/>"
+        ),
+        format!("<Relationship Id=\"rId1\" {worksheet} Target=\"s&amp;1.xml\"/>"),
+        // The only Target has a prefix: the crate reads none.
+        format!(
+            "<Relationship xmlns:q=\"urn:q\" Id=\"rId1\" {worksheet} q:Target=\"sheet1.xml\"/>"
+        ),
+        // A repeated attribute, a repeated id, a missing attribute.
+        format!("<Relationship Id=\"rId1\" {worksheet} Target=\"a.xml\" Target=\"b.xml\"/>"),
+        format!(
+            "<Relationship Id=\"rId1\" {worksheet} Target=\"a.xml\"/><Relationship Id=\"rId1\" {worksheet} Target=\"b.xml\"/>"
+        ),
+        format!("<Relationship Id=\"rId1\" {worksheet}/>"),
+        // Another element name or a prefixed one.
+        format!("<Other Id=\"rId1\" {worksheet} Target=\"a.xml\"/>"),
+        format!("<x:Relationship xmlns:x=\"{RELS_NS}\" Id=\"rId1\" {worksheet} Target=\"a.xml\"/>"),
+    ];
+    for (index, body) in cases.iter().enumerate() {
+        let stderr = run_hostile(&with_sheet_rels_text(body));
+        assert!(
+            stderr.contains("cannot read the workbook"),
+            "case {index}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn relationships_are_read_as_the_crate_reads_them() {
+    // The crate reads `Target`, not `q:Target`: the cycle through sheet1 is real.
+    let body = format!(
+        "<Relationship xmlns:q=\"urn:q\" Id=\"rId1\" Type=\"{REL_BASE}/worksheet\" q:Target=\"none.xml\" Target=\"sheet1.xml\"/>"
+    );
+    let stderr = run_hostile(&with_sheet_rels_text(&body));
+    assert!(stderr.contains("relationship cycle"), "{stderr}");
+
+    // The crate skips `<Relationship>..</Relationship>`; the copy of the
+    // package has it as an empty element, so the check sees it too.
+    let body = format!(
+        "<Relationship Id=\"rId1\" Type=\"{REL_BASE}/worksheet\" Target=\"sheet1.xml\"></Relationship>"
+    );
+    let stderr = run_hostile(&with_sheet_rels_text(&body));
+    assert!(stderr.contains("relationship cycle"), "{stderr}");
+}
+
+#[test]
+fn sheets_with_one_relationship_id_are_refused() {
+    let sheets = (0..300)
+        .map(|index| {
+            format!(
+                "<sheet name=\"S{index}\" sheetId=\"{}\" r:id=\"rId1\"/>",
+                index + 1
+            )
+        })
+        .collect::<Vec<_>>()
+        .concat();
+    let bytes = repackage(
+        &real_book_bytes(),
+        str::to_owned,
+        |name, text| {
+            (name == "xl/workbook.xml").then(|| {
+                let start = text.find("<sheets>").unwrap();
+                let end = text.find("</sheets>").unwrap();
+                format!("{}<sheets>{sheets}{}", &text[..start], &text[end..])
+            })
+        },
+        &[],
+    );
+    let start = std::time::Instant::now();
+    let stderr = run_hostile(&bytes);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    assert!(
+        stderr.contains("one relationship for two sheets"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn drawing_with_2500_images_gets_a_copy() {
+    let images: Vec<(&str, String)> = (1..=2_500)
+        .map(|index| ("image", format!("../media/image{index}.png")))
+        .collect();
+    let drawing = "<xdr:wsDr xmlns:xdr=\"http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing\"/>";
+    let mut parts = vec![
+        ("xl/drawings/drawing1.xml".to_owned(), drawing.to_owned()),
+        (
+            "xl/drawings/_rels/drawing1.xml.rels".to_owned(),
+            rels_xml(&images),
+        ),
+    ];
+    parts.extend((1..=2_500).map(|index| (format!("xl/media/image{index}.png"), "PNG".to_owned())));
+    let bytes = with_sheet_rels(
+        &real_book_bytes(),
+        &[("drawing", "../drawings/drawing1.xml".to_owned())],
+        &parts,
+    );
+    // Stored entries: the debug build of the crate is slow to open deflated ones.
+    let bytes = stored(&bytes);
+    let dir = project(None);
+    fs::write(dir.path().join("mappe.xlsx"), bytes).unwrap();
+    let (out, _, _) = run_ok(dir.path());
+    assert!(out.path().join("mappe.xlsx").exists());
+}
+
+/// The same package with stored (not compressed) entries.
+fn stored(bytes: &[u8]) -> Vec<u8> {
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    for (name, text) in package_parts(bytes) {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(text.as_bytes()).unwrap();
+    }
+    writer.finish().unwrap().into_inner()
+}
+
+#[test]
+fn many_external_relationships_and_many_entries_fail_fast() {
+    // 9 900 External relationships: the crate scans all names for each one.
+    let rels: String = (1..=9_900)
+        .map(|index| external_rel(&format!("rId{index}")))
+        .collect();
+    let mut extra = vec![(
+        "xl/worksheets/_rels/sheet1.xml.rels".to_owned(),
+        rels_body(&rels),
+    )];
+    extra.extend((0..9_900).map(|index| (format!("xl/media/m{index}.bin"), String::new())));
+    let bytes = repackage(&real_book_bytes(), str::to_owned, |_, _| None, &extra);
+    let start = std::time::Instant::now();
+    let stderr = run_hostile(&bytes);
+    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    assert!(stderr.contains("too large"), "{stderr}");
+}
+
+#[test]
+fn external_hyperlink_with_an_entity_and_foreign_attributes_gets_a_copy() {
+    let body = format!(
+        "<Relationship Id=\"rId1\" Type=\"{REL_BASE}/hyperlink\" Target=\"https://example.test/?a=1&amp;b=2\" TargetMode=\"External\" xmlns:q=\"urn:q\" q:Note=\"x\"/>"
+    );
+    let dir = project(None);
+    fs::write(dir.path().join("mappe.xlsx"), with_sheet_rels_text(&body)).unwrap();
+    let (out, _, _) = run_ok(dir.path());
+    assert!(out.path().join("mappe.xlsx").exists());
+}
+
+#[test]
+fn many_references_to_one_external_link_part_finish_fast() {
+    let references = "<externalReference r:id=\"rId99\"/>".repeat(10_000);
+    let link = format!(
+        "<externalLink xmlns=\"{MAIN_NS}\"><externalBook/>{}</externalLink>",
+        " ".repeat(4 * 1024 * 1024)
+    );
+    let link_rel = format!(
+        "<Relationship Id=\"rId99\" Type=\"{REL_BASE}/externalLink\" Target=\"externalLinks/externalLink1.xml\"/></Relationships>"
+    );
+    let bytes = repackage(
+        &real_book_bytes(),
+        str::to_owned,
+        |name, text| match name {
+            "xl/workbook.xml" => Some(text.replacen(
+                "</sheets>",
+                &format!("</sheets><externalReferences>{references}</externalReferences>"),
+                1,
+            )),
+            "xl/_rels/workbook.xml.rels" => Some(text.replacen("</Relationships>", &link_rel, 1)),
+            _ => None,
+        },
+        &[("xl/externalLinks/externalLink1.xml".to_owned(), link)],
+    );
+    let dir = project(None);
+    fs::write(dir.path().join("mappe.xlsx"), bytes).unwrap();
+    let start = std::time::Instant::now();
+    let out = TempDir::new().unwrap();
+    let output = pseudofy()
+        .args(["run", "--project"])
+        .arg(dir.path())
+        .arg("--out")
+        .arg(out.path())
+        .output()
+        .unwrap();
+    assert!(start.elapsed() < std::time::Duration::from_secs(20));
+    // Either a copy or a plain refusal, never an abort.
+    assert!(matches!(output.status.code(), Some(0 | 1)));
+}
+
+#[test]
+fn xlsx_file_above_512_mib_is_refused_before_it_is_read() {
+    let dir = project(None);
+    // A sparse file: it takes no disk space and is never read.
+    let file = fs::File::create(dir.path().join("mappe.xlsx")).unwrap();
+    file.set_len(512 * 1024 * 1024 + 1).unwrap();
+    drop(file);
+    let stderr = run_hostile_project(&dir);
+    assert!(
+        stderr.contains("mappe.xlsx: file is larger than 512 MiB"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn package_with_one_600_mib_entry_fails_at_once() {
+    // Streamed zeros: some hundred KiB in the file, 600 MiB for the crate.
+    let mut writer = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let options = zip::write::SimpleFileOptions::default().large_file(true);
+    for (name, text) in package_parts(&real_book_bytes()) {
+        writer.start_file(name, options).unwrap();
+        writer.write_all(text.as_bytes()).unwrap();
+    }
+    writer.start_file("xl/media/big.bin", options).unwrap();
+    let chunk = vec![0u8; 1024 * 1024];
+    for _ in 0..600 {
+        writer.write_all(&chunk).unwrap();
+    }
+    let bytes = writer.finish().unwrap().into_inner();
+    assert!(bytes.len() < 4 * 1024 * 1024);
+    let start = std::time::Instant::now();
+    let stderr = run_hostile(&bytes);
+    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    assert!(stderr.contains("too large"), "{stderr}");
 }

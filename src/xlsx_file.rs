@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::Path;
 
 use anyhow::{Context, anyhow};
@@ -37,12 +37,37 @@ pub struct XlsxStats {
 /// A rule with the sheet-name globs of its `sheets` field (`None`: each sheet).
 type SheetRule<'a> = (Option<GlobSet>, &'a Rule);
 
+/// The largest XLSX file that pseudofy reads (the file is held in memory).
+const MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Read `input`. A file above `MAX_BYTES` is refused before and while it is
+/// read, so a file that grows during the read cannot pass.
+fn read_input(input: &Path, rel: &str) -> anyhow::Result<Vec<u8>> {
+    let unreadable = || format!("cannot read {rel}");
+    let too_large = || anyhow!("{rel}: file is larger than 512 MiB");
+    let file = fs::File::open(input).with_context(unreadable)?;
+    let size = file.metadata().with_context(unreadable)?.len();
+    if size > MAX_BYTES {
+        return Err(too_large());
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(unreadable)?;
+    if u64::try_from(bytes.len()).is_ok_and(|len| len > MAX_BYTES) {
+        return Err(too_large());
+    }
+    Ok(bytes)
+}
+
 /// Read `input` once. Return the workbook and the package bytes it came from.
 /// The package check runs before `umya-spreadsheet` reads a byte.
 fn open_book(input: &Path, rel: &str) -> anyhow::Result<(Workbook, Vec<u8>)> {
-    let bytes = fs::read(input).with_context(|| format!("cannot read {rel}"))?;
+    let bytes = read_input(input, rel)?;
     let unreadable = || anyhow!("{rel}: cannot read the workbook");
-    xlsx_scrub::check_package(&bytes).map_err(|reason| anyhow!("{rel}: {reason}"))?;
+    // From here on the canonical package is the only one that is read: the
+    // check and `umya-spreadsheet` see the same names and relationships.
+    let bytes = xlsx_scrub::check_package(&bytes).map_err(|reason| anyhow!("{rel}: {reason}"))?;
     let found = xlsx_scrub::inspect(&bytes).map_err(|_| unreadable())?;
     if found.unsupported {
         return Err(anyhow!("{rel}: unsupported workbook layout"));
