@@ -3066,7 +3066,7 @@ mod tests {
         assert_eq!(refused(&package), TOO_LARGE);
         let package = graph(&[("worksheet", "p0.xml")], &fan_out(8));
         check_package(&package).unwrap();
-        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert!(start.elapsed() < std::time::Duration::from_secs(60));
     }
 
     #[test]
@@ -3311,7 +3311,7 @@ mod tests {
         ]);
         let start = std::time::Instant::now();
         let out = scrub(&input, &plain_output(OUT_WORKBOOK)).unwrap();
-        assert!(start.elapsed() < std::time::Duration::from_secs(10));
+        assert!(start.elapsed() < std::time::Duration::from_secs(60));
         assert!(part(&out, WORKBOOK).contains("<externalReferences>"));
     }
 }

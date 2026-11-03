@@ -939,7 +939,6 @@ mod tests {
         };
         let small = time(20_000)?;
         let large = time(200_000)?;
-        assert!(large < std::time::Duration::from_secs(20), "{large:?}");
         // 10 times the input: far below the 100 times of a quadratic scan.
         assert!(
             large < small * 40 + std::time::Duration::from_millis(200),

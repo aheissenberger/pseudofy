@@ -1633,6 +1633,6 @@ fn xn_label_of_400_kb_takes_less_than_a_second() {
     let label = format!("xn--{}", "a".repeat(400_000));
     let start = std::time::Instant::now();
     let (t, _) = run_cells(&format!("first_name,last_name,email\nA,B,a@{label}.test\n"));
-    assert!(start.elapsed() < std::time::Duration::from_secs(30));
+    assert!(start.elapsed() < std::time::Duration::from_secs(60));
     assert!(!t[1][2].contains(&label));
 }

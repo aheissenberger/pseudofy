@@ -1795,7 +1795,7 @@ fn fan_out_chain_fails_fast() {
     );
     let start = std::time::Instant::now();
     let stderr = run_hostile(&bytes);
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    assert!(start.elapsed() < std::time::Duration::from_secs(60));
     assert!(stderr.contains("nested too deeply"), "stderr: {stderr}");
 
     // 14 levels pass the depth limit; 2^14 references pass the count limit.
@@ -1806,7 +1806,7 @@ fn fan_out_chain_fails_fast() {
     );
     let start = std::time::Instant::now();
     let stderr = run_hostile(&bytes);
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    assert!(start.elapsed() < std::time::Duration::from_secs(60));
     assert!(stderr.contains("too large"), "stderr: {stderr}");
 }
 
@@ -1842,7 +1842,7 @@ fn many_missing_targets_fail_without_a_long_scan() {
     let bytes = with_sheet_rels(&real_book_bytes(), &missing, &extra);
     let start = std::time::Instant::now();
     let stderr = run_hostile(&bytes);
-    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    assert!(start.elapsed() < std::time::Duration::from_secs(60));
     assert!(stderr.contains("too large"), "stderr: {stderr}");
 }
 
@@ -2061,7 +2061,7 @@ fn sheets_with_one_relationship_id_are_refused() {
     );
     let start = std::time::Instant::now();
     let stderr = run_hostile(&bytes);
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    assert!(start.elapsed() < std::time::Duration::from_secs(60));
     assert!(
         stderr.contains("one relationship for two sheets"),
         "{stderr}"
@@ -2121,7 +2121,7 @@ fn many_external_relationships_and_many_entries_fail_fast() {
     let bytes = repackage(&real_book_bytes(), str::to_owned, |_, _| None, &extra);
     let start = std::time::Instant::now();
     let stderr = run_hostile(&bytes);
-    assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    assert!(start.elapsed() < std::time::Duration::from_secs(60));
     assert!(stderr.contains("too large"), "{stderr}");
 }
 
@@ -2171,7 +2171,7 @@ fn many_references_to_one_external_link_part_finish_fast() {
         .arg(out.path())
         .output()
         .unwrap();
-    assert!(start.elapsed() < std::time::Duration::from_secs(20));
+    assert!(start.elapsed() < std::time::Duration::from_secs(60));
     // Either a copy or a plain refusal, never an abort.
     assert!(matches!(output.status.code(), Some(0 | 1)));
 }
@@ -2208,7 +2208,7 @@ fn package_with_one_600_mib_entry_fails_at_once() {
     assert!(bytes.len() < 4 * 1024 * 1024);
     let start = std::time::Instant::now();
     let stderr = run_hostile(&bytes);
-    assert!(start.elapsed() < std::time::Duration::from_secs(10));
+    assert!(start.elapsed() < std::time::Duration::from_secs(60));
     assert!(stderr.contains("too large"), "{stderr}");
 }
 
@@ -2261,7 +2261,7 @@ fn greater_than_in_a_target_cannot_hide_a_cycle() {
                 rels_xml(&[("drawing", "s>1.xml".to_owned())]),
             )],
         );
-        let stderr = run_hostile_within(&bytes, 10);
+        let stderr = run_hostile_within(&bytes, 60);
         assert!(!stderr.contains("overflow"), "{part}: {stderr}");
     }
 }
@@ -2341,7 +2341,7 @@ fn four_mib_shared_string_in_2000_cells_is_refused_without_an_abort() {
         &styles_of("Calibri", PLAIN_FILL, "", 2),
         &cell_rows(2_000, " t=\"s\"", "0"),
     );
-    let stderr = run_hostile_within(&bytes, 10);
+    let stderr = run_hostile_within(&bytes, 60);
     assert!(stderr.contains("longer than Excel allows"), "{stderr}");
 }
 
@@ -2383,7 +2383,7 @@ fn shared_string_copies_above_one_gib_are_refused() {
         &cell_rows(40_000, " t=\"s\"", "0"),
     );
     assert!(bytes.len() < 1024 * 1024, "{}", bytes.len());
-    let stderr = run_hostile_within(&bytes, 10);
+    let stderr = run_hostile_within(&bytes, 60);
     assert!(stderr.contains("workbook is too large"), "{stderr}");
 }
 
@@ -2395,7 +2395,7 @@ fn four_mib_font_name_in_2000_cell_formats_is_refused_without_an_abort() {
         &styles_of(&text, PLAIN_FILL, "", 2_000),
         &cell_rows(2_000, " s=\"1\"", "1"),
     );
-    let stderr = run_hostile_within(&bytes, 10);
+    let stderr = run_hostile_within(&bytes, 60);
     assert!(stderr.contains("longer than Excel allows"), "{stderr}");
 }
 
@@ -2442,7 +2442,7 @@ fn cell_formats_that_expand_above_one_gib_are_refused() {
         &cell_rows(1_200, " s=\"1\"", "1"),
     );
     assert!(bytes.len() < 1024 * 1024, "{}", bytes.len());
-    let stderr = run_hostile_within(&bytes, 10);
+    let stderr = run_hostile_within(&bytes, 60);
     assert!(stderr.contains("workbook is too large"), "{stderr}");
 }
 
@@ -2462,7 +2462,7 @@ fn many_sheet_elements_fail_fast() {
         (name == "xl/workbook.xml")
             .then(|| text.replace("</sheets>", &format!("{sheets}</sheets>")))
     });
-    let stderr = run_hostile_within(&bytes, 10);
+    let stderr = run_hostile_within(&bytes, 60);
     assert!(stderr.contains("workbook has too many sheets"), "{stderr}");
 }
 

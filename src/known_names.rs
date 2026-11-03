@@ -744,16 +744,42 @@ mod tests {
         assert_eq!(run(&f, FreeText::Tokens, "Kesta J.").0, "F5 F.");
     }
 
+    /// Fail if `work(8 * n)` takes more than 24 times `work(n)`. Linear work
+    /// grows about 8 times, quadratic work about 64 times. The check does not
+    /// depend on the speed of the machine (a CI runner is slower than a laptop).
+    fn assert_linear(mut work: impl FnMut(usize), n: usize) {
+        let mut best = |m: usize| {
+            (0..3)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    work(m);
+                    start.elapsed()
+                })
+                .min()
+                .unwrap_or_default()
+        };
+        let small = best(n);
+        let large = best(8 * n);
+        assert!(
+            large < small * 24 + std::time::Duration::from_millis(50),
+            "{small:?} for {n}, {large:?} for {}",
+            8 * n
+        );
+    }
+
     #[test]
     fn many_repeats_of_a_name_with_a_trailing_initial_are_fast() {
         let mut k = KnownNames::default();
         k.add_person("Anna J.", "Berg");
         k.add_full("Anna B J.");
-        let text = "Anna B ".repeat(100_000);
-        let start = std::time::Instant::now();
-        let (out, _) = run(&k, FreeText::Tokens, &text);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
-        assert!(out.starts_with("F4 F F4 F "), "{}", &out[..20]);
+        let (out, _) = run(&k, FreeText::Tokens, &"Anna B ".repeat(10));
+        assert!(out.starts_with("F4 F F4 F "), "{out}");
+        assert_linear(
+            |n| {
+                run(&k, FreeText::Tokens, &"Anna B ".repeat(n));
+            },
+            12_500,
+        );
     }
 
     #[test]
@@ -1115,14 +1141,32 @@ mod tests {
                 .map(|d| (b'a' + (d as u8 - b'0')) as char)
                 .collect()
         };
-        let mut k = KnownNames::default();
-        for i in 0..5000 {
-            k.add_person(
-                &format!("Vorname{}", code(i)),
-                &format!("Nachname{}", code(i)),
-            );
-        }
-        k.add_person("Anna", "Muster");
+        let known = |names: usize| {
+            let mut k = KnownNames::default();
+            for i in 0..names {
+                k.add_person(
+                    &format!("Vorname{}", code(i)),
+                    &format!("Nachname{}", code(i)),
+                );
+            }
+            k.add_person("Anna", "Muster");
+            k
+        };
+        // The time per text must not grow with the number of known names.
+        let sample: Vec<String> = (0..2000)
+            .map(|i| format!("Please call Vorname{} Nachname{} today", code(i), code(i)))
+            .collect();
+        assert_linear(
+            |names| {
+                let k = known(names);
+                let m = k.matcher(FreeText::Tokens);
+                for text in &sample {
+                    m.replace(text, &mut |_, _| String::new());
+                }
+            },
+            625,
+        );
+        let k = known(5000);
         let texts: Vec<String> = (0..10_000)
             .map(|i| {
                 format!(
@@ -1132,14 +1176,12 @@ mod tests {
                 )
             })
             .collect();
-        let start = std::time::Instant::now();
         let m = k.matcher(FreeText::Tokens);
         let mut total = 0;
         for text in &texts {
             total += m.replace(text, &mut fake).1;
         }
         assert!(total >= 10_000);
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(
             run(&k, FreeText::Off, "Call Anna Muster"),
             ("Call Anna Muster".to_string(), 0)
