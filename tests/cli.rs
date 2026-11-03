@@ -72,6 +72,10 @@ fn init_with_language_de_ignores_the_system_language() {
 }
 
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "sys-locale reads the macOS system language, not LANG or LC_ALL"
+)]
 fn init_with_unsupported_system_language_writes_en_and_warns() {
     let dir = tempfile::TempDir::new().unwrap();
     init_command(dir.path())
@@ -443,7 +447,15 @@ fn run_refuses_out_in_secrets_through_a_symlink_or_another_case() {
     );
     assert!(!dir.path().join("secrets/data.csv").exists());
     assert!(!dir.path().join("secrets/deep").exists());
-    assert!(!dir.path().join("Secrets").exists());
+    // A case-insensitive file system (APFS) finds `secrets` for `Secrets`.
+    let names: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert!(
+        !names.iter().any(|n| n == "Secrets" || n == "CONFIG"),
+        "{names:?}"
+    );
 }
 
 #[cfg(unix)]

@@ -75,7 +75,7 @@ jobs:
         run: cargo build --locked --release --target "${TARGET}"
 
       - name: Test the release build
-        run: cargo test --locked --release --target "${TARGET}"
+        run: cargo test --locked --release --no-fail-fast --target "${TARGET}"
 
       - name: Run the binary
         run: |
