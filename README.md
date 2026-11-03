@@ -208,6 +208,26 @@ devcontainer exec --workspace-folder . ./scripts/check
 
 The script runs `cargo fmt --check`, `cargo clippy`, `cargo test`, and `./scripts/docs-check`.
 
+## Release
+
+1. Set the version in `Cargo.toml` and merge the change into `main`.
+2. Create and push the tag on the host:
+
+   ```sh
+   git tag -a vX.Y.Z -m "pseudofy X.Y.Z"
+   git push origin vX.Y.Z
+   gh run watch
+   ```
+
+3. After the release workflow passes, update the Homebrew formula in the tap (ADR-0016):
+
+   ```sh
+   gh workflow run update-pseudofy.yml -R aheissenberger/homebrew-tools -f version=X.Y.Z
+   gh run watch -R aheissenberger/homebrew-tools
+   ```
+
+   Without `-f version=...`, the workflow uses the latest pseudofy release. It checks the SHA-256 and the build attestation, runs `brew audit` and `brew test`, and then pushes the new formula.
+
 ## License
 
 pseudofy is licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE).
