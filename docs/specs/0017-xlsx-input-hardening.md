@@ -1,7 +1,7 @@
 # Feature Delta Spec: XLSX input hardening
 
 **Date:** 2026-11-02
-**Status:** active
+**Status:** done
 **Author:** Claude (agent)
 **Related:** `docs/specs/0003-xlsx-support.md` · `docs/adr/0010-scrub-the-written-xlsx-package.md` · `docs/adr/0011-restore-dropped-xlsx-parts-from-the-input.md`
 
@@ -34,7 +34,7 @@
   - Parse each `.rels` part with exact attribute names. Accept only unprefixed `Relationship` elements. Refuse a duplicate attribute, a duplicate `Id`, a relationship without `Id`, `Type`, or `Target`, an entity in `TargetMode`, and `&`, `<`, `"`, or a control character in a non-External `Target` or an `Id`. Write each `.rels` part again in a canonical form (only `Id`, `Type`, `Target`, `TargetMode`) before `umya-spreadsheet` reads the package.
   - Refuse two `<sheet>` elements with the same `r:id` in `xl/workbook.xml`, and more than 4 096 `<sheet>` elements. Read a sheet id with the rule of `umya-spreadsheet` (exact `r:id` first).
   - Refuse `>` in a non-External `Target` or an `Id` (the crate reads attribute values without unescape).
-  - Estimate the memory that the crate builds: the length of the shared string of each `t="s"` cell, the font, fill, border, and number format of each cell format, and the cell format of each cell, row, and column with an `s` attribute. Refuse more than 1 GiB. Refuse a shared string longer than 32 767 characters, a font name longer than 31 characters, and a number format longer than 255 characters (the limits of Excel).
+  - Estimate the memory that the crate builds: the length of the shared string of each `t="s"` cell, the font, fill, border, and number format of each cell format, and the cell format of each cell, row, and column with an `s` attribute. Refuse more than 1 GiB. Refuse a shared string longer than 32 767 characters, a font name longer than 31 characters, and a number format longer than 255 characters (the limits of Excel). Refuse more than 1 048 576 items in each style list (fonts, fills, borders, number formats, cell formats).
   - Count each case-insensitive lookup that `umya-spreadsheet` makes, also for each External relationship. Refuse more than 10 000 000 name comparisons (about 4 seconds).
 - `src/xlsx_scrub.rs` — the external-link restore reads each link part once.
 - `src/xlsx_file.rs` — refuse an XLSX file larger than 512 MiB: `<path>: file is larger than 512 MiB`.
@@ -60,29 +60,29 @@
 
 ## 3. Architectural Rules & Invariants
 
-- [ ] A refused file gets no copy. The run continues with the next file.
-- [ ] No hostile workbook aborts the process. Each limit is checked before `umya-spreadsheet` reads the package.
-- [ ] An error message contains the path and the reason, never part contents.
-- [ ] No new crate. No `unwrap()` or `expect()` outside tests.
+- [x] A refused file gets no copy. The run continues with the next file.
+- [x] No hostile workbook aborts the process. Each limit is checked before `umya-spreadsheet` reads the package.
+- [x] An error message contains the path and the reason, never part contents.
+- [x] No new crate. No `unwrap()` or `expect()` outside tests.
 
 ## 4. Acceptance Criteria & Verification
 
 **Behavior:**
 
-- [ ] A workbook with pivot parts under `xl/PivotCache/` or `xl\pivotCache\` is refused.
-- [ ] A worksheet header with a name under `xl/Worksheets/` gets the warning `headers/footers`.
-- [ ] A relationship cycle makes the file fail. A second, valid file in the same project gets its copy.
-- [ ] A fan-out chain of 40 parts fails within 5 seconds.
-- [ ] A package with a total uncompressed size above 512 MiB fails without a large memory use.
-- [ ] 100 000 repeats of a name with a trailing initial take less than 1 second.
-- [ ] Each hostile package of the review (2026-11-03) fails without an abort: External self-loops through `/_rels/.rels`, an entity in `TargetMode` or `Target`, a prefixed `Target` attribute, two entry names that decode to the same text, 300 sheets with one `r:id`, 10 000 external references to one part.
-- [ ] A drawing with 2 500 images gets a copy.
-- [ ] A cycle hidden behind `>` in a `Target`, one 4 MiB shared string in 2 000 cells, one 4 MiB font name in 2 000 cell formats, and 100 000 `<sheet>` elements each fail without an abort and within 10 seconds.
-- [ ] A package with a 600 MiB entry fails at once.
+- [x] A workbook with pivot parts under `xl/PivotCache/` or `xl\pivotCache\` is refused.
+- [x] A worksheet header with a name under `xl/Worksheets/` gets the warning `headers/footers`.
+- [x] A relationship cycle makes the file fail. A second, valid file in the same project gets its copy.
+- [x] A fan-out chain of 40 parts fails within 5 seconds.
+- [x] A package with a total uncompressed size above 512 MiB fails without a large memory use.
+- [x] 100 000 repeats of a name with a trailing initial take less than 1 second.
+- [x] Each hostile package of the review (2026-11-03) fails without an abort: External self-loops through `/_rels/.rels`, an entity in `TargetMode` or `Target`, a prefixed `Target` attribute, two entry names that decode to the same text, 300 sheets with one `r:id`, 10 000 external references to one part.
+- [x] A drawing with 2 500 images gets a copy.
+- [x] A cycle hidden behind `>` in a `Target`, one 4 MiB shared string in 2 000 cells, one 4 MiB font name in 2 000 cell formats, and 100 000 `<sheet>` elements each fail without an abort and within 10 seconds.
+- [x] A package with a 600 MiB entry fails at once.
 
 **Tests to add/update:**
 
-- [ ] `tests/xlsx.rs`, `tests/csv.rs`, and unit tests in `src/xlsx_scrub.rs` and `src/known_names.rs` — the behaviors above. Tests build the hostile packages in memory with `zip`.
+- [x] `tests/xlsx.rs`, `tests/csv.rs`, and unit tests in `src/xlsx_scrub.rs` and `src/known_names.rs` — the behaviors above. Tests build the hostile packages in memory with `zip`.
 
 **Commands that must pass:**
 
