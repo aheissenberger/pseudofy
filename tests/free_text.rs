@@ -767,3 +767,144 @@ fn one_letter_words_after_a_name_stay() {
         format!("{first} u. Karl; Thanks {first} I will; {last} e. V.")
     );
 }
+
+// ---- Text normalization (spec 0019, ADR-0013) ----
+
+/// Writes `people.csv` (header `first_name,last_name,note`) with `rows`, runs,
+/// and returns the output table.
+fn run_people(rows: &str) -> Vec<Vec<String>> {
+    let dir = project(Some("tokens"));
+    write_file(dir.path(), "people.csv", &format!("{HEADER}{rows}"));
+    let (out, _, _) = run_ok(dir.path());
+    table(out.path(), "people.csv")
+}
+
+/// A CSV cell with quotes.
+fn quoted(text: &str) -> String {
+    format!("\"{}\"", text.replace('"', "\"\""))
+}
+
+#[test]
+fn apostrophe_sharp_s_and_dotted_i_match_in_free_text() {
+    let t = run_people(
+        "Tamsorin,O\u{2019}Brien,Tamsorin O'Brien / Tamsorin O\u{2019}Brien\n\
+         \u{130}lker,Strau\u{df},Ilker STRAUSS / ilker Strauss / \u{130}LKER Strau\u{df}\n",
+    );
+    let (f, l) = fakes(&t, 1);
+    assert_eq!(t[1][2], format!("{f} {l} / {f} {l}"));
+    let (f, l) = fakes(&t, 2);
+    assert_eq!(
+        t[2][2],
+        format!(
+            "{f} {} / {} {l} / {} {l}",
+            l.to_uppercase(),
+            f.to_lowercase(),
+            f.to_uppercase()
+        )
+    );
+}
+
+#[test]
+fn format_characters_do_not_hide_a_name_in_free_text() {
+    let t = run_people(&format!(
+        "Kesta,M\u{fc}ller,{}\n",
+        quoted("M\u{fc}\u{ad}ller und Kes\u{200b}ta, Kesta M\u{fc}l\u{200d}ler")
+    ));
+    let (f, l) = fakes(&t, 1);
+    assert_eq!(t[1][2], format!("{l} und {f}, {f} {l}"));
+}
+
+#[test]
+fn address_keeps_its_surrounding_punctuation_in_free_text() {
+    let t = run_people(&format!(
+        "Zorbina,Quenzel,{}\n",
+        quoted("Schreib an anna.zorbel@firma.test! oder anna.zorbel@firma.test \u{bb}x\u{ab}")
+    ));
+    let note = &t[1][2];
+    let rest = note.strip_prefix("Schreib an ").unwrap();
+    let (first, rest) = rest.split_once("! oder ").unwrap();
+    let (second, tail) = rest.split_once(' ').unwrap();
+    assert_eq!(first, second);
+    assert_eq!(tail, "\u{bb}x\u{ab}");
+    assert!(first.contains('@'), "{first}");
+    assert_absent(note, &["zorbel", "firma"], "note");
+}
+
+#[test]
+fn address_in_a_url_changes_and_the_url_stays_valid() {
+    let t = run_people(&format!(
+        "Zorbina,Quenzel,{}\n",
+        quoted(
+            "https://firma.test/x?u=anna.zorbel@firma.test&y=1 und anna.zorbel@firma.test \
+             und https://anna@firma.test/p"
+        )
+    ));
+    let note = &t[1][2];
+    let rest = note.strip_prefix("https://firma.test/x?u=").unwrap();
+    let (fake, rest) = rest.split_once("&y=1 und ").unwrap();
+    let (again, rest) = rest.split_once(" und ").unwrap();
+    assert_eq!(fake, again);
+    assert!(fake.contains('@'));
+    assert_eq!(rest, "https://anna@firma.test/p");
+}
+
+#[test]
+fn price_with_an_at_sign_stays() {
+    let t = run_people(&format!(
+        "Zorbina,Quenzel,{}\n",
+        quoted("Preis 3@4.50 EUR, 2@1.5")
+    ));
+    assert_eq!(t[1][2], "Preis 3@4.50 EUR, 2@1.5");
+}
+
+#[test]
+fn localhost_and_quoted_local_part_are_replaced() {
+    let t = run_people(&format!(
+        "Zorbina,Quenzel,{}\n",
+        quoted("an anna.zorbel@localhost und \"anna zorbel\"@firma.test.")
+    ));
+    let note = &t[1][2];
+    assert_absent(note, &["zorbel", "localhost", "firma"], "note");
+    assert!(note.ends_with('.'));
+    assert_eq!(note.matches('@').count(), 2);
+}
+
+#[test]
+fn idn_and_punycode_domains_get_one_label_in_free_text() {
+    let t = run_people(&format!(
+        "Zorbina,Quenzel,{}\n",
+        quoted("a@b\u{e4}ckerei.test und a@xn--bckerei-5wa.test und a@andere.test")
+    ));
+    let parts: Vec<&str> = t[1][2].split(" und ").collect();
+    assert_eq!(parts[0], parts[1]);
+    assert_ne!(parts[0], parts[2]);
+}
+
+#[test]
+fn titles_particles_and_comma_order_in_free_text() {
+    let dir = project(Some("tokens"));
+    write_file(
+        dir.path(),
+        "people.csv",
+        "name,note\n\
+         Dr. Hans Zorbel,Dr. Hans Zorbel / Dr. Mag. Herr Frau\n\
+         Ludwig van Beethoven,Ludwig van Beethoven\n\
+         \"Zorbel, Hans\",\"Zorbel, Hans\"\n\
+         Berta Quenzel Jr.,Berta Quenzel Jr. / Mrs. Ms. Prof. DI Mr.\n",
+    );
+    let (out, _, _) = run_ok(dir.path());
+    let t = table(out.path(), "people.csv");
+    let name = &t[1][0];
+    assert!(name.starts_with("Dr. "), "{name}");
+    assert_eq!(t[1][1], format!("{name} / Dr. Mag. Herr Frau"));
+    assert!(t[2][0].contains(" van "), "{}", t[2][0]);
+    assert_eq!(t[2][1], t[2][0]);
+    assert!(t[3][0].contains(", "), "{}", t[3][0]);
+    assert_eq!(t[3][1], t[3][0]);
+    assert!(t[4][0].ends_with(" Jr."), "{}", t[4][0]);
+    assert_eq!(t[4][1], format!("{} / Mrs. Ms. Prof. DI Mr.", t[4][0]));
+    // Hans in "Dr. Hans Zorbel" and "Zorbel, Hans" is one person.
+    let hans = t[1][0].strip_prefix("Dr. ").unwrap();
+    let (first, last) = hans.split_once(' ').unwrap();
+    assert_eq!(t[3][0], format!("{last}, {first}"));
+}

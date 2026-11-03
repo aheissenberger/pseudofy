@@ -168,21 +168,41 @@ pub(crate) fn name_kind(part: Part) -> Kind {
     }
 }
 
+const MAILTO: &str = "mailto:";
+
+/// `text` split before a trailing `mailto:` (any case); the tail is empty
+/// without one.
+fn split_mailto(text: &str) -> (&str, &str) {
+    let at = text.len().saturating_sub(MAILTO.len());
+    match (text.get(..at), text.get(at..)) {
+        (Some(head), Some(tail)) if tail.eq_ignore_ascii_case(MAILTO) => (head, tail),
+        _ => (text, ""),
+    }
+}
+
 /// Replace the addresses at `spans`; run the text outside them through `names`.
+/// With `keep_mailto`, a `mailto:` right before an address stays as it is.
 pub(crate) fn replace_spans(
     cell: &str,
     spans: &[std::ops::Range<usize>],
     names: NameFn,
     name_role: NameRole,
+    keep_mailto: bool,
     replace: &mut dyn FnMut(Kind, &str) -> String,
 ) -> String {
     let mut out = String::with_capacity(cell.len());
     let mut pos = 0;
     for span in spans {
         let before = cell.get(pos..span.start).unwrap_or("");
+        let (before, tag) = if keep_mailto {
+            split_mailto(before)
+        } else {
+            (before, "")
+        };
         out.push_str(&names(before, name_role, &mut |part, token| {
             replace(name_kind(part), token)
         }));
+        out.push_str(tag);
         out.push_str(&replace(Kind::Email, cell.get(span.clone()).unwrap_or("")));
         pos = span.end;
     }
@@ -340,20 +360,27 @@ pub(crate) fn transform_cell(
                 &text::email_spans(cell, email_regex),
                 names,
                 name_role,
+                false,
                 replace,
             )
         }
         Some(ColRole::Email) => {
             let spans = text::email_spans(cell, email_regex);
             if !spans.is_empty() {
-                return replace_spans(cell, &spans, names, NameRole::Full, replace);
+                return replace_spans(cell, &spans, names, NameRole::Full, true, replace);
             }
-            // No address found: the whole trimmed cell is the address.
+            // No address found: the whole trimmed cell is the address. A
+            // `mailto:` prefix stays.
             let lead = cell.len() - cell.trim_start().len();
             let tail = cell.len() - cell.trim_end().len();
+            let has_mailto = trimmed
+                .get(..MAILTO.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(MAILTO));
+            let (scheme, address) = trimmed.split_at(if has_mailto { MAILTO.len() } else { 0 });
             let mut out = String::with_capacity(cell.len());
             out.push_str(cell.get(..lead).unwrap_or(""));
-            out.push_str(&replace(Kind::Email, trimmed));
+            out.push_str(scheme);
+            out.push_str(&replace(Kind::Email, address));
             out.push_str(cell.get(cell.len() - tail..).unwrap_or(""));
             out
         }

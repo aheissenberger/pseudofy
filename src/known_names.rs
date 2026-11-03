@@ -38,7 +38,10 @@ use unicode_normalization::char::is_combining_mark;
 use unicode_normalization::{UnicodeNormalization, is_nfc};
 
 use crate::config::FreeText;
-use crate::text::{NameRole, Part, replace_name};
+use crate::text::{
+    NameRole, Part, Slot, full_slots, is_apostrophe, is_format_char, is_particle, normalize,
+    replace_name,
+};
 
 /// Longest person sequence in tokens. A longer person is ignored.
 const MAX_WORDS: usize = 12;
@@ -66,13 +69,8 @@ pub struct KnownNames {
     initial_after: HashMap<String, Part>,
 }
 
-/// `'`, the curly apostrophe U+2019 and the modifier letter U+02BC.
-fn is_apos(c: char) -> bool {
-    matches!(c, '\'' | '\u{2019}' | '\u{2bc}')
-}
-
 fn is_token_char(c: char) -> bool {
-    c.is_alphabetic() || is_apos(c) || is_combining_mark(c)
+    c.is_alphabetic() || is_apostrophe(c) || is_combining_mark(c) || is_format_char(c)
 }
 
 /// A name token: byte range in the (NFC) text.
@@ -87,14 +85,19 @@ fn push_run(text: &str, from: usize, to: usize, out: &mut Vec<Tok>) {
     let Some(run) = text.get(from..to) else {
         return;
     };
-    let start = from + (run.len() - run.trim_start_matches(is_apos).len());
-    let trim =
-        |s: usize, e: usize| s + text.get(s..e).unwrap_or("").trim_end_matches(is_apos).len();
+    let start = from + (run.len() - run.trim_start_matches(is_apostrophe).len());
+    let trim = |s: usize, e: usize| {
+        s + text
+            .get(s..e)
+            .unwrap_or("")
+            .trim_end_matches(is_apostrophe)
+            .len()
+    };
     let mut end = trim(start, to);
     let mut rev = text.get(start..end).unwrap_or("").char_indices().rev();
     if let (Some((_, last)), Some((at, apos))) = (rev.next(), rev.next())
         && matches!(last, 's' | 'S')
-        && is_apos(apos)
+        && is_apostrophe(apos)
         && at > 0
     {
         end = trim(start, start + at);
@@ -108,7 +111,7 @@ fn push_run(text: &str, from: usize, to: usize, out: &mut Vec<Tok>) {
     out.push(Tok {
         start,
         end,
-        initial: token.chars().count() == 1,
+        initial: token.chars().filter(|c| !is_format_char(*c)).count() == 1,
     });
 }
 
@@ -130,20 +133,9 @@ fn lex(text: &str) -> Vec<Tok> {
     out
 }
 
-/// Fold a token: NFC, lowercase, `ß` to `ss`, no U+0307 after `i`.
+/// Fold a token: the shared normalization (`text::normalize`, ADR-0013).
 fn fold(token: &str) -> String {
-    let mut out = String::with_capacity(token.len());
-    for c in token.nfc() {
-        for l in c.to_lowercase() {
-            match l {
-                'ß' => out.push_str("ss"),
-                '\u{2019}' | '\u{2bc}' => out.push('\''),
-                '\u{307}' if out.ends_with('i') => {}
-                _ => out.push(l),
-            }
-        }
-    }
-    out
+    normalize(token)
 }
 
 fn is_sep_char(c: char) -> bool {
@@ -227,7 +219,7 @@ impl KnownNames {
         if let Some((last, rest)) = toks.split_last()
             && last.initial
         {
-            self.note_initial_after(&nfc, rest, Part::First);
+            self.note_initial_after(&nfc, rest.last(), Part::First);
         }
         let tokens = name_tokens(value);
         for (t, _, raw) in &tokens {
@@ -238,8 +230,8 @@ impl KnownNames {
     }
 
     /// Remember that an initial with role `part` followed the last of `rest`.
-    fn note_initial_after(&mut self, nfc: &str, rest: &[Tok], part: Part) {
-        let before = rest.last().filter(|t| !t.initial);
+    fn note_initial_after(&mut self, nfc: &str, prev: Option<&Tok>, part: Part) {
+        let before = prev.filter(|t| !t.initial);
         if let Some(raw) = before.and_then(|t| nfc.get(t.start..t.end)) {
             self.initial_after.insert(fold(raw), part);
         }
@@ -274,31 +266,41 @@ impl KnownNames {
     }
 
     /// Add the value of one `full_name` cell ("First Middle Last" or
-    /// "Last, First"). Angle-bracket parts (`<...>`) are ignored.
+    /// "Last, First"). Angle-bracket parts (`<...>`) are ignored. The tokens
+    /// get the same slots as in `text::replace_name` (`text::full_slots`):
+    /// titles and suffixes are no names, particles belong to the last name.
     pub fn add_full(&mut self, value: &str) {
         let clean = strip_angle(value);
         let nfc: String = clean.nfc().collect();
-        if let Some((before, after)) = nfc.split_once(',') {
-            self.add_person(after, before);
-            return;
-        }
-        // Same assignment as `NameRole::Full`: the final token is Last, an
-        // initial included. A final initial leaves no last name.
         let toks = lex(&nfc);
-        let Some((last, rest)) = toks.split_last() else {
-            return;
+        let ranges: Vec<(usize, usize)> = toks.iter().map(|t| (t.start, t.end)).collect();
+        let slots = full_slots(&nfc, &ranges);
+        let join = |wanted: &dyn Fn(Slot) -> bool| {
+            toks.iter()
+                .zip(&slots)
+                .filter(|(_, slot)| wanted(**slot))
+                .filter_map(|(t, _)| nfc.get(t.start..t.end))
+                .collect::<Vec<_>>()
+                .join(" ")
         };
-        if last.initial {
-            self.add_first(nfc.get(..last.start).unwrap_or(""));
-            self.note_initial_after(&nfc, rest, Part::Last);
+        let first = join(&|slot| slot == Slot::First);
+        let last = join(&|slot| matches!(slot, Slot::Last | Slot::Particle));
+        // A final initial is Last (as in `NameRole::Full`) and leaves no last
+        // name.
+        let named: Vec<usize> = (0..toks.len())
+            .filter(|i| slots.get(*i).is_some_and(|s| *s != Slot::Skip))
+            .collect();
+        if let Some((&at, before)) = named.split_last()
+            && toks.get(at).is_some_and(|t| t.initial)
+            && slots.get(at) == Some(&Slot::Last)
+            && !last.contains(' ')
+        {
+            self.add_first(&first);
+            let prev = before.last().and_then(|i| toks.get(*i));
+            self.note_initial_after(&nfc, prev, Part::Last);
             return;
         }
-        let first = match rest.first() {
-            Some(a) => nfc.get(a.start..last.start).unwrap_or(""),
-            None => "",
-        };
-        let last = nfc.get(last.start..last.end).unwrap_or("");
-        self.add_person(first, last);
+        self.add_person(&first, &last);
     }
 
     /// Build the whole-word matcher for `mode`.
@@ -638,10 +640,20 @@ impl Matcher {
         edits.sort_by_key(|(idx, _)| *idx);
         let mut out = String::with_capacity(text.len());
         let mut pos = 0;
-        for (idx, part) in edits {
+        for (k, &(idx, part)) in edits.iter().enumerate() {
             let Some(t) = toks.get(idx) else { continue };
             out.push_str(text.get(pos..t.start).unwrap_or(""));
             let token = text.get(t.start..t.end).unwrap_or("");
+            // A lowercase particle right before a last-name token stays, as
+            // in a name column (`text::replace_name`).
+            let before_last = edits
+                .get(k + 1)
+                .is_some_and(|&(next, p)| next == idx + 1 && p == Part::Last);
+            if before_last && is_particle(token) {
+                out.push_str(token);
+                pos = t.end;
+                continue;
+            }
             // A token with a column spelling is passed as it is; any other
             // spelling gets the smallest column spelling. The case style
             // comes from the text.
@@ -910,16 +922,81 @@ mod tests {
     }
 
     #[test]
+    fn format_characters_do_not_split_a_name() {
+        let mut k = KnownNames::default();
+        k.add_person("Kesta", "M\u{fc}ller");
+        for text in [
+            "M\u{fc}\u{ad}ller",
+            "Kes\u{200b}ta",
+            "\u{feff}Kesta M\u{fc}l\u{2060}ler",
+        ] {
+            assert!(run(&k, FreeText::Tokens, text).1 >= 1, "{text:?}");
+        }
+        assert_eq!(
+            run(&k, FreeText::Tokens, "Kes\u{200b}ta M\u{fc}\u{ad}ller").0,
+            "F5 L6"
+        );
+        let mut c = KnownNames::default();
+        c.add_person("Kes\u{200b}ta", "Arvo");
+        assert_eq!(
+            run(&c, FreeText::Full, "Kesta Arvo"),
+            ("F6 L4".to_string(), 1)
+        );
+    }
+
+    #[test]
+    fn apostrophe_sharp_s_and_dotted_i_fold_together() {
+        let mut k = KnownNames::default();
+        k.add_person("Tamsorin", "O\u{2019}Brien");
+        k.add_person("\u{130}lker", "Strau\u{df}");
+        assert_eq!(run(&k, FreeText::Tokens, "O'Brien").1, 1);
+        assert_eq!(run(&k, FreeText::Tokens, "STRAUSS Ilker").1, 2);
+        assert_eq!(run(&k, FreeText::Tokens, "ilker Strauss").1, 1);
+    }
+
+    #[test]
+    fn titles_and_suffixes_are_no_names() {
+        let mut k = KnownNames::default();
+        k.add_full("Dr. Hans Zorbel Jr.");
+        k.add_full("Frau Mag. Berta Quenzel, MBA");
+        assert_eq!(
+            run(
+                &k,
+                FreeText::Tokens,
+                "Dr. Hans Zorbel Jr., Frau Mag. Berta Quenzel MBA"
+            ),
+            ("Dr. F4 L6 Jr., Frau Mag. F5 L7 MBA".to_string(), 2)
+        );
+        assert_eq!(run(&k, FreeText::Tokens, "Dr. Mag. Frau").1, 0);
+    }
+
+    #[test]
+    fn last_comma_first_with_a_title() {
+        let mut k = KnownNames::default();
+        k.add_full("Zorbel, Hans");
+        assert_eq!(
+            run(&k, FreeText::Full, "Zorbel, Hans"),
+            ("L6, F4".to_string(), 1)
+        );
+        let mut p = KnownNames::default();
+        p.add_full("Ludwig van Beethoven");
+        assert_eq!(
+            run(&p, FreeText::Full, "Ludwig van Beethoven"),
+            ("F6 van L9".to_string(), 1)
+        );
+    }
+
+    #[test]
     fn multi_token_last_name_split() {
         let mut k = KnownNames::default();
         k.add_person("Jorvik", "van der Hallen");
         assert_eq!(
             run(&k, FreeText::Full, "Jorvik van der Hallen"),
-            ("F6 l3 l3 L6".to_string(), 1)
+            ("F6 van der L6".to_string(), 1)
         );
         assert_eq!(
             run(&k, FreeText::Full, "van der Hallen, Jorvik"),
-            ("l3 l3 L6, F6".to_string(), 1)
+            ("van der L6, F6".to_string(), 1)
         );
         // Particles do not match alone; the capitalized part does.
         assert_eq!(
